@@ -1,0 +1,21 @@
+# Ignore everything by default
+*
+
+# Keep source directories traversable
+!*/
+
+# Track Python source and notebooks
+!*.py
+!*.ipynb
+
+# Keep essential project metadata/config files
+!.gitignore
+!pyproject.toml
+!README*
+!LICENSE*
+
+# Explicitly ignore common generated artifacts inside kept directories
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
