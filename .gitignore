@@ -4,6 +4,8 @@
 # Keep source directories traversable
 !*/
 
+.venv/
+
 # Track Python source and notebooks
 !*.py
 !*.ipynb
