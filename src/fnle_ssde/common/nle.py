@@ -104,6 +104,8 @@ class NLEEstimator:
         Args:
             x_ref: Reference trajectories
             n_params: Number of parameter samples for training
+            ref_noize: Noise level for initial conditions
+            n_steps: Number of steps to simulate forward for each training sample
             batch_size: Training batch size
             lr: Learning rate
             epochs: Number of epochs

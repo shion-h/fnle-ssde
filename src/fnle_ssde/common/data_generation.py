@@ -56,7 +56,7 @@ class SwitchingSDEDataGenerator:
 def generate_true_and_obs_data(generator,
                                num_series,
                                hmm_param_true,
-                               T_obs,
+                               n_of_all_steps,
                                X0,
                                obs_interval):
     X_obs = []
@@ -66,7 +66,7 @@ def generate_true_and_obs_data(generator,
     obs_idx_list = []
 
     for i in range(num_series):
-        x, z = generator.generate(hmm_param_true, T_obs, x0=X0)
+        x, z = generator.generate(hmm_param_true, n_of_all_steps, x0=X0)
         # Subsample
         obs_idx = np.arange(len(x))[::obs_interval]
         X_obs.append(x[::obs_interval])
