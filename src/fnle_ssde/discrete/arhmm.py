@@ -1,9 +1,3 @@
-
-"""
-Refactored ARHMM-NLE: Autoregressive Hidden Markov Model with Neural Likelihood Estimation
-for Lotka-Volterra dynamics
-"""
-
 from typing import List
 import numpy as np
 import torch

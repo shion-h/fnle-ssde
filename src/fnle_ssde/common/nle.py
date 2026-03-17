@@ -1,9 +1,3 @@
-
-"""
-Refactored ARHMM-NLE: Autoregressive Hidden Markov Model with Neural Likelihood Estimation
-for Lotka-Volterra dynamics
-"""
-
 import time
 from tqdm import tqdm
 from typing import Tuple, List
