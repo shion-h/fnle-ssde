@@ -6,7 +6,7 @@ for Lotka-Volterra dynamics
 
 import time
 from tqdm import tqdm
-from typing import Tuple, List
+from typing import Optional, Tuple, List
 import torch
 import pyro.distributions as dist
 from torch.distributions import Independent, Normal
@@ -37,7 +37,8 @@ class NLEEstimator:
             theta: torch.Tensor, 
             x_ref: torch.Tensor, 
             ref_noize: float,
-            n_steps: int
+            n_steps: int,
+            elapsed_times: Optional[torch.Tensor] = None,
             ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Generate training data for one parameter sample.
@@ -46,9 +47,27 @@ class NLEEstimator:
             theta: Parameter vector
             x_ref: Reference trajectory
             n_steps: Number of steps to simulate forward
+            elapsed_times: Optional elapsed time for each transition in x_ref.
+                Shape should be (len(x_ref) - 1,). If omitted, elapsed time
+                is fixed to n_steps * dynamics.dt for all samples.
         """
         xt_chunk = []
         ctx_chunk = []
+
+        if elapsed_times is None:
+            elapsed_times = torch.full(
+                (len(x_ref) - 1,),
+                fill_value=float(n_steps * self.dynamics.dt),
+                dtype=x_ref.dtype,
+                device=x_ref.device,
+            )
+        else:
+            elapsed_times = elapsed_times.to(device=x_ref.device, dtype=x_ref.dtype)
+
+        if elapsed_times.shape[0] != len(x_ref) - 1:
+            raise ValueError('elapsed_times must have shape (len(x_ref) - 1,)')
+
+        theta = theta.to(device=x_ref.device, dtype=x_ref.dtype)
         
         for t in range(1, len(x_ref)):
             # Use first state parameters (assuming single regime for training)
@@ -64,7 +83,8 @@ class NLEEstimator:
                 x_sim = torch.clamp(x_sim, min=0.0, max=1e4)
             
             # Create context
-            context = torch.cat([theta, x_init], dim=-1)
+            elapsed_time = elapsed_times[t-1].unsqueeze(0)
+            context = torch.cat([theta, x_init, elapsed_time], dim=-1)
             
             xt_chunk.append(x_sim)
             ctx_chunk.append(context)
@@ -77,6 +97,7 @@ class NLEEstimator:
             x_ref: torch.Tensor, 
             ref_noize: float,
             n_steps: int,
+            elapsed_times: Optional[torch.Tensor] = None,
             ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate complete training dataset.
@@ -92,7 +113,7 @@ class NLEEstimator:
         for _ in tqdm(range(n_params)):
             theta = self.sampling_dist.sample().cpu()
             xt_chunk, ctx_chunk = self.generate_training_data_one_theta(
-                theta, x_ref, ref_noize, n_steps)
+                theta, x_ref, ref_noize, n_steps, elapsed_times)
             all_xt.extend(xt_chunk)
             all_ctx.extend(ctx_chunk)
         
@@ -102,6 +123,7 @@ class NLEEstimator:
     def train(self, x_ref: torch.Tensor, n_params: int = 500, 
               ref_noize: float = 0.02,
               n_steps: int = 50,
+              elapsed_times: Optional[torch.Tensor] = None,
               batch_size: int = 256, lr: float = 5e-4, 
               epochs: int = 50) -> 'NLEEstimator':
         """
@@ -117,7 +139,7 @@ class NLEEstimator:
         # Generate training data
         start_time = time.time()
         xt_data, ctx_data = self.generate_training_data(
-            n_params, x_ref, ref_noize, n_steps)
+            n_params, x_ref, ref_noize, n_steps, elapsed_times)
         print(f"Data generation took {time.time() - start_time:.2f}s,"
               f"samples: {len(ctx_data)}")
         
