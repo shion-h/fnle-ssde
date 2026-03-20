@@ -19,8 +19,7 @@ def calc_log_prob_mesh(nle, state, hmm_param_true, X_obs_concat,
         for xij, yij in zip(xi, yi):
             tmp_theta[:, theta_idx_as_x] = xij
             tmp_theta[:, theta_idx_as_y] = yij
-            conditions = torch.cat(
-                [tmp_theta, X_obs_concat], dim=-1).to(torch.float32)
+            conditions = torch.cat([tmp_theta, X_obs_concat], dim=-1).to(torch.float32)
             log_prob = nle.estimator.log_prob(
                 targets.unsqueeze(0), condition=conditions).sum().item()
             zi.append(log_prob)

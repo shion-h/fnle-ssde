@@ -1,11 +1,13 @@
 import time
 from tqdm import tqdm
-from typing import Tuple, List
+from typing import Tuple, List, Union
 import torch
 import pyro.distributions as dist
 from torch.distributions import Independent, Normal
 from sbi.inference import SNLE
 from .dynamics import Dynamics
+
+NStepsType = Union[int, Tuple[int], List[int]]
 
 
 class NLEEstimator:
@@ -17,6 +19,7 @@ class NLEEstimator:
         self.dynamics = dynamics
         self.device = device
         self.estimator = None
+        self.conditions_on_n_steps = False
         
         if sampling_dist is None:
             self.sampling_dist = dist.MultivariateNormal(
@@ -31,7 +34,7 @@ class NLEEstimator:
             theta: torch.Tensor, 
             x_ref: torch.Tensor, 
             ref_noize: float,
-            n_steps: int
+            n_steps: NStepsType
             ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Generate training data for one parameter sample.
@@ -39,7 +42,7 @@ class NLEEstimator:
         Args:
             theta: Parameter vector
             x_ref: Reference trajectory
-            n_steps: Number of steps to simulate forward
+            n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
         """
         xt_chunk = []
         ctx_chunk = []
@@ -53,12 +56,19 @@ class NLEEstimator:
             
             # Simulate forward
             x_sim = x_init
-            for _ in range(n_steps):
+            sampled_n_steps = self._sample_n_steps(n_steps)
+            for _ in range(sampled_n_steps):
                 x_sim = self.dynamics.simulate_one_step(x_sim, theta)
                 x_sim = torch.clamp(x_sim, min=0.0, max=1e4)
             
             # Create context
-            context = torch.cat([theta, x_init], dim=-1)
+            if self._uses_n_steps_conditioning(n_steps):
+                n_steps_tensor = torch.tensor(
+                    [sampled_n_steps], device=x_init.device, dtype=x_init.dtype
+                )
+                context = torch.cat([theta, x_init, n_steps_tensor], dim=-1)
+            else:
+                context = torch.cat([theta, x_init], dim=-1)
             
             xt_chunk.append(x_sim)
             ctx_chunk.append(context)
@@ -70,7 +80,7 @@ class NLEEstimator:
             n_params: int, 
             x_ref: torch.Tensor, 
             ref_noize: float,
-            n_steps: int,
+            n_steps: NStepsType,
             ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate complete training dataset.
@@ -95,7 +105,7 @@ class NLEEstimator:
     
     def train(self, x_ref: torch.Tensor, n_params: int = 500, 
               ref_noize: float = 0.02,
-              n_steps: int = 50,
+              n_steps: NStepsType = 50,
               batch_size: int = 256, lr: float = 5e-4, 
               epochs: int = 50) -> 'NLEEstimator':
         """
@@ -105,11 +115,13 @@ class NLEEstimator:
             x_ref: Reference trajectories
             n_params: Number of parameter samples for training
             ref_noize: Noise level for initial conditions
-            n_steps: Number of steps to simulate forward for each training sample
+            n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
             batch_size: Training batch size
             lr: Learning rate
             epochs: Number of epochs
         """
+        self.conditions_on_n_steps = self._uses_n_steps_conditioning(n_steps)
+
         # Generate training data
         start_time = time.time()
         xt_data, ctx_data = self.generate_training_data(
@@ -149,3 +161,24 @@ class NLEEstimator:
         print(f"\nNLE training took {time.time() - start_time:.2f}s")
         
         return self
+
+    def _sample_n_steps(self, n_steps: NStepsType) -> int:
+        if isinstance(n_steps, int):
+            if n_steps < 1:
+                raise ValueError("n_steps must be a positive integer.")
+            return n_steps
+
+        if isinstance(n_steps, (tuple, list)) and len(n_steps) == 1:
+            max_steps = n_steps[0]
+            if not isinstance(max_steps, int):
+                raise TypeError("Random n_steps max must be an integer.")
+            if max_steps < 1:
+                raise ValueError("Random n_steps max must be positive.")
+            return torch.randint(1, max_steps + 1, (1,)).item()
+
+        raise TypeError(
+            "n_steps must be an int or a length-1 tuple/list containing max_n_steps."
+        )
+
+    def _uses_n_steps_conditioning(self, n_steps: NStepsType) -> bool:
+        return isinstance(n_steps, (tuple, list))

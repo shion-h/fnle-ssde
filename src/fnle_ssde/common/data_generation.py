@@ -80,6 +80,13 @@ def generate_true_and_obs_data(generator,
 
 def generate_data_of_state(nle, state, hmm_param_true, X_obs_concat,
                            n_steps_for_each_interval):
+    if not isinstance(n_steps_for_each_interval, int):
+        raise TypeError(
+            "HMM generation requires a fixed integer n_steps_for_each_interval."
+        )
+    if n_steps_for_each_interval < 1:
+        raise ValueError("n_steps_for_each_interval must be a positive integer.")
+
     # generate the next state by simulating forward from each observed state
     targets = []
     for x_i in X_obs_concat:
