@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 from tqdm import tqdm
 from typing import Tuple, List, Union
 import torch
@@ -8,6 +9,7 @@ from sbi.inference import SNLE
 from .dynamics import Dynamics
 
 NStepsType = Union[int, Tuple[int], List[int]]
+PathLike = Union[str, Path]
 
 
 class NLEEstimator:
@@ -81,6 +83,7 @@ class NLEEstimator:
             x_ref: torch.Tensor, 
             ref_noize: float,
             n_steps: NStepsType,
+            cache_path: PathLike | None = None,
             ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate complete training dataset.
@@ -88,7 +91,17 @@ class NLEEstimator:
         Args:
             n_params: Number of parameter samples
             x_ref: Reference trajectories for training
+            ref_noize: Noise level for initial conditions
+            n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
+            cache_path: Optional path to save or reuse generated training data
         """
+        if cache_path is not None:
+            cache_path = Path(cache_path)
+            if cache_path.exists():
+                print(f"Loading cached training data from {cache_path}...")
+                xt_data, ctx_data = self._load_training_data_cache(cache_path)
+                return xt_data.to(self.device), ctx_data.to(self.device)
+
         all_xt = []
         all_ctx = []
         
@@ -99,13 +112,27 @@ class NLEEstimator:
                 theta, x_ref, ref_noize, n_steps)
             all_xt.extend(xt_chunk)
             all_ctx.extend(ctx_chunk)
-        
-        return (torch.stack(all_xt).to(self.device),
-                torch.stack(all_ctx).to(self.device))
+
+        xt_data = torch.stack(all_xt).to(self.device)
+        ctx_data = torch.stack(all_ctx).to(self.device)
+
+        if cache_path is not None:
+            self._save_training_data_cache(
+                cache_path=cache_path,
+                xt_data=xt_data,
+                ctx_data=ctx_data,
+                n_params=n_params,
+                ref_noize=ref_noize,
+                n_steps=n_steps,
+                x_ref_shape=tuple(x_ref.shape),
+            )
+
+        return xt_data, ctx_data
     
     def train(self, x_ref: torch.Tensor, n_params: int = 500, 
               ref_noize: float = 0.02,
               n_steps: NStepsType = 50,
+              cache_path: PathLike | None = None,
               batch_size: int = 256, lr: float = 5e-4, 
               epochs: int = 50) -> 'NLEEstimator':
         """
@@ -116,6 +143,7 @@ class NLEEstimator:
             n_params: Number of parameter samples for training
             ref_noize: Noise level for initial conditions
             n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
+            cache_path: Optional path to save or reuse generated training data
             batch_size: Training batch size
             lr: Learning rate
             epochs: Number of epochs
@@ -125,7 +153,7 @@ class NLEEstimator:
         # Generate training data
         start_time = time.time()
         xt_data, ctx_data = self.generate_training_data(
-            n_params, x_ref, ref_noize, n_steps)
+            n_params, x_ref, ref_noize, n_steps, cache_path=cache_path)
         print(f"Data generation took {time.time() - start_time:.2f}s,"
               f"samples: {len(ctx_data)}")
         
@@ -182,3 +210,45 @@ class NLEEstimator:
 
     def _uses_n_steps_conditioning(self, n_steps: NStepsType) -> bool:
         return isinstance(n_steps, (tuple, list))
+
+    def _save_training_data_cache(
+            self,
+            cache_path: Path,
+            xt_data: torch.Tensor,
+            ctx_data: torch.Tensor,
+            n_params: int,
+            ref_noize: float,
+            n_steps: NStepsType,
+            x_ref_shape: Tuple[int, ...]) -> None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "xt_data": xt_data.detach().cpu(),
+                "ctx_data": ctx_data.detach().cpu(),
+                "metadata": {
+                    "n_params": n_params,
+                    "ref_noize": ref_noize,
+                    "n_steps": n_steps,
+                    "x_ref_shape": x_ref_shape,
+                    "conditions_on_n_steps": self.conditions_on_n_steps,
+                },
+                "member_variables": {
+                    "dynamics": self.dynamics,
+                    "sampling_dist": self.sampling_dist,
+                    "device": self.device,
+                    "conditions_on_n_steps": self.conditions_on_n_steps,
+                },
+            },
+            cache_path,
+        )
+        print(f"Saved training data cache to {cache_path}")
+
+    def _load_training_data_cache(
+            self,
+            cache_path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
+        cache = torch.load(cache_path, map_location="cpu")
+        metadata = cache.get("metadata", {})
+        if "conditions_on_n_steps" in metadata:
+            self.conditions_on_n_steps = metadata["conditions_on_n_steps"]
+        self.cached_member_variables = cache.get("member_variables", {})
+        return cache["xt_data"], cache["ctx_data"]
