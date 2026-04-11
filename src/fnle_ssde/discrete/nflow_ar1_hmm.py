@@ -95,12 +95,12 @@ class NFlowAR1HMMEstimator(nn.Module):
         
         return log_B
     
-    def _forward_scaled(self, X):
+    def _forward_scaled(self, X, log_B=None):
         T = X.shape[0]
         nS = self.n_states
     
-        # 1回だけ計算
-        log_B = self._compute_log_emission_matrix(X)  # (T-1, nS)
+        if log_B is None:
+            log_B = self._compute_log_emission_matrix(X)  # (T-1, nS)
     
         rows = []
         log_cs = []
@@ -126,10 +126,11 @@ class NFlowAR1HMMEstimator(nn.Module):
         log_c = torch.stack(log_cs, dim=0)                 # (T-1,)
         return log_alpha_hat, log_c
         
-    def _backward_scaled(self, X, log_c):
+    def _backward_scaled(self, X, log_c, log_B=None):
         T = X.shape[0]
         nS = self.n_states
-        log_B = self._compute_log_emission_matrix(X)       # (T-1, nS)
+        if log_B is None:
+            log_B = self._compute_log_emission_matrix(X)       # (T-1, nS)
     
         rows_rev = []
         # 最後はゼロ行
@@ -172,10 +173,10 @@ class NFlowAR1HMMEstimator(nn.Module):
         log_B = self._compute_log_emission_matrix(X)
         
         # Forward pass
-        log_alpha_hat, log_c = self._forward_scaled(X)
+        log_alpha_hat, log_c = self._forward_scaled(X, log_B=log_B)
         
         # Backward pass
-        log_beta_hat = self._backward_scaled(X, log_c)
+        log_beta_hat = self._backward_scaled(X, log_c, log_B=log_B)
         
         # Compute log likelihood
         log_likelihood = torch.sum(log_c)
