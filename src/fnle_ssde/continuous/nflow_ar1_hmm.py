@@ -121,12 +121,12 @@ class NFlowAR1HMMGibbsSampler(nn.Module):
         
         return log_B
     
-    def _forward_scaled(self, X):
-        T = X.shape[0]
+    def _forward_scaled(self, Y, n_steps):
+        T = Y.shape[0]
         nS = self.n_states
     
         # 1回だけ計算
-        log_B = self._compute_log_emission_matrix(X)  # (T-1, nS)
+        log_B = self._compute_log_emission_matrix(Y, n_steps)  # (T-1, nS)
     
         rows = []
         log_cs = []
