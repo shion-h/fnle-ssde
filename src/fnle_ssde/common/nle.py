@@ -139,16 +139,16 @@ class NLEEstimator:
         x_ref_shape = tuple(x_ref.shape)
 
         if self.model_cache_path is not None and self.model_cache_path.exists():
-                cache = self._load_model_cache(self.model_cache_path)
-                xt_data = cache.get("xt_data")
-                ctx_data = cache.get("ctx_data")
-                metadata = cache.get("metadata", {})
-                if xt_data is not None and ctx_data is not None:
-                    print(f"Loading cached training data from {self.model_cache_path}...")
-                    if "conditions_on_n_steps" in metadata:
-                        self.conditions_on_n_steps = metadata["conditions_on_n_steps"]
-                    xt_data = xt_data.to(self.device)
-                    ctx_data = ctx_data.to(self.device)
+            cache = self._load_model_cache(self.model_cache_path)
+            xt_data = cache.get("xt_data")
+            ctx_data = cache.get("ctx_data")
+            metadata = cache.get("metadata", {})
+            if xt_data is not None and ctx_data is not None:
+                print(f"Loading cached training data from {self.model_cache_path}...")
+                if "conditions_on_n_steps" in metadata:
+                    self.conditions_on_n_steps = metadata["conditions_on_n_steps"]
+                xt_data = xt_data.to(self.device)
+                ctx_data = ctx_data.to(self.device)
 
         if xt_data is None or ctx_data is None:
             xt_data, ctx_data = self.generate_training_data(
