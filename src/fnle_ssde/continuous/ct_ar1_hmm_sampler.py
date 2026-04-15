@@ -262,36 +262,56 @@ class ContinuousTimeAR1HMMSampler:
             raise RuntimeError("Call initialize() before build_augmented_grid().")
 
         T_pseudo = self.add_virtual_jumps()
-        T_all = torch.cat(
-            [
-                self.T_true,
-                T_pseudo,
-                self.T_obs,
-            ]
-        )
-        T_all = torch.unique(T_all, sorted=True)
+        T_all_values: List[float] = []
+        is_event_values: List[bool] = []
+        obs_idx_values: List[int] = []
 
-        tol = 1e-10
-        is_jump_or_virtual_time = torch.zeros(T_all.shape[0], dtype=torch.bool, device=self.device)
-        jump_or_virtual_times = torch.cat([self.T_true, T_pseudo])
-        for t in jump_or_virtual_times:
-            idx = torch.argmin(torch.abs(T_all - t))
-            if torch.abs(T_all[idx] - t) < tol:
-                is_jump_or_virtual_time[idx] = True
+        # K-way merge of the sorted sets T_true, T_pseudo, and T_obs.
+        # This avoids building T_all by concatenate+unique and avoids searching
+        # T_all again to mark event times.  Exact ties are collapsed by recording
+        # which source sequences attained the selected next_time.
+        idx_true = 0
+        idx_pseudo = 0
+        idx_obs = 0
+        while idx_true < self.T_true.shape[0] or idx_pseudo < T_pseudo.shape[0] or idx_obs < self.N:
+            t_true = float(self.T_true[idx_true].item()) if idx_true < self.T_true.shape[0] else float("inf")
+            t_pseudo = float(T_pseudo[idx_pseudo].item()) if idx_pseudo < T_pseudo.shape[0] else float("inf")
+            t_obs = float(self.T_obs[idx_obs].item()) if idx_obs < self.N else float("inf")
 
-        obs_idx_in_T_all = torch.empty(self.N, dtype=torch.long, device=self.device)
-        for i, t in enumerate(self.T_obs):
-            idx = torch.argmin(torch.abs(T_all - t))
-            if torch.abs(T_all[idx] - t) > tol:
-                raise RuntimeError("Observation time was not found on the merged grid.")
-            obs_idx_in_T_all[i] = idx
+            next_time = min(t_true, t_pseudo, t_obs)
+            from_true = t_true == next_time
+            from_pseudo = t_pseudo == next_time
+            from_obs = t_obs == next_time
+
+            if from_true:
+                idx_true += 1
+            if from_pseudo:
+                idx_pseudo += 1
+            if from_obs:
+                obs_idx_at_time = idx_obs
+                idx_obs += 1
+
+            T_all_idx = len(T_all_values)
+            T_all_values.append(next_time)
+            is_event_values.append(from_true or from_pseudo)
+            if from_obs:
+                obs_idx_values.append(T_all_idx)
+
+        T_all = torch.tensor(T_all_values, dtype=self.dtype, device=self.device)
+        is_jump_or_virtual_time = torch.tensor(is_event_values, dtype=torch.bool, device=self.device)
+        obs_idx_in_T_all = torch.tensor(obs_idx_values, dtype=torch.long, device=self.device)
+        if obs_idx_in_T_all.shape[0] != self.N:
+            raise RuntimeError("Observation time was not found on the merged grid.")
 
         # Point-state representation on T_all.
         interval_states = torch.empty(T_all.shape[0] - 1, dtype=torch.long, device=self.device)
         path_idx = 0
         for j in range(T_all.shape[0] - 1):
+            # time at the left of the interval
             left = T_all[j]
-            while path_idx < self.T_true.shape[0] and left >= self.T_true[path_idx] - tol:
+            # Set path_idx to the first index where T_true[path_idx] > left, 
+            # so that z_true[path_idx-1] is the state on the interval.
+            while self.T_true[path_idx] <= left and path_idx < self.T_true.shape[0]:
                 path_idx += 1
             interval_states[j] = self.z_true[path_idx]
 
