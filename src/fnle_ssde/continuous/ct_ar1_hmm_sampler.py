@@ -340,15 +340,16 @@ class ContinuousTimeAR1HMMSampler:
 
         pseudo_times: List[torch.Tensor] = []
         for j, state in enumerate(self.z_true.tolist()):
+            # state is the regime on the interval between t0 and t1
             t0 = 0.0 if j == 0 else self.T_true[j - 1].item()
             t1 = self.T.item() if j == len(self.z_true) - 1 else self.T_true[j].item()
-            dt = max(t1 - t0, 0.0)
+            dt = t1 - t0
             if dt <= 0.0:
-                continue
+                raise RuntimeError("dt <= 0 encountered when adding virtual jumps.")
 
-            rate = max(self.omega + float(self.Q[state, state].item()), 0.0)
+            rate = self.omega + float(self.Q[state, state].item())
             if rate <= 0.0:
-                continue
+                raise RuntimeError("omega must be greater than max_k(-Q_kk) to ensure a positive virtual jump rate.")
 
             num_virtual = torch.poisson(torch.tensor(rate * dt, dtype=self.dtype)).to(torch.long).item()
             if num_virtual == 0:
@@ -361,7 +362,6 @@ class ContinuousTimeAR1HMMSampler:
             return torch.empty(0, dtype=self.dtype, device=self.device)
 
         T_pseudo = torch.cat(pseudo_times)
-        T_pseudo = T_pseudo[(T_pseudo > 0.0) & (T_pseudo < self.T)]
         return torch.unique(T_pseudo, sorted=True)
 
     def ou_transition_mean_var(
