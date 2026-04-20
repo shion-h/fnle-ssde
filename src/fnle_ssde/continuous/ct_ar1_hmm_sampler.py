@@ -311,7 +311,7 @@ class ContinuousTimeAR1HMMSampler:
             left = T_all[j]
             # Set path_idx to the first index where T_true[path_idx] > left, 
             # so that z_true[path_idx-1] is the state on the interval.
-            while self.T_true[path_idx] <= left and path_idx < self.T_true.shape[0]:
+            while path_idx < self.T_true.shape[0] and self.T_true[path_idx] <= left:
                 path_idx += 1
             interval_states[j] = self.z_true[path_idx]
 
@@ -659,53 +659,70 @@ class ContinuousTimeAR1HMMSampler:
         Sample z on the augmented grid with FFBS in log-space.
 
         Forward recursion:
-            alpha_j(h) = log sum_i exp(alpha_{j-1}(i) + log g_j(i) + log A_j(i, h))
+            log_alpha_j(h)
+                = log g_j(h) + logsumexp_i(log_alpha_{j-1}(i) + log A_j(i, h))
+
+        Then we normalize at each step:
+            log_alpha_j(h) <- log_alpha_j(h) - logsumexp_h(log_alpha_j(h))
+
+        Hence `log_alpha[j]` in the code is a scaled forward message, defined only
+        up to an additive constant shared across states at time j. This scaling does
+        not change the FFBS conditional distributions because only within-time
+        differences across states matter.
 
         where:
-            g_j(i) = p(y_j | y_{j-1}, z_{j-1}=i, Delta_j; theta)
-            A_j = B if T_all[j] belongs to T_true ∪ T_pseudo, else I
+            g_j(h) = p(y_j | y_{j-1}, z_j = h, Delta_j; theta)
+            A_j(i, h) is the transition kernel from previous state i to current
+            state h on interval [T_all[j-1], T_all[j]]
+            A_j = B if the right endpoint T_all[j] is in T_true ∪ T_pseudo, else I
+
+        In code, interval index `j-1` is stored at array index `j-1`, so the update
+        from time index `j` to `j+1` is written using `emission_logits[j]` and the
+        event indicator at `T_all[j+1]`.
         """
         if self.grid is None or self.y_aug is None:
             raise RuntimeError("Sampler must be initialized before sample_z_ffbs().")
 
         grid = self.grid
-        L = grid.T_all.shape[0] - 1
-        log_alpha = torch.empty(L + 1, self.K, dtype=self.dtype, device=self.device)
+        L = grid.T_all.shape[0]
+        log_alpha = torch.empty(L, self.K, dtype=self.dtype, device=self.device)
         log_alpha[0] = torch.log(self.initial_state_probs.clamp_min(1e-32))
 
-        eye = torch.eye(self.K, dtype=self.dtype, device=self.device)
         log_B = torch.log(self.B.clamp_min(1e-32))
-        log_I = torch.log(eye.clamp_min(1e-32))
 
         deltas = grid.T_all[1:] - grid.T_all[:-1]
-        transition_choice: List[torch.Tensor] = []
-        emission_logits = torch.empty(L, self.K, dtype=self.dtype, device=self.device)
+        emission_logits = torch.empty(L - 1, self.K, dtype=self.dtype, device=self.device)
 
-        for j in range(1, L + 1):
-            dt = deltas[j - 1]
+        for j in range(L - 1):
+            dt = deltas[j]
             for k in range(self.K):
-                emission_logits[j - 1, k] = self.ou_transition_logprob(
-                    y_curr=self.y_aug[j],
-                    y_prev=self.y_aug[j - 1],
+                emission_logits[j, k] = self.ou_transition_logprob(
+                    y_curr=self.y_aug[j + 1],
+                    y_prev=self.y_aug[j],
                     state=k,
                     delta=dt,
                     theta=self.theta,
                 )
 
-            log_A_j = log_B if grid.is_jump_or_virtual_time[j] else log_I
-            transition_choice.append(log_A_j)
-            scores = log_alpha[j - 1].unsqueeze(1) + emission_logits[j - 1].unsqueeze(1) + log_A_j
-            log_alpha[j] = torch.logsumexp(scores, dim=0)
+            if grid.is_jump_or_virtual_time[j + 1]:
+                scores = log_alpha[j].unsqueeze(1) + log_B
+                log_alpha[j + 1] = emission_logits[j] + torch.logsumexp(scores, dim=0)
+            else:
+                # At observation-only times the transition kernel is I, so the state
+                # does not change. Only the OU transition likelihood contributes.
+                log_alpha[j + 1] = log_alpha[j] + emission_logits[j]
+            log_alpha[j + 1] = log_alpha[j + 1] - torch.logsumexp(log_alpha[j + 1], dim=0)
 
-        z = torch.empty(L + 1, dtype=torch.long, device=self.device)
-        z[L] = dist.Categorical(logits=log_alpha[L]).sample()
+        z = torch.empty(L, dtype=torch.long, device=self.device)
+        z[L - 1] = dist.Categorical(logits=log_alpha[L - 1]).sample()
 
-        for j in range(L, 0, -1):
-            log_A_j = transition_choice[j - 1]
-            logits_prev = log_alpha[j - 1] + emission_logits[j - 1] + log_A_j[:, z[j]]
-            z[j - 1] = dist.Categorical(logits=logits_prev).sample()
+        for j in range(L - 2, -1, -1):
+            if grid.is_jump_or_virtual_time[j + 1]:
+                logits_prev = log_alpha[j] + log_B[:, z[j + 1]]
+                z[j] = dist.Categorical(logits=logits_prev).sample()
+            else:
+                z[j] = z[j + 1]
 
-        z[-1] = z[-2]
         return z
 
     def prune_self_transitions(
