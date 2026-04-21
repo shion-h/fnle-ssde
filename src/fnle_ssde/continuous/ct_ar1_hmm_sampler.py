@@ -64,10 +64,9 @@ class ContinuousTimeAR1HMMSampler:
     Conventions
     -----------
     - States are indexed from 0 to K-1.
-    - `z_aug[j+1]` denotes the state on the interval [T_all[j], T_all[j+1]].
-    - Therefore the OU transition from y_aug[j] to y_aug[j+1] uses state z_aug[j+1].
-    - `z_aug[0]` duplicates the first interval state so that `z_aug` has the same
-      length as `T_all`.
+    - `z_aug[j]` denotes the state immediately after time `T_all[j]`.
+      Therefore the OU transition on interval [T_all[j-1], T_all[j]] uses state z_aug[j-1].
+    - The final entry z_aug[-1] is duplicated for shape convenience.
     """
 
     def __init__(
@@ -203,8 +202,8 @@ class ContinuousTimeAR1HMMSampler:
         Path convention
         ---------------
         - `initial_path_times` stores only true jump times in the open interval (0, T).
-        - `initial_path_states` stores the regime on each true-path segment, so its
-          length must be `len(initial_path_times) + 1`.
+        - `initial_path_states` stores the regime on each segment, so its length must be
+          `len(initial_path_times) + 1`.
         """
         if initial_state_probs is not None:
             probs = initial_state_probs.to(device=self.device, dtype=self.dtype)
@@ -274,7 +273,6 @@ class ContinuousTimeAR1HMMSampler:
         idx_true = 0
         idx_pseudo = 0
         idx_obs = 0
-        idx_all = 0
         while idx_true < self.T_true.shape[0] or idx_pseudo < T_pseudo.shape[0] or idx_obs < self.N:
             t_true = float(self.T_true[idx_true].item()) if idx_true < self.T_true.shape[0] else float("inf")
             t_pseudo = float(T_pseudo[idx_pseudo].item()) if idx_pseudo < T_pseudo.shape[0] else float("inf")
@@ -285,17 +283,19 @@ class ContinuousTimeAR1HMMSampler:
             from_pseudo = t_pseudo == next_time
             from_obs = t_obs == next_time
 
-            T_all_values.append(next_time)
-            is_event_values.append(from_true or from_pseudo)
-
             if from_true:
                 idx_true += 1
             if from_pseudo:
                 idx_pseudo += 1
             if from_obs:
-                obs_idx_values.append(idx_all)
+                obs_idx_at_time = idx_obs
                 idx_obs += 1
-            idx_all += 1
+
+            T_all_idx = len(T_all_values)
+            T_all_values.append(next_time)
+            is_event_values.append(from_true or from_pseudo)
+            if from_obs:
+                obs_idx_values.append(T_all_idx)
 
         T_all = torch.tensor(T_all_values, dtype=self.dtype, device=self.device)
         is_jump_or_virtual_time = torch.tensor(is_event_values, dtype=torch.bool, device=self.device)
@@ -304,23 +304,20 @@ class ContinuousTimeAR1HMMSampler:
             raise RuntimeError("Observation time was not found on the merged grid.")
 
         # Point-state representation on T_all.
-        # z_aug[j+1] is the regime on [T_all[j], T_all[j+1]], and z_aug[0]
-        # duplicates the first interval state. z_true is not padded: z_true[r] is
-        # the regime on true-path segment r.
         interval_states = torch.empty(T_all.shape[0] - 1, dtype=torch.long, device=self.device)
         path_idx = 0
         for j in range(T_all.shape[0] - 1):
             # time at the left of the interval
             left = T_all[j]
-            # path_idx is the number of true jumps at or before `left`.
-            # The matching true-path state is z_true[path_idx].
+            # Set path_idx to the first index where T_true[path_idx] > left, 
+            # so that z_true[path_idx-1] is the state on the interval.
             while path_idx < self.T_true.shape[0] and self.T_true[path_idx] <= left:
                 path_idx += 1
             interval_states[j] = self.z_true[path_idx]
 
         z_aug = torch.empty(T_all.shape[0], dtype=torch.long, device=self.device)
-        z_aug[0] = interval_states[0]
-        z_aug[1:] = interval_states
+        z_aug[:-1] = interval_states
+        z_aug[-1] = interval_states[-1]
 
         return _AugmentedGrid(
             T_all=T_all,
@@ -342,11 +339,10 @@ class ContinuousTimeAR1HMMSampler:
             raise RuntimeError("Call initialize() before add_virtual_jumps().")
 
         pseudo_times: List[torch.Tensor] = []
-        segment_states = self.z_true
-        for j, state in enumerate(segment_states.tolist()):
+        for j, state in enumerate(self.z_true.tolist()):
             # state is the regime on the interval between t0 and t1
             t0 = 0.0 if j == 0 else self.T_true[j - 1].item()
-            t1 = self.T.item() if j == segment_states.shape[0] - 1 else self.T_true[j].item()
+            t1 = self.T.item() if j == len(self.z_true) - 1 else self.T_true[j].item()
             dt = t1 - t0
             if dt <= 0.0:
                 raise RuntimeError("dt <= 0 encountered when adding virtual jumps.")
@@ -442,7 +438,7 @@ class ContinuousTimeAR1HMMSampler:
 
             log p(y_aug | z_aug, theta, x)
               = log p(y_0 | z_0, theta)
-              + sum_l log p(y_l | y_{l-1}, z_l, Delta_l, theta)
+              + sum_l log p(y_l | y_{l-1}, z_{l-1}, Delta_l, theta)
               + sum_i log p(x_i | y_{m(i)}, theta)
         """
         theta = self.theta if theta is None else theta
@@ -458,7 +454,7 @@ class ContinuousTimeAR1HMMSampler:
             logp = logp + self.ou_transition_logprob(
                 y_curr=y_aug[l],
                 y_prev=y_aug[l - 1],
-                state=z_aug[l],
+                state=z_aug[l - 1],
                 delta=deltas[l - 1],
                 theta=theta,
             )
@@ -481,7 +477,7 @@ class ContinuousTimeAR1HMMSampler:
 
             log p(theta | y, z, x)
               = log p(theta)
-              + sum_l log p(y_l | y_{l-1}, z_l, Delta_l, theta)
+              + sum_l log p(y_l | y_{l-1}, z_{l-1}, Delta_l, theta)
               + sum_i log p(x_i | y_{m(i)}, theta)
         """
         cfg = self.prior_config
@@ -496,7 +492,7 @@ class ContinuousTimeAR1HMMSampler:
             logp = logp + self.ou_transition_logprob(
                 y_curr=y_aug[l],
                 y_prev=y_aug[l - 1],
-                state=z_aug[l],
+                state=z_aug[l - 1],
                 delta=deltas[l - 1],
                 theta=theta,
             )
@@ -667,22 +663,22 @@ class ContinuousTimeAR1HMMSampler:
                 = log g_j(h) + logsumexp_i(log_alpha_{j-1}(i) + log A_j(i, h))
 
         Then we normalize at each step:
-            log_alpha_j(h)
-                <- log_alpha_j(h) - logsumexp_h(log_alpha_j(h))
+            log_alpha_j(h) <- log_alpha_j(h) - logsumexp_h(log_alpha_j(h))
 
-        Hence `log_alpha[j]` in the code is a scaled forward message for the state
-        on interval [T_all[j-1], T_all[j]], defined only up to an additive constant
-        shared across states at time index j. This scaling does not change the FFBS
-        conditional distributions because only within-time differences across states
-        matter.
+        Hence `log_alpha[j]` in the code is a scaled forward message, defined only
+        up to an additive constant shared across states at time j. This scaling does
+        not change the FFBS conditional distributions because only within-time
+        differences across states matter.
 
         where:
             g_j(h) = p(y_j | y_{j-1}, z_j = h, Delta_j; theta)
-            A_j(i, h) is the transition kernel at the right endpoint T_all[j]
-            A_j = B if T_all[j] is in T_true ∪ T_pseudo, else I
+            A_j(i, h) is the transition kernel from previous state i to current
+            state h on interval [T_all[j-1], T_all[j]]
+            A_j = B if the right endpoint T_all[j] is in T_true ∪ T_pseudo, else I
 
-        This matches the rest of the codebase: the latent regime attached to an OU
-        transition from y_aug[j-1] to y_aug[j] is z_aug[j].
+        In code, interval index `j-1` is stored at array index `j-1`, so the update
+        from time index `j` to `j+1` is written using `emission_logits[j]` and the
+        event indicator at `T_all[j+1]`.
         """
         if self.grid is None or self.y_aug is None:
             raise RuntimeError("Sampler must be initialized before sample_z_ffbs().")
@@ -727,7 +723,6 @@ class ContinuousTimeAR1HMMSampler:
             else:
                 z[j] = z[j + 1]
 
-        z[0] = z[1]
         return z
 
     def prune_self_transitions(
@@ -740,24 +735,18 @@ class ContinuousTimeAR1HMMSampler:
         Convert the sampled augmented skeleton back to a true jump path.
 
         Only candidate times where the state actually changes are retained as true jumps.
-        Returned z_true is not padded: z_true[r] is the state on true segment r.
         """
-        T_true_value: List[float] = []
-        # z_true[j] is the regime on [T_true[j-1], T_true[j]],
-        # so we start with z_aug[1](equals z_aug[0]).
-        z_true_value: List[int] = [int(z_aug[1].item())]
+        keep_jump_times: List[float] = []
+        keep_states: List[int] = [int(z_aug[0].item())]
 
-        # T_all[1], ... T_all[T_all.shape[0] - 2]
-        # z_aug[2], ... z_aug[T_all.shape[0] - 1]
         for j in range(1, T_all.shape[0] - 1):
-            # not obs, and state changes across this interval
-            if bool(is_jump_or_virtual_time[j]) and int(z_aug[j + 1].item()) != int(z_aug[j].item()):
-                T_true_value.append(float(T_all[j].item()))
-                z_true_value.append(int(z_aug[j + 1].item()))
+            if bool(is_jump_or_virtual_time[j]) and int(z_aug[j].item()) != int(z_aug[j - 1].item()):
+                keep_jump_times.append(float(T_all[j].item()))
+                keep_states.append(int(z_aug[j].item()))
 
-        T_true = torch.tensor(T_true_value, dtype=self.dtype, device=self.device)
-        z_true = torch.tensor(z_true_value, dtype=torch.long, device=self.device)
-        return T_true, z_true
+        path_times = torch.tensor(keep_jump_times, dtype=self.dtype, device=self.device)
+        path_states = torch.tensor(keep_states, dtype=torch.long, device=self.device)
+        return path_times, path_states
 
     def one_sweep(self) -> Dict[str, Any]:
         """Run one Gibbs sweep: augment grid, sample y, sample z, sample theta."""
