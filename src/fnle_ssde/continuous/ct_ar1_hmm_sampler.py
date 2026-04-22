@@ -308,17 +308,18 @@ class ContinuousTimeAR1HMMSampler:
         # duplicates the first interval state. z_true is not padded: z_true[r] is
         # the regime on true-path segment r.
         interval_states = torch.empty(T_all.shape[0] - 1, dtype=torch.long, device=self.device)
-        path_idx = 0
+        T_true_idx = 0
         for j in range(T_all.shape[0] - 1):
             # time at the left of the interval
             left = T_all[j]
-            # path_idx is the number of true jumps at or before `left`.
-            # The matching true-path state is z_true[path_idx].
-            while path_idx < self.T_true.shape[0] and self.T_true[path_idx] <= left:
-                path_idx += 1
-            interval_states[j] = self.z_true[path_idx]
+            # T_true_idx is the number of true jumps at or before `left`.
+            # The matching true-path state is z_true[T_true_idx].
+            while T_true_idx < self.T_true.shape[0] and self.T_true[T_true_idx] <= left:
+                T_true_idx += 1
+            interval_states[j] = self.z_true[T_true_idx]
 
         z_aug = torch.empty(T_all.shape[0], dtype=torch.long, device=self.device)
+        # To fit z_aug indices with y_aug indices, duplicate the first interval state
         z_aug[0] = interval_states[0]
         z_aug[1:] = interval_states
 
@@ -342,11 +343,10 @@ class ContinuousTimeAR1HMMSampler:
             raise RuntimeError("Call initialize() before add_virtual_jumps().")
 
         pseudo_times: List[torch.Tensor] = []
-        segment_states = self.z_true
-        for j, state in enumerate(segment_states.tolist()):
+        for j, state in enumerate(self.z_true.tolist()):
             # state is the regime on the interval between t0 and t1
             t0 = 0.0 if j == 0 else self.T_true[j - 1].item()
-            t1 = self.T.item() if j == segment_states.shape[0] - 1 else self.T_true[j].item()
+            t1 = self.T.item() if j == self.z_true.shape[0] - 1 else self.T_true[j].item()
             dt = t1 - t0
             if dt <= 0.0:
                 raise RuntimeError("dt <= 0 encountered when adding virtual jumps.")
@@ -741,6 +741,7 @@ class ContinuousTimeAR1HMMSampler:
 
         Only candidate times where the state actually changes are retained as true jumps.
         Returned z_true is not padded: z_true[r] is the state on true segment r.
+        z_true[j]: state in [T_true[j], T_true[j+1]]
         """
         T_true_value: List[float] = []
         # z_true[j] is the regime on [T_true[j-1], T_true[j]],
