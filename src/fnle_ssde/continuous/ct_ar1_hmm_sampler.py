@@ -5,19 +5,21 @@ This implementation combines:
 1. Uniformization / virtual jumps for the continuous-time discrete state path z(t)
 2. Conditional NUTS updates for the continuous latent trajectory y on an augmented grid
 3. FFBS updates for the discrete state skeleton on the same augmented grid
-4. Conditional NUTS updates for the OU / observation parameters
+4. Conditional NUTS updates for the NLE transition parameters
+5. Conjugate Gibbs updates for the diagonal observation noise
+6. Conjugate Gibbs updates for the CTMC generator Q
 
 Model summary
 -------------
 z(t) in {0, ..., K-1} follows a continuous-time Markov jump process with generator Q.
 
-Conditional on regime k, each coordinate d=1,...,D follows an independent OU process:
-
-    dy_t^(d) = -lambda_{k,d} (y_t^(d) - mu_{k,d}) dt + sigma_{k,d} dW_t^(d)
-
 The observation model is diagonal Gaussian:
 
     x_i | y(t_i) ~ Normal(y(t_i), diag(tau_obs^2))
+
+The latent transition density is evaluated by an NLEEstimator:
+
+    p(y_{t+1} | y_t, z=k) = flow.log_prob(y_{t+1}, context=[theta_k, y_t, n_step?])
 
 The code keeps the implementation intentionally explicit and modular inside one class so
 that each Gibbs step remains easy to inspect and modify.
@@ -48,7 +50,7 @@ class _AugmentedGrid:
 
 class ContinuousTimeAR1HMMSampler:
     """
-    Gibbs sampler for a continuous-time AR(1)-HMM with diagonal multivariate OU dynamics.
+    Gibbs sampler for a continuous-time AR(1)-HMM with NLE transition density.
 
     Shapes
     ------
@@ -56,16 +58,15 @@ class ContinuousTimeAR1HMMSampler:
     T_obs: (N,)
     y_aug: (L+1, D)
     z_aug: (L+1,)
-    mu: (K, D)
-    log_lambda: (K, D)
-    log_sigma: (K, D)
-    log_tau_obs: (D,)
+    theta: (K, theta_dim)       NLE transition/emission-density parameters only
+    log_tau_obs: (D,)           observation-noise log scale, not part of theta
+    Q: (K, K)                   CTMC generator, sampled by Gamma conjugacy
 
     Conventions
     -----------
     - States are indexed from 0 to K-1.
     - `z_aug[j+1]` denotes the state on the interval [T_all[j], T_all[j+1]].
-    - Therefore the OU transition from y_aug[j] to y_aug[j+1] uses state z_aug[j+1].
+    - Therefore the NLE transition from y_aug[j] to y_aug[j+1] uses state z_aug[j+1].
     - `z_aug[0]` duplicates the first interval state so that `z_aug` has the same
       length as `T_all`.
     """
@@ -78,9 +79,11 @@ class ContinuousTimeAR1HMMSampler:
         T: float,
         *,
         omega_scale: float = 1.5,
+        nle_estimator: Any,
+        n_step: int = 1,
         y_nuts_config: Optional[Dict[str, Any]] = None,
         theta_nuts_config: Optional[Dict[str, Any]] = None,
-        prior_config: Optional[Dict[str, float]] = None,
+        prior_config: Optional[Dict[str, Any]] = None,
         y0_prior_scale: float = 5.0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float64,
@@ -100,10 +103,16 @@ class ContinuousTimeAR1HMMSampler:
             End time of the latent process.
         omega_scale:
             Uniformization rate factor. Omega = omega_scale * max_k(-Q_kk).
+        nle_estimator:
+            Trained/loaded NLEEstimator. Transition log densities are evaluated by
+            `nle_estimator.estimator.log_prob`.
+        n_step:
+            Fixed simulation-step conditioning value passed to the NLE when the
+            estimator was trained with n-step conditioning.
         y_nuts_config / theta_nuts_config:
             Pyro NUTS settings used for the conditional updates.
         prior_config:
-            Prior hyperparameters for theta.
+            Prior hyperparameters for theta and observation-noise variance.
         y0_prior_scale:
             Optional fallback scale for initialization of y.
         """
@@ -114,12 +123,26 @@ class ContinuousTimeAR1HMMSampler:
         pyro.set_rng_seed(seed)
 
         self.Q = Q.to(device=self.device, dtype=self.dtype)
+        self.omega_scale = float(omega_scale)
         self.x_obs = x_obs.to(device=self.device, dtype=self.dtype)
         self.T_obs = obs_times.to(device=self.device, dtype=self.dtype)
         self.T = torch.tensor(float(T), device=self.device, dtype=self.dtype)
         self.K = int(self.Q.shape[0])
         self.N, self.D = self.x_obs.shape
         self.y0_prior_scale = float(y0_prior_scale)
+        self.n_step = int(n_step)
+        if self.n_step < 1:
+            raise ValueError("n_step must be a positive integer.")
+        self.nle_estimator = nle_estimator
+        self.flow_model = nle_estimator.estimator
+        if self.flow_model is None:
+            raise ValueError("nle_estimator.estimator must be trained/loaded before sampling.")
+        self.conditions_on_n_steps = bool(getattr(nle_estimator, "conditions_on_n_steps", False))
+        self.theta_dim = int(nle_estimator.dynamics.theta_dim)
+        if hasattr(self.flow_model, "to"):
+            self.flow_model.to(self.device)
+        if hasattr(self.flow_model, "eval"):
+            self.flow_model.eval()
 
         if self.Q.shape != (self.K, self.K):
             raise ValueError("Q must be square with shape (K, K).")
@@ -136,9 +159,9 @@ class ContinuousTimeAR1HMMSampler:
         if abs(float(self.T_obs[-1].item()) - float(self.T.item())) > 1e-10:
             raise ValueError("obs_times must end at T.")
 
-        max_exit = torch.max(-torch.diag(self.Q)).item()
-        self.omega = float(max(omega_scale * max_exit, max_exit + 1e-6))
-        self.B = self._build_uniformized_transition_matrix()
+        self.omega = 0.0
+        self.B = torch.empty_like(self.Q)
+        self._refresh_uniformization()
 
         self.y_nuts_config = {
             "warmup_steps": 32,
@@ -159,16 +182,21 @@ class ContinuousTimeAR1HMMSampler:
             self.theta_nuts_config.update(theta_nuts_config)
 
         self.prior_config = {
-            "mu_loc": 0.0,
-            "mu_scale": 3.0,
-            "log_lambda_loc": 0.0,
-            "log_lambda_scale": 0.75,
-            "log_sigma_loc": -0.5,
-            "log_sigma_scale": 0.75,
-            "log_tau_loc": -1.0,
-            "log_tau_scale": 0.75,
+            "theta_loc": 0.0,
+            "theta_scale": 1.0,
+            # tau_obs[d]^2 ~ InvGamma(tau2_alpha, tau2_beta), independently by d.
+            "tau2_alpha": 2.0,
+            "tau2_beta": 0.1,
+            # q_ij ~ Gamma(q_alpha, q_beta) for i != j, using rate parameterization.
+            "q_alpha": 1.0,
+            "q_beta": 1.0,
         }
         if prior_config is not None:
+            # Accept old names, but internally keep theta as the NLE parameter only.
+            if "theta_nle_loc" in prior_config:
+                prior_config = {**prior_config, "theta_loc": prior_config["theta_nle_loc"]}
+            if "theta_nle_scale" in prior_config:
+                prior_config = {**prior_config, "theta_scale": prior_config["theta_nle_scale"]}
             self.prior_config.update(prior_config)
 
         self.history: Dict[str, List[Any]] = {
@@ -176,12 +204,16 @@ class ContinuousTimeAR1HMMSampler:
             "z_aug": [],
             "T_all": [],
             "theta": [],
+            "log_tau_obs": [],
+            "Q": [],
+            "omega": [],
             "T_true": [],
             "z_true": [],
             "diagnostics": [],
         }
 
-        self.theta: Dict[str, torch.Tensor] = {}
+        self.theta: Optional[torch.Tensor] = None
+        self.log_tau_obs: Optional[torch.Tensor] = None
         self.T_true: Optional[torch.Tensor] = None
         self.z_true: Optional[torch.Tensor] = None
         self.grid: Optional[_AugmentedGrid] = None
@@ -191,14 +223,18 @@ class ContinuousTimeAR1HMMSampler:
     def initialize(
         self,
         *,
-        initial_theta: Optional[Dict[str, torch.Tensor]] = None,
+        initial_theta: Optional[torch.Tensor | Dict[str, torch.Tensor]] = None,
+        initial_log_tau_obs: Optional[torch.Tensor] = None,
         initial_path_times: Optional[Sequence[float]] = None,
         initial_path_states: Optional[Sequence[int]] = None,
         initial_y_aug: Optional[torch.Tensor] = None,
         initial_state_probs: Optional[torch.Tensor] = None,
     ) -> None:
         """
-        Initialize theta, the true discrete path, and an initial y trajectory.
+        Initialize theta, observation noise, the true discrete path, and y.
+
+        `initial_theta` is the NLE transition/emission-density parameter only. Pass
+        observation noise separately as `initial_log_tau_obs`.
 
         Path convention
         ---------------
@@ -211,21 +247,34 @@ class ContinuousTimeAR1HMMSampler:
             self.initial_state_probs = probs / probs.sum()
 
         if initial_theta is None:
-            mu0 = self.x_obs.mean(dim=0)
             empirical_scale = self.x_obs.std(dim=0).clamp_min(0.25)
-            initial_theta = {
-                "mu": mu0.unsqueeze(0).repeat(self.K, 1),
-                "log_lambda": torch.zeros(self.K, self.D, device=self.device, dtype=self.dtype),
-                "log_sigma": torch.log(empirical_scale.unsqueeze(0).repeat(self.K, 1) * 0.7),
-                "log_tau_obs": torch.log(empirical_scale * 0.3),
-            }
+            theta_value = torch.zeros(self.K, self.theta_dim, device=self.device, dtype=self.dtype)
+            if initial_log_tau_obs is None:
+                initial_log_tau_obs = torch.log(empirical_scale * 0.3)
+        else:
+            if isinstance(initial_theta, dict):
+                if initial_log_tau_obs is None:
+                    # Legacy input only. New callers should pass initial_log_tau_obs separately.
+                    initial_log_tau_obs = initial_theta.get("log_tau_obs")
+                if "theta" in initial_theta:
+                    theta_value = initial_theta["theta"]
+                elif "theta_nle" in initial_theta:
+                    # Backward-compatible input name for callers that still pass theta_nle.
+                    theta_value = initial_theta["theta_nle"]
+                else:
+                    raise ValueError("initial_theta dict must contain key 'theta'.")
+            else:
+                theta_value = initial_theta
+            if initial_log_tau_obs is None:
+                empirical_scale = self.x_obs.std(dim=0).clamp_min(0.25)
+                initial_log_tau_obs = torch.log(empirical_scale * 0.3)
 
-        self.theta = {
-            "mu": initial_theta["mu"].to(device=self.device, dtype=self.dtype).clone(),
-            "log_lambda": initial_theta["log_lambda"].to(device=self.device, dtype=self.dtype).clone(),
-            "log_sigma": initial_theta["log_sigma"].to(device=self.device, dtype=self.dtype).clone(),
-            "log_tau_obs": initial_theta["log_tau_obs"].to(device=self.device, dtype=self.dtype).clone(),
-        }
+        self.theta = theta_value.to(device=self.device, dtype=self.dtype).clone()
+        self.log_tau_obs = initial_log_tau_obs.to(device=self.device, dtype=self.dtype).clone()
+        if self.theta.shape != (self.K, self.theta_dim):
+            raise ValueError(f"theta must have shape ({self.K}, {self.theta_dim}).")
+        if self.log_tau_obs.shape != (self.D,):
+            raise ValueError(f"log_tau_obs must have shape ({self.D},).")
 
         if initial_path_times is None or initial_path_states is None:
             self.T_true = torch.empty(0, dtype=self.dtype, device=self.device)
@@ -368,54 +417,34 @@ class ContinuousTimeAR1HMMSampler:
         T_pseudo = torch.cat(pseudo_times)
         return torch.unique(T_pseudo, sorted=True)
 
-    def ou_transition_mean_var(
-        self,
-        y_prev: torch.Tensor,
-        delta: torch.Tensor,
-        mu_k: torch.Tensor,
-        log_lambda_k: torch.Tensor,
-        log_sigma_k: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Diagonal OU transition moments.
-
-        Shapes
-        ------
-        y_prev: (..., D)
-        delta: scalar tensor or broadcastable to (..., 1)
-        mu_k, log_lambda_k, log_sigma_k: (D,)
-        """
-        delta = torch.as_tensor(delta, dtype=self.dtype, device=self.device)
-        if delta.ndim == 0:
-            delta = delta.reshape(1)
-        lam = torch.exp(log_lambda_k).clamp_min(1e-8)
-        sig = torch.exp(log_sigma_k).clamp_min(1e-8)
-        while delta.ndim < y_prev.ndim:
-            delta = delta.unsqueeze(-1)
-
-        exp_term = torch.exp(-lam * delta)
-        mean = mu_k + exp_term * (y_prev - mu_k)
-        # Use -expm1(-2 lambda delta) for small-delta stability.
-        var = (sig**2) * (-torch.expm1(-2.0 * lam * delta)) / (2.0 * lam)
-        var = var.clamp_min(1e-10)
-        return mean, var
-
-    def ou_transition_logprob(
+    def transition_logprob(
         self,
         y_curr: torch.Tensor,
         y_prev: torch.Tensor,
         state: int | torch.Tensor,
-        delta: torch.Tensor,
-        theta: Optional[Dict[str, torch.Tensor]] = None,
+        delta: Optional[torch.Tensor] = None,
+        theta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Log p(y_curr | y_prev, z=state, delta; theta) for diagonal OU transitions."""
+        """
+        Neural likelihood transition log density.
+
+        This mirrors NFlowAR1HMMGibbsSampler:
+            flow.log_prob(y_curr, context=[theta_state, y_prev, n_step?])
+        """
+        if self.flow_model is None:
+            raise RuntimeError("NLE transition requested but no flow_model is available.")
         theta = self.theta if theta is None else theta
+        if theta is None:
+            raise RuntimeError("Sampler theta has not been initialized.")
         k = int(state) if not torch.is_tensor(state) else int(state.item())
-        mu_k = theta["mu"][k]
-        log_lambda_k = theta["log_lambda"][k]
-        log_sigma_k = theta["log_sigma"][k]
-        mean, var = self.ou_transition_mean_var(y_prev, delta, mu_k, log_lambda_k, log_sigma_k)
-        return dist.Normal(mean, torch.sqrt(var)).log_prob(y_curr).sum()
+        theta_k = theta[k]
+        context = torch.cat([theta_k, y_prev], dim=-1).unsqueeze(0)
+        if self.conditions_on_n_steps:
+            n_step_tensor = torch.tensor([[float(self.n_step)]], dtype=y_prev.dtype, device=y_prev.device)
+            context = torch.cat([context, n_step_tensor], dim=-1)
+        y_batch = y_curr.unsqueeze(0)
+        log_prob = self.flow_model.log_prob(y_batch.unsqueeze(0), condition=context)
+        return log_prob.reshape(-1)[0]
 
     def observation_logprob(
         self,
@@ -425,7 +454,9 @@ class ContinuousTimeAR1HMMSampler:
     ) -> torch.Tensor:
         """Diagonal Gaussian observation log density."""
         if log_tau_obs is None:
-            log_tau_obs = self.theta["log_tau_obs"]
+            log_tau_obs = self.log_tau_obs
+        if log_tau_obs is None:
+            raise RuntimeError("Observation noise has not been initialized.")
         tau = torch.exp(log_tau_obs).clamp_min(1e-8)
         return dist.Normal(y, tau).log_prob(x).sum()
 
@@ -435,27 +466,32 @@ class ContinuousTimeAR1HMMSampler:
         z_aug: torch.Tensor,
         T_all: torch.Tensor,
         obs_idx_in_T_all: torch.Tensor,
-        theta: Optional[Dict[str, torch.Tensor]] = None,
+        theta: Optional[torch.Tensor] = None,
+        log_tau_obs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Conditional log density:
 
-            log p(y_aug | z_aug, theta, x)
+            log p(y_aug | z_aug, theta, log_tau_obs, x)
               = log p(y_0 | z_0, theta)
               + sum_l log p(y_l | y_{l-1}, z_l, Delta_l, theta)
-              + sum_i log p(x_i | y_{m(i)}, theta)
+              + sum_i log p(x_i | y_{m(i)}, log_tau_obs)
         """
         theta = self.theta if theta is None else theta
-        y0_state = int(z_aug[0].item())
-        mu0 = theta["mu"][y0_state]
-        lam0 = torch.exp(theta["log_lambda"][y0_state]).clamp_min(1e-8)
-        sig0 = torch.exp(theta["log_sigma"][y0_state]).clamp_min(1e-8)
-        stationary_var = (sig0**2) / (2.0 * lam0)
-        logp = dist.Normal(mu0, torch.sqrt(stationary_var.clamp_min(1e-10))).log_prob(y_aug[0]).sum()
+        if theta is None:
+            raise RuntimeError("Sampler theta has not been initialized.")
+        if log_tau_obs is None:
+            log_tau_obs = self.log_tau_obs
+        if log_tau_obs is None:
+            raise RuntimeError("Observation noise has not been initialized.")
+        logp = dist.Normal(
+            torch.zeros(self.D, dtype=self.dtype, device=self.device),
+            self.y0_prior_scale,
+        ).log_prob(y_aug[0]).sum()
 
         deltas = T_all[1:] - T_all[:-1]
         for l in range(1, T_all.shape[0]):
-            logp = logp + self.ou_transition_logprob(
+            logp = logp + self.transition_logprob(
                 y_curr=y_aug[l],
                 y_prev=y_aug[l - 1],
                 state=z_aug[l],
@@ -464,46 +500,41 @@ class ContinuousTimeAR1HMMSampler:
             )
 
         y_at_obs = y_aug[obs_idx_in_T_all]  # (N, D)
-        tau = torch.exp(theta["log_tau_obs"]).clamp_min(1e-8)
+        tau = torch.exp(log_tau_obs).clamp_min(1e-8)
         logp = logp + dist.Normal(y_at_obs, tau).log_prob(self.x_obs).sum()
         return logp
 
     def logprob_theta_given_y_z(
         self,
-        theta: Dict[str, torch.Tensor],
+        theta: torch.Tensor,
         y_aug: torch.Tensor,
         z_aug: torch.Tensor,
         T_all: torch.Tensor,
-        obs_idx_in_T_all: torch.Tensor,
     ) -> torch.Tensor:
         """
         Conditional log density:
 
-            log p(theta | y, z, x)
+            log p(theta | y, z)
               = log p(theta)
               + sum_l log p(y_l | y_{l-1}, z_l, Delta_l, theta)
-              + sum_i log p(x_i | y_{m(i)}, theta)
+
+        The observation model x | y, log_tau_obs is constant with respect to
+        theta, so it is intentionally omitted here. Observation noise is updated
+        separately by sample_log_tau_obs().
         """
         cfg = self.prior_config
         logp = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        logp = logp + dist.Normal(cfg["mu_loc"], cfg["mu_scale"]).log_prob(theta["mu"]).sum()
-        logp = logp + dist.Normal(cfg["log_lambda_loc"], cfg["log_lambda_scale"]).log_prob(theta["log_lambda"]).sum()
-        logp = logp + dist.Normal(cfg["log_sigma_loc"], cfg["log_sigma_scale"]).log_prob(theta["log_sigma"]).sum()
-        logp = logp + dist.Normal(cfg["log_tau_loc"], cfg["log_tau_scale"]).log_prob(theta["log_tau_obs"]).sum()
+        logp = logp + dist.Normal(cfg["theta_loc"], cfg["theta_scale"]).log_prob(theta).sum()
 
         deltas = T_all[1:] - T_all[:-1]
         for l in range(1, T_all.shape[0]):
-            logp = logp + self.ou_transition_logprob(
+            logp = logp + self.transition_logprob(
                 y_curr=y_aug[l],
                 y_prev=y_aug[l - 1],
                 state=z_aug[l],
                 delta=deltas[l - 1],
                 theta=theta,
             )
-
-        y_at_obs = y_aug[obs_idx_in_T_all]
-        tau = torch.exp(theta["log_tau_obs"]).clamp_min(1e-8)
-        logp = logp + dist.Normal(y_at_obs, tau).log_prob(self.x_obs).sum()
         return logp
 
     def sample_y_nuts(
@@ -517,6 +548,8 @@ class ContinuousTimeAR1HMMSampler:
         """Sample the full augmented latent path y_aug with Pyro NUTS."""
         if self.grid is None or self.y_aug is None:
             raise RuntimeError("Sampler must be initialized before sample_y_nuts().")
+        if self.theta is None or self.log_tau_obs is None:
+            raise RuntimeError("Sampler parameters have not been initialized.")
 
         grid = self.grid
         y_init = self.y_aug.clone()
@@ -543,6 +576,7 @@ class ContinuousTimeAR1HMMSampler:
                 T_all=grid.T_all,
                 obs_idx_in_T_all=grid.obs_idx_in_T_all,
                 theta=self.theta,
+                log_tau_obs=self.log_tau_obs,
             )
             pyro.factor("target_log_density", target - base_dist.log_prob(y))
 
@@ -571,10 +605,12 @@ class ContinuousTimeAR1HMMSampler:
         num_samples: Optional[int] = None,
         max_tree_depth: Optional[int] = None,
         target_accept_prob: Optional[float] = None,
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-        """Sample theta = (mu, log_lambda, log_sigma, log_tau_obs) with Pyro NUTS."""
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Sample only the NLE transition/emission-density parameter theta with NUTS."""
         if self.grid is None or self.y_aug is None:
             raise RuntimeError("Sampler must be initialized before sample_theta_nuts().")
+        if self.theta is None:
+            raise RuntimeError("Sampler theta has not been initialized.")
 
         grid = self.grid
         config = dict(self.theta_nuts_config)
@@ -589,49 +625,22 @@ class ContinuousTimeAR1HMMSampler:
 
         cfg = self.prior_config
         init_values = {
-            "mu": self.theta["mu"].clone(),
-            "log_lambda": self.theta["log_lambda"].clone(),
-            "log_sigma": self.theta["log_sigma"].clone(),
-            "log_tau_obs": self.theta["log_tau_obs"].clone(),
+            "theta": self.theta.clone(),
         }
 
         def theta_model() -> None:
-            mu = pyro.sample(
-                "mu",
-                dist.Normal(cfg["mu_loc"], cfg["mu_scale"]).expand([self.K, self.D]).to_event(2),
+            theta = pyro.sample(
+                "theta",
+                dist.Normal(cfg["theta_loc"], cfg["theta_scale"]).expand([self.K, self.theta_dim]).to_event(2),
             )
-            log_lambda = pyro.sample(
-                "log_lambda",
-                dist.Normal(cfg["log_lambda_loc"], cfg["log_lambda_scale"]).expand([self.K, self.D]).to_event(2),
-            )
-            log_sigma = pyro.sample(
-                "log_sigma",
-                dist.Normal(cfg["log_sigma_loc"], cfg["log_sigma_scale"]).expand([self.K, self.D]).to_event(2),
-            )
-            log_tau_obs = pyro.sample(
-                "log_tau_obs",
-                dist.Normal(cfg["log_tau_loc"], cfg["log_tau_scale"]).expand([self.D]).to_event(1),
-            )
-            theta_now = {
-                "mu": mu,
-                "log_lambda": log_lambda,
-                "log_sigma": log_sigma,
-                "log_tau_obs": log_tau_obs,
-            }
             log_lik = self.logprob_theta_given_y_z(
-                theta=theta_now,
+                theta=theta,
                 y_aug=self.y_aug,
                 z_aug=grid.z_aug,
                 T_all=grid.T_all,
-                obs_idx_in_T_all=grid.obs_idx_in_T_all,
             )
             # logprob_theta_given_y_z already includes the priors, so subtract them once.
-            log_prior = (
-                dist.Normal(cfg["mu_loc"], cfg["mu_scale"]).log_prob(mu).sum()
-                + dist.Normal(cfg["log_lambda_loc"], cfg["log_lambda_scale"]).log_prob(log_lambda).sum()
-                + dist.Normal(cfg["log_sigma_loc"], cfg["log_sigma_scale"]).log_prob(log_sigma).sum()
-                + dist.Normal(cfg["log_tau_loc"], cfg["log_tau_scale"]).log_prob(log_tau_obs).sum()
-            )
+            log_prior = dist.Normal(cfg["theta_loc"], cfg["theta_scale"]).log_prob(theta).sum()
             pyro.factor("likelihood_plus_prior_correction", log_lik - log_prior)
 
         pyro.clear_param_store()
@@ -650,13 +659,101 @@ class ContinuousTimeAR1HMMSampler:
         mcmc.run()
         samples = mcmc.get_samples()
         diagnostics = self._extract_mcmc_diagnostics(mcmc)
-        theta_sample = {
-            "mu": samples["mu"][-1].detach(),
-            "log_lambda": samples["log_lambda"][-1].detach(),
-            "log_sigma": samples["log_sigma"][-1].detach(),
-            "log_tau_obs": samples["log_tau_obs"][-1].detach(),
-        }
+        theta_sample = samples["theta"][-1].detach()
         return theta_sample, diagnostics
+
+    def sample_log_tau_obs(self) -> torch.Tensor:
+        """
+        Gibbs update for diagonal observation noise.
+
+        With x_i[d] | y_i[d], tau_d^2 ~ Normal(y_i[d], tau_d^2) and
+        tau_d^2 ~ InvGamma(alpha0, beta0), the conditional posterior is:
+
+            tau_d^2 | x, y ~ InvGamma(alpha0 + N/2,
+                                      beta0 + 0.5 * sum_i (x_i[d] - y_i[d])^2)
+
+        The stored parameter is log_tau_obs[d] = 0.5 * log(tau_d^2).
+        """
+        if self.grid is None or self.y_aug is None:
+            raise RuntimeError("Sampler must be initialized before sample_log_tau_obs().")
+
+        cfg = self.prior_config
+        y_at_obs = self.y_aug[self.grid.obs_idx_in_T_all]  # (N, D)
+        residual = self.x_obs - y_at_obs
+        ssr = (residual**2).sum(dim=0)  # (D,)
+
+        alpha = torch.as_tensor(cfg["tau2_alpha"], dtype=self.dtype, device=self.device) + 0.5 * self.N
+        beta = torch.as_tensor(cfg["tau2_beta"], dtype=self.dtype, device=self.device) + 0.5 * ssr
+
+        # If tau^2 ~ InvGamma(alpha, beta), then precision 1/tau^2 ~ Gamma(alpha, beta).
+        precision = dist.Gamma(alpha.expand_as(beta), beta).sample()
+        tau2 = precision.reciprocal().clamp_min(1e-16)
+        return 0.5 * torch.log(tau2).detach()
+
+    def sample_Q(self) -> torch.Tensor:
+        """
+        Sample a new CTMC generator Q from the current true jump path.
+
+        For i != j, use independent Gamma priors:
+
+            q_ij ~ Gamma(a_ij, b_ij)      # rate parameterization
+
+        Given the true path, let n_ij be the number of jumps i -> j and let
+        S_i be total dwell time in state i. The conditional posterior is:
+
+            q_ij | z(t) ~ Gamma(a_ij + n_ij, b_ij + S_i)
+
+        After sampling off-diagonal rates, diagonals are set to
+        q_ii = -sum_{j != i} q_ij.
+
+        This method has no side effects: assignment to self.Q and the required
+        Omega/B refresh are handled by one_sweep().
+        """
+        if self.T_true is None or self.z_true is None:
+            raise RuntimeError("Call initialize() before sample_Q().")
+        if self.z_true.shape[0] != self.T_true.shape[0] + 1:
+            raise RuntimeError("z_true must have len(T_true)+1 entries.")
+
+        cfg = self.prior_config
+        q_alpha = torch.as_tensor(cfg["q_alpha"], dtype=self.dtype, device=self.device)
+        q_beta = torch.as_tensor(cfg["q_beta"], dtype=self.dtype, device=self.device)
+        if q_alpha.ndim == 0:
+            q_alpha = q_alpha.expand(self.K, self.K)
+        if q_beta.ndim == 0:
+            q_beta = q_beta.expand(self.K, self.K)
+        if q_alpha.shape != (self.K, self.K) or q_beta.shape != (self.K, self.K):
+            raise ValueError("q_alpha and q_beta must be scalars or tensors with shape (K, K).")
+
+        dwell = torch.zeros(self.K, dtype=self.dtype, device=self.device)
+        counts = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
+
+        boundaries = torch.cat(
+            [
+                torch.zeros(1, dtype=self.dtype, device=self.device),
+                self.T_true,
+                self.T.reshape(1),
+            ]
+        )
+        for r, state in enumerate(self.z_true.tolist()):
+            dwell[state] = dwell[state] + (boundaries[r + 1] - boundaries[r])
+
+        for r in range(self.T_true.shape[0]):
+            src = int(self.z_true[r].item())
+            dst = int(self.z_true[r + 1].item())
+            if src != dst:
+                counts[src, dst] = counts[src, dst] + 1.0
+
+        Q = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
+        for i in range(self.K):
+            for j in range(self.K):
+                if i == j:
+                    continue
+                posterior_alpha = q_alpha[i, j] + counts[i, j]
+                posterior_beta = q_beta[i, j] + dwell[i]
+                Q[i, j] = dist.Gamma(posterior_alpha, posterior_beta).sample()
+            Q[i, i] = -Q[i].sum()
+
+        return Q.detach()
 
     def sample_z_ffbs(self) -> torch.Tensor:
         """
@@ -681,7 +778,7 @@ class ContinuousTimeAR1HMMSampler:
             A_j(i, h) is the transition kernel at the right endpoint T_all[j]
             A_j = B if T_all[j] is in T_true ∪ T_pseudo, else I
 
-        This matches the rest of the codebase: the latent regime attached to an OU
+        This matches the rest of the codebase: the latent regime attached to an NLE
         transition from y_aug[j-1] to y_aug[j] is z_aug[j].
         """
         if self.grid is None or self.y_aug is None:
@@ -700,7 +797,7 @@ class ContinuousTimeAR1HMMSampler:
         for j in range(L - 1):
             dt = deltas[j]
             for k in range(self.K):
-                emission_logits[j, k] = self.ou_transition_logprob(
+                emission_logits[j, k] = self.transition_logprob(
                     y_curr=self.y_aug[j + 1],
                     y_prev=self.y_aug[j],
                     state=k,
@@ -713,7 +810,7 @@ class ContinuousTimeAR1HMMSampler:
                 log_alpha[j + 1] = emission_logits[j] + torch.logsumexp(scores, dim=0)
             else:
                 # At observation-only times the transition kernel is I, so the state
-                # does not change. Only the OU transition likelihood contributes.
+                # does not change. Only the NLE transition likelihood contributes.
                 log_alpha[j + 1] = log_alpha[j] + emission_logits[j]
             log_alpha[j + 1] = log_alpha[j + 1] - torch.logsumexp(log_alpha[j + 1], dim=0)
 
@@ -761,7 +858,7 @@ class ContinuousTimeAR1HMMSampler:
         return T_true, z_true
 
     def one_sweep(self) -> Dict[str, Any]:
-        """Run one Gibbs sweep: augment grid, sample y, sample z, sample theta."""
+        """Run one Gibbs sweep: augment grid, sample y, z, theta, tau, and Q."""
         if self.T_true is None or self.z_true is None:
             raise RuntimeError("Call initialize() before one_sweep().")
 
@@ -787,12 +884,15 @@ class ContinuousTimeAR1HMMSampler:
 
         theta_sample, theta_diag = self.sample_theta_nuts()
         self.theta = theta_sample
+        self.log_tau_obs = self.sample_log_tau_obs()
 
         self.T_true, self.z_true = self.prune_self_transitions(
             T_all=self.grid.T_all,
             z_aug=self.grid.z_aug,
             is_jump_or_virtual_time=self.grid.is_jump_or_virtual_time,
         )
+        self.Q = self.sample_Q()
+        self._refresh_uniformization()
 
         sweep_info = {
             "grid_size": int(self.grid.T_all.shape[0]),
@@ -800,12 +900,18 @@ class ContinuousTimeAR1HMMSampler:
             "num_true_segments": int(self.z_true.shape[0]),
             "y_nuts": y_diag,
             "theta_nuts": theta_diag,
+            "log_tau_obs_update": "conjugate_inverse_gamma_gibbs",
+            "Q_update": "conjugate_gamma_gibbs",
+            "omega": float(self.omega),
         }
 
         self.history["y_aug"].append(self.y_aug.detach().cpu())
         self.history["z_aug"].append(self.grid.z_aug.detach().cpu())
         self.history["T_all"].append(self.grid.T_all.detach().cpu())
-        self.history["theta"].append({k: v.detach().cpu() for k, v in self.theta.items()})
+        self.history["theta"].append(self.theta.detach().cpu())
+        self.history["log_tau_obs"].append(self.log_tau_obs.detach().cpu())
+        self.history["Q"].append(self.Q.detach().cpu())
+        self.history["omega"].append(float(self.omega))
         self.history["T_true"].append(self.T_true.detach().cpu())
         self.history["z_true"].append(self.z_true.detach().cpu())
         self.history["diagnostics"].append(sweep_info)
@@ -837,6 +943,18 @@ class ContinuousTimeAR1HMMSampler:
         B = B.clamp_min(0.0)
         B = B / B.sum(dim=1, keepdim=True).clamp_min(1e-12)
         return B
+
+    def _refresh_uniformization(self) -> None:
+        """
+        Recompute Omega and B after Q changes.
+
+        Uniformization requires Omega >= max_i -Q_ii.  We keep a strict margin so
+        virtual-jump rates Omega + Q_ii remain positive even for the largest exit
+        rate state.
+        """
+        max_exit = torch.max(-torch.diag(self.Q)).item()
+        self.omega = float(max(self.omega_scale * max_exit, max_exit + 1e-6, 1e-6))
+        self.B = self._build_uniformized_transition_matrix()
 
     def _initialize_y_on_grid(self, T_all: torch.Tensor) -> torch.Tensor:
         """
@@ -910,114 +1028,3 @@ class ContinuousTimeAR1HMMSampler:
                 if key in diagnostics:
                     summary[key] = diagnostics[key]
         return summary
-
-
-if __name__ == "__main__":
-    torch.set_default_dtype(torch.float64)
-
-    # Small synthetic example with D=2.
-    K = 2
-    D = 2
-    T = 8.0
-    N = 25
-
-    Q_true = torch.tensor(
-        [
-            [-0.6, 0.6],
-            [0.45, -0.45],
-        ],
-        dtype=torch.float64,
-    )
-
-    theta_true = {
-        "mu": torch.tensor([[0.0, -0.5], [2.0, 1.0]], dtype=torch.float64),
-        "log_lambda": torch.log(torch.tensor([[1.0, 0.7], [1.4, 0.9]], dtype=torch.float64)),
-        "log_sigma": torch.log(torch.tensor([[0.35, 0.25], [0.30, 0.40]], dtype=torch.float64)),
-        "log_tau_obs": torch.log(torch.tensor([0.15, 0.20], dtype=torch.float64)),
-    }
-
-    # Simulate a simple continuous-time latent state path.
-    # Here T_true stores only internal jump times, while z_true stores segment states.
-    state = 0
-    t = 0.0
-    T_true = []
-    z_true = []
-    while t < T:
-        rate = float(-Q_true[state, state].item())
-        wait = dist.Exponential(rate).sample().item()
-        next_t = t + wait
-        z_true.append(state)
-        if next_t >= T:
-            break
-        T_true.append(next_t)
-        state = int(dist.Categorical(probs=(Q_true[state].clone().clamp_min(0.0) / rate)).sample().item())
-        t = next_t
-
-    T_true_t = torch.tensor(T_true, dtype=torch.float64)
-    z_true_t = torch.tensor(z_true, dtype=torch.long)
-
-    # Irregular observation times T_obs with 0 = t_1 and T = t_N.
-    T_obs_interior = torch.sort(torch.rand(N - 2, dtype=torch.float64) * T).values
-    T_obs = torch.cat(
-        [
-            torch.tensor([0.0], dtype=torch.float64),
-            T_obs_interior,
-            torch.tensor([T], dtype=torch.float64),
-        ]
-    )
-
-    # Simulate y(T_obs) directly by propagating along the piecewise-constant regime path.
-    y_obs = torch.zeros(N, D, dtype=torch.float64)
-    current_y = theta_true["mu"][0] + 0.2 * torch.randn(D, dtype=torch.float64)
-    current_time = 0.0
-    path_idx = 0
-
-    for i, t_obs in enumerate(T_obs.tolist()):
-        while path_idx < len(T_true) and t_obs > T_true[path_idx]:
-            state_k = int(z_true_t[path_idx].item())
-            dt = T_true[path_idx] - current_time
-            lam = torch.exp(theta_true["log_lambda"][state_k])
-            sig = torch.exp(theta_true["log_sigma"][state_k])
-            mu = theta_true["mu"][state_k]
-            exp_term = torch.exp(-lam * dt)
-            mean = mu + exp_term * (current_y - mu)
-            var = (sig**2) * (-torch.expm1(-2.0 * lam * dt)) / (2.0 * lam)
-            current_y = mean + torch.sqrt(var.clamp_min(1e-10)) * torch.randn(D, dtype=torch.float64)
-            current_time = float(T_true[path_idx])
-            path_idx += 1
-
-        state_k = int(z_true_t[path_idx].item())
-        dt = t_obs - current_time
-        lam = torch.exp(theta_true["log_lambda"][state_k])
-        sig = torch.exp(theta_true["log_sigma"][state_k])
-        mu = theta_true["mu"][state_k]
-        exp_term = torch.exp(-lam * dt)
-        mean = mu + exp_term * (current_y - mu)
-        var = (sig**2) * (-torch.expm1(-2.0 * lam * dt)) / (2.0 * lam)
-        current_y = mean + torch.sqrt(var.clamp_min(1e-10)) * torch.randn(D, dtype=torch.float64)
-        current_time = t_obs
-        y_obs[i] = current_y
-
-    x_obs = y_obs + torch.exp(theta_true["log_tau_obs"]) * torch.randn(N, D, dtype=torch.float64)
-
-    sampler = ContinuousTimeAR1HMMSampler(
-        Q=Q_true,
-        x_obs=x_obs,
-        obs_times=T_obs,
-        T=T,
-        y_nuts_config={"warmup_steps": 16, "num_samples": 1, "max_tree_depth": 3, "target_accept_prob": 0.75},
-        theta_nuts_config={"warmup_steps": 24, "num_samples": 1, "max_tree_depth": 3, "target_accept_prob": 0.75},
-        seed=123,
-    )
-    sampler.initialize()
-    history = sampler.run(num_sweeps=5, verbose=True)
-
-    print("\nFinal theta sample:")
-    print("mu =", history["theta"][-1]["mu"])
-    print("lambda =", torch.exp(history["theta"][-1]["log_lambda"]))
-    print("sigma =", torch.exp(history["theta"][-1]["log_sigma"]))
-    print("tau_obs =", torch.exp(history["theta"][-1]["log_tau_obs"]))
-
-    print("\nFinal inferred true path:")
-    print("T_true =", history["T_true"][-1])
-    print("z_true =", history["z_true"][-1])
