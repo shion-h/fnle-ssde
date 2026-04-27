@@ -868,7 +868,7 @@ class ContinuousTimeAR1HMMSampler:
         emission_logits = self._compute_log_emission_matrix(self.y_aug, self.theta, delta)
 
         for j in range(L - 1):
-            if grid.is_jump_or_virtual_time[j + 1]:
+            if grid.is_jump_or_virtual_time[j]:
                 scores = log_alpha[j].unsqueeze(1) + log_B
                 log_alpha[j + 1] = emission_logits[j] + torch.logsumexp(scores, dim=0)
             else:
@@ -881,7 +881,7 @@ class ContinuousTimeAR1HMMSampler:
         z[L - 1] = dist.Categorical(logits=log_alpha[L - 1]).sample()
 
         for j in range(L - 2, -1, -1):
-            if grid.is_jump_or_virtual_time[j + 1]:
+            if grid.is_jump_or_virtual_time[j]:
                 logits_prev = log_alpha[j] + log_B[:, z[j + 1]]
                 z[j] = dist.Categorical(logits=logits_prev).sample()
             else:
