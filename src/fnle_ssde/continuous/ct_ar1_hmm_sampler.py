@@ -19,7 +19,7 @@ The observation model is diagonal Gaussian:
 
 The latent transition density is evaluated by an NLEEstimator:
 
-    p(y_{t+1} | y_t, z=k) = flow.log_prob(y_{t+1}, context=[theta_k, y_t, n_step?])
+    p(y_{t+1} | y_t, z=k) = flow.log_prob(y_{t+1}, context=[theta_k, y_t, interval_length / dt])
 
 The code keeps the implementation intentionally explicit and modular inside one class so
 that each Gibbs step remains easy to inspect and modify.
@@ -80,7 +80,6 @@ class ContinuousTimeAR1HMMSampler:
         *,
         omega_scale: float = 1.5,
         nle_estimator: Any,
-        n_step: int = 1,
         y_nuts_config: Optional[Dict[str, Any]] = None,
         theta_nuts_config: Optional[Dict[str, Any]] = None,
         prior_config: Optional[Dict[str, Any]] = None,
@@ -106,9 +105,6 @@ class ContinuousTimeAR1HMMSampler:
         nle_estimator:
             Trained/loaded NLEEstimator. Transition log densities are evaluated by
             `nle_estimator.estimator.log_prob`.
-        n_step:
-            Fixed simulation-step conditioning value passed to the NLE when the
-            estimator was trained with n-step conditioning.
         y_nuts_config / theta_nuts_config:
             Pyro NUTS settings used for the conditional updates.
         prior_config:
@@ -130,14 +126,10 @@ class ContinuousTimeAR1HMMSampler:
         self.K = int(self.Q.shape[0])
         self.N, self.D = self.x_obs.shape
         self.y0_prior_scale = float(y0_prior_scale)
-        self.n_step = int(n_step)
-        if self.n_step < 1:
-            raise ValueError("n_step must be a positive integer.")
         self.nle_estimator = nle_estimator
         self.flow_model = nle_estimator.estimator
         if self.flow_model is None:
             raise ValueError("nle_estimator.estimator must be trained/loaded before sampling.")
-        self.conditions_on_n_steps = bool(getattr(nle_estimator, "conditions_on_n_steps", False))
         self.theta_dim = int(nle_estimator.dynamics.theta_dim)
         self.dynamics_dt = float(nle_estimator.dynamics.dt)
         if self.dynamics_dt <= 0.0:
@@ -420,40 +412,6 @@ class ContinuousTimeAR1HMMSampler:
         T_pseudo = torch.cat(pseudo_times)
         return torch.unique(T_pseudo, sorted=True)
 
-    def transition_logprob(
-        self,
-        y_curr: torch.Tensor,
-        y_prev: torch.Tensor,
-        state: int | torch.Tensor,
-        delta: Optional[torch.Tensor] = None,
-        theta: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Neural likelihood transition log density.
-
-        This mirrors NFlowAR1HMMGibbsSampler:
-            flow.log_prob(y_curr, context=[theta_state, y_prev, n_step?])
-        """
-        if self.flow_model is None:
-            raise RuntimeError("NLE transition requested but no flow_model is available.")
-        theta = self.theta if theta is None else theta
-        if theta is None:
-            raise RuntimeError("Sampler theta has not been initialized.")
-        k = int(state) if not torch.is_tensor(state) else int(state.item())
-        theta_k = theta[k]
-        context = torch.cat([theta_k, y_prev], dim=-1).unsqueeze(0)
-        if self.conditions_on_n_steps:
-            if delta is None:
-                raise ValueError("delta must be provided when the NLE conditions on n_steps.")
-            n_step_value = self._delta_to_n_steps(
-                torch.as_tensor(delta, dtype=y_prev.dtype, device=y_prev.device).reshape(())
-            )
-            n_step_tensor = n_step_value.reshape(1, 1)
-            context = torch.cat([context, n_step_tensor], dim=-1)
-        y_batch = y_curr.unsqueeze(0)
-        log_prob = self.flow_model.log_prob(y_batch.unsqueeze(0), condition=context)
-        return log_prob.reshape(-1)[0]
-
     def _delta_to_n_steps(self, delta: torch.Tensor) -> torch.Tensor:
         """
         Convert continuous elapsed time to the discrete NLE conditioning step count.
@@ -505,16 +463,7 @@ class ContinuousTimeAR1HMMSampler:
             torch.zeros(self.D, dtype=self.dtype, device=self.device),
             self.y0_prior_scale,
         ).log_prob(y_aug[0]).sum()
-
-        deltas = T_all[1:] - T_all[:-1]
-        for l in range(1, T_all.shape[0]):
-            logp = logp + self.transition_logprob(
-                y_curr=y_aug[l],
-                y_prev=y_aug[l - 1],
-                state=z_aug[l],
-                delta=deltas[l - 1],
-                theta=theta,
-            )
+        logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
 
         y_at_obs = y_aug[obs_idx_in_T_all]  # (N, D)
         tau = torch.exp(log_tau_obs).clamp_min(1e-8)
@@ -542,16 +491,7 @@ class ContinuousTimeAR1HMMSampler:
         cfg = self.prior_config
         logp = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         logp = logp + dist.Normal(cfg["theta_loc"], cfg["theta_scale"]).log_prob(theta).sum()
-
-        deltas = T_all[1:] - T_all[:-1]
-        for l in range(1, T_all.shape[0]):
-            logp = logp + self.transition_logprob(
-                y_curr=y_aug[l],
-                y_prev=y_aug[l - 1],
-                state=z_aug[l],
-                delta=deltas[l - 1],
-                theta=theta,
-            )
+        logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
         return logp
 
     def sample_y_nuts(
@@ -772,17 +712,48 @@ class ContinuousTimeAR1HMMSampler:
 
         return Q.detach()
 
+    def _evaluate_batched_transition_logprobs(
+        self,
+        y_prev_batch: torch.Tensor,
+        y_curr_batch: torch.Tensor,
+        theta_batch: torch.Tensor,
+        delta_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate batched NLE transition log probabilities."""
+        if self.flow_model is None:
+            raise RuntimeError("NLE transition requested but no flow_model is available.")
+        delta = torch.as_tensor(
+            delta_batch,
+            device=self.device,
+            dtype=y_prev_batch.dtype,
+        ).reshape(-1)
+        if y_prev_batch.shape != y_curr_batch.shape:
+            raise ValueError("y_prev_batch and y_curr_batch must have the same shape.")
+        if y_prev_batch.shape[0] != theta_batch.shape[0] or y_prev_batch.shape[0] != delta.shape[0]:
+            raise ValueError("Batch dimensions of y, theta, and delta_batch must match.")
+
+        n_steps = self._delta_to_n_steps(delta)
+        context = torch.cat([theta_batch, y_prev_batch], dim=-1)
+        # change it to a column vector
+        n_step_batch = n_steps.unsqueeze(-1).to(
+            device=context.device,
+            dtype=context.dtype,
+        )
+        context = torch.cat([context, n_step_batch], dim=-1)
+        # first dimension is not a batch, needed to be 1
+        return self.flow_model.log_prob(y_curr_batch.unsqueeze(0), condition=context)
+
     def _compute_log_emission_matrix(
         self,
         y_aug: torch.Tensor,
         theta: torch.Tensor,
-        delta_t: torch.Tensor,
+        delta: torch.Tensor,
     ) -> torch.Tensor:
         """
         Compute FFBS emission logits for all intervals and states in one NLE call.
 
-        `delta_t[j] = T_all[j+1] - T_all[j]` is converted to the NLE conditioning
-        step count by delta_t[j] / dynamics.dt.
+        `delta[j] = T_all[j+1] - T_all[j]` is converted to the NLE conditioning
+        step count by delta[j] / dynamics.dt.
 
         Returns
         -------
@@ -790,21 +761,14 @@ class ContinuousTimeAR1HMMSampler:
             Tensor with shape (L-1, K), where
             log_emission[j, k] = log p(y_aug[j+1] | y_aug[j], z_aug[j+1]=k, theta).
         """
-        if self.flow_model is None:
-            raise RuntimeError("NLE transition requested but no flow_model is available.")
-
         L = y_aug.shape[0]
         n_intervals = L - 1
         if n_intervals <= 0:
             return torch.empty(0, self.K, dtype=self.dtype, device=self.device)
-        delta = torch.as_tensor(
-            delta_t,
-            device=self.device,
-            dtype=y_aug.dtype,
-        ).reshape(-1)
+
+        delta = torch.as_tensor(delta, device=self.device, dtype=y_aug.dtype).reshape(-1)
         if delta.shape[0] != n_intervals:
-            raise ValueError("delta_t must have length len(y_aug) - 1.")
-        n_steps = self._delta_to_n_steps(delta)
+            raise ValueError("delta must have length len(y_aug) - 1.")
 
         # ((L-1)*K, y_dim)
         y_prev_batch = y_aug[:-1].repeat_interleave(self.K, dim=0).contiguous()
@@ -814,18 +778,46 @@ class ContinuousTimeAR1HMMSampler:
         theta_batch = theta.unsqueeze(0).expand(n_intervals, self.K, self.theta_dim)
         # ((L-1), K, theta_dim) -> ((L-1)*K, theta_dim)
         theta_batch = theta_batch.reshape(n_intervals * self.K, self.theta_dim).contiguous()
+        delta_batch = delta.repeat_interleave(self.K)
 
-        context = torch.cat([theta_batch, y_prev_batch], dim=-1)
-        if self.conditions_on_n_steps:
-            # ((L-1), ) -> ((L-1) * K, ) -> ((L-1)*K, 1)
-            n_step_batch = n_steps.repeat_interleave(self.K).unsqueeze(-1).to(
-                device=context.device,
-                dtype=context.dtype,
-            )
-            context = torch.cat([context, n_step_batch], dim=-1)
-
-        log_probs = self.flow_model.log_prob(y_curr_batch.unsqueeze(0), condition=context)
+        log_probs = self._evaluate_batched_transition_logprobs(
+            y_prev_batch=y_prev_batch,
+            y_curr_batch=y_curr_batch,
+            theta_batch=theta_batch,
+            delta_batch=delta_batch,
+        )
         return log_probs.reshape(n_intervals, self.K)
+
+    def _compute_log_emission_given_z(
+        self,
+        y_aug: torch.Tensor,
+        z_aug: torch.Tensor,
+        T_all: torch.Tensor,
+        theta: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the total transition log density along a fixed z path using a
+        single batched NLE evaluation over the selected states only.
+        """
+        delta = T_all[1:] - T_all[:-1]
+        n_intervals = y_aug.shape[0] - 1
+        if n_intervals <= 0:
+            return torch.tensor(0.0, dtype=self.dtype, device=self.device)
+
+        delta = torch.as_tensor(delta, device=self.device, dtype=y_aug.dtype).reshape(-1)
+        if delta.shape[0] != n_intervals:
+            raise ValueError("T_all must have length len(y_aug).")
+
+        y_prev_batch = y_aug[:-1].contiguous()
+        y_curr_batch = y_aug[1:].contiguous()
+        theta_batch = theta[z_aug[1:].to(dtype=torch.long, device=self.device)].contiguous()
+        log_probs = self._evaluate_batched_transition_logprobs(
+            y_prev_batch=y_prev_batch,
+            y_curr_batch=y_curr_batch,
+            theta_batch=theta_batch,
+            delta_batch=delta,
+        )
+        return log_probs.sum()
 
     def sample_z_ffbs(self) -> torch.Tensor:
         """
