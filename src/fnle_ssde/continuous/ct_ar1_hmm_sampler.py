@@ -674,39 +674,30 @@ class ContinuousTimeAR1HMMSampler:
         cfg = self.prior_config
         q_alpha = torch.as_tensor(cfg["q_alpha"], dtype=self.dtype, device=self.device)
         q_beta = torch.as_tensor(cfg["q_beta"], dtype=self.dtype, device=self.device)
-        if q_alpha.ndim == 0:
-            q_alpha = q_alpha.expand(self.K, self.K)
-        if q_beta.ndim == 0:
-            q_beta = q_beta.expand(self.K, self.K)
-        if q_alpha.shape != (self.K, self.K) or q_beta.shape != (self.K, self.K):
-            raise ValueError("q_alpha and q_beta must be scalars or tensors with shape (K, K).")
+        if q_alpha.ndim != 0 or q_beta.ndim != 0:
+            raise ValueError("q_alpha and q_beta must be scalars.")
 
-        dwell = torch.zeros(self.K, dtype=self.dtype, device=self.device)
-        counts = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
+        dwell_time_k = torch.zeros(self.K, dtype=self.dtype, device=self.device)
+        n_jumps_kk = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
 
-        boundaries = torch.cat(
-            [
-                torch.zeros(1, dtype=self.dtype, device=self.device),
-                self.T_true,
-                self.T.reshape(1),
-            ]
-        )
-        for r, state in enumerate(self.z_true.tolist()):
-            dwell[state] = dwell[state] + (boundaries[r + 1] - boundaries[r])
+        for i, state in enumerate(self.z_true.tolist()):
+            t_left = 0.0 if i == 0 else self.T_true[i - 1]
+            t_right = self.T if i == self.z_true.shape[0] - 1 else self.T_true[i]
+            dwell_time_k[state] = dwell_time_k[state] + (t_right - t_left)
 
-        for r in range(self.T_true.shape[0]):
-            src = int(self.z_true[r].item())
-            dst = int(self.z_true[r + 1].item())
+        for i in range(self.T_true.shape[0]):
+            src = self.z_true[i].item()
+            dst = self.z_true[i + 1].item()
             if src != dst:
-                counts[src, dst] = counts[src, dst] + 1.0
+                n_jumps_kk[src, dst] = n_jumps_kk[src, dst] + 1.0
 
         Q = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
         for i in range(self.K):
             for j in range(self.K):
                 if i == j:
                     continue
-                posterior_alpha = q_alpha[i, j] + counts[i, j]
-                posterior_beta = q_beta[i, j] + dwell[i]
+                posterior_alpha = q_alpha + n_jumps_kk[i, j]
+                posterior_beta = q_beta + dwell_time_k[i]
                 Q[i, j] = dist.Gamma(posterior_alpha, posterior_beta).sample()
             Q[i, i] = -Q[i].sum()
 
