@@ -488,9 +488,9 @@ class ContinuousTimeAR1HMMSampler:
         theta, so it is intentionally omitted here. Observation noise is updated
         separately by sample_log_tau_obs().
         """
-        cfg = self.prior_config
+        prior_config = self.prior_config
         logp = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        logp = logp + dist.Normal(cfg["theta_loc"], cfg["theta_scale"]).log_prob(theta).sum()
+        logp = logp + dist.Normal(prior_config["theta_loc"], prior_config["theta_scale"]).log_prob(theta).sum()
         logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
         return logp
 
@@ -510,15 +510,15 @@ class ContinuousTimeAR1HMMSampler:
 
         grid = self.grid
         y_init = self.y_aug.clone()
-        config = dict(self.y_nuts_config)
+        y_nuts_config = dict(self.y_nuts_config)
         if warmup_steps is not None:
-            config["warmup_steps"] = warmup_steps
+            y_nuts_config["warmup_steps"] = warmup_steps
         if num_samples is not None:
-            config["num_samples"] = num_samples
+            y_nuts_config["num_samples"] = num_samples
         if max_tree_depth is not None:
-            config["max_tree_depth"] = max_tree_depth
+            y_nuts_config["max_tree_depth"] = max_tree_depth
         if target_accept_prob is not None:
-            config["target_accept_prob"] = target_accept_prob
+            y_nuts_config["target_accept_prob"] = target_accept_prob
 
         base_dist = dist.Normal(
             torch.zeros_like(y_init),
@@ -541,13 +541,13 @@ class ContinuousTimeAR1HMMSampler:
         kernel = NUTS(
             y_model,
             init_strategy=init_to_value(values={"y_aug": y_init}),
-            max_tree_depth=config["max_tree_depth"],
-            target_accept_prob=config["target_accept_prob"],
+            max_tree_depth=y_nuts_config["max_tree_depth"],
+            target_accept_prob=y_nuts_config["target_accept_prob"],
         )
         mcmc = MCMC(
             kernel,
-            warmup_steps=config["warmup_steps"],
-            num_samples=config["num_samples"],
+            warmup_steps=y_nuts_config["warmup_steps"],
+            num_samples=y_nuts_config["num_samples"],
             disable_progbar=True,
         )
         mcmc.run()
@@ -570,17 +570,17 @@ class ContinuousTimeAR1HMMSampler:
             raise RuntimeError("Sampler theta has not been initialized.")
 
         grid = self.grid
-        config = dict(self.theta_nuts_config)
+        theta_nuts_config = dict(self.theta_nuts_config)
         if warmup_steps is not None:
-            config["warmup_steps"] = warmup_steps
+            theta_nuts_config["warmup_steps"] = warmup_steps
         if num_samples is not None:
-            config["num_samples"] = num_samples
+            theta_nuts_config["num_samples"] = num_samples
         if max_tree_depth is not None:
-            config["max_tree_depth"] = max_tree_depth
+            theta_nuts_config["max_tree_depth"] = max_tree_depth
         if target_accept_prob is not None:
-            config["target_accept_prob"] = target_accept_prob
+            theta_nuts_config["target_accept_prob"] = target_accept_prob
 
-        cfg = self.prior_config
+        prior_config = self.prior_config
         init_values = {
             "theta": self.theta.clone(),
         }
@@ -588,7 +588,7 @@ class ContinuousTimeAR1HMMSampler:
         def theta_model() -> None:
             theta = pyro.sample(
                 "theta",
-                dist.Normal(cfg["theta_loc"], cfg["theta_scale"]).expand([self.K, self.theta_dim]).to_event(2),
+                dist.Normal(prior_config["theta_loc"], prior_config["theta_scale"]).expand([self.K, self.theta_dim]).to_event(2),
             )
             log_lik = self.logprob_theta_given_y_z(
                 theta=theta,
@@ -597,20 +597,20 @@ class ContinuousTimeAR1HMMSampler:
                 T_all=grid.T_all,
             )
             # logprob_theta_given_y_z already includes the priors, so subtract them once.
-            log_prior = dist.Normal(cfg["theta_loc"], cfg["theta_scale"]).log_prob(theta).sum()
+            log_prior = dist.Normal(prior_config["theta_loc"], prior_config["theta_scale"]).log_prob(theta).sum()
             pyro.factor("likelihood_plus_prior_correction", log_lik - log_prior)
 
         pyro.clear_param_store()
         kernel = NUTS(
             theta_model,
             init_strategy=init_to_value(values=init_values),
-            max_tree_depth=config["max_tree_depth"],
-            target_accept_prob=config["target_accept_prob"],
+            max_tree_depth=theta_nuts_config["max_tree_depth"],
+            target_accept_prob=theta_nuts_config["target_accept_prob"],
         )
         mcmc = MCMC(
             kernel,
-            warmup_steps=config["warmup_steps"],
-            num_samples=config["num_samples"],
+            warmup_steps=theta_nuts_config["warmup_steps"],
+            num_samples=theta_nuts_config["num_samples"],
             disable_progbar=True,
         )
         mcmc.run()
@@ -634,13 +634,13 @@ class ContinuousTimeAR1HMMSampler:
         if self.grid is None or self.y_aug is None:
             raise RuntimeError("Sampler must be initialized before sample_log_tau_obs().")
 
-        cfg = self.prior_config
+        prior_config = self.prior_config
         y_at_obs = self.y_aug[self.grid.obs_idx_in_T_all]  # (N, D)
         residual = self.x_obs - y_at_obs
         ssr = (residual**2).sum(dim=0)  # (D,)
 
-        alpha = torch.as_tensor(cfg["tau2_alpha"], dtype=self.dtype, device=self.device) + 0.5 * self.N
-        beta = torch.as_tensor(cfg["tau2_beta"], dtype=self.dtype, device=self.device) + 0.5 * ssr
+        alpha = torch.as_tensor(prior_config["tau2_alpha"], dtype=self.dtype, device=self.device) + 0.5 * self.N
+        beta = torch.as_tensor(prior_config["tau2_beta"], dtype=self.dtype, device=self.device) + 0.5 * ssr
 
         # If tau^2 ~ InvGamma(alpha, beta), then precision 1/tau^2 ~ Gamma(alpha, beta).
         precision = dist.Gamma(alpha.expand_as(beta), beta).sample()
@@ -671,9 +671,9 @@ class ContinuousTimeAR1HMMSampler:
         if self.z_true.shape[0] != self.T_true.shape[0] + 1:
             raise RuntimeError("z_true must have len(T_true)+1 entries.")
 
-        cfg = self.prior_config
-        q_alpha = torch.as_tensor(cfg["q_alpha"], dtype=self.dtype, device=self.device)
-        q_beta = torch.as_tensor(cfg["q_beta"], dtype=self.dtype, device=self.device)
+        prior_config = self.prior_config
+        q_alpha = torch.as_tensor(prior_config["q_alpha"], dtype=self.dtype, device=self.device)
+        q_beta = torch.as_tensor(prior_config["q_beta"], dtype=self.dtype, device=self.device)
         if q_alpha.ndim != 0 or q_beta.ndim != 0:
             raise ValueError("q_alpha and q_beta must be scalars.")
 
