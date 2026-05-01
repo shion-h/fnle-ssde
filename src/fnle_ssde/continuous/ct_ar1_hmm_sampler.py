@@ -432,7 +432,7 @@ class ContinuousTimeAR1HMMSampler:
             log_tau_obs = self.log_tau_obs
         if log_tau_obs is None:
             raise RuntimeError("Observation noise has not been initialized.")
-        tau = torch.exp(log_tau_obs).clamp_min(1e-8)
+        tau = torch.exp(log_tau_obs)
         return dist.Normal(y, tau).log_prob(x).sum()
 
     def logprob_y_given_z_theta(
@@ -466,7 +466,7 @@ class ContinuousTimeAR1HMMSampler:
         logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
 
         y_at_obs = y_aug[obs_idx_in_T_all]  # (N, D)
-        tau = torch.exp(log_tau_obs).clamp_min(1e-8)
+        tau = torch.exp(log_tau_obs)
         logp = logp + dist.Normal(y_at_obs, tau).log_prob(self.x_obs).sum()
         return logp
 
