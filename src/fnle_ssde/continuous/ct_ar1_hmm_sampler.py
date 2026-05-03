@@ -33,7 +33,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pyro
 import pyro.distributions as dist
 from pyro.infer import MCMC, NUTS
-from pyro.infer.autoguide.initialization import init_to_value
 import torch
 
 
@@ -159,8 +158,6 @@ class ContinuousTimeAR1HMMSampler:
         self._refresh_uniformization()
 
         self.y_nuts_config = {
-            "warmup_steps": 32,
-            "num_samples": 1,
             "max_tree_depth": 4,
             "target_accept_prob": 0.8,
         }
@@ -168,8 +165,6 @@ class ContinuousTimeAR1HMMSampler:
             self.y_nuts_config.update(y_nuts_config)
 
         self.theta_nuts_config = {
-            "warmup_steps": 48,
-            "num_samples": 1,
             "max_tree_depth": 4,
             "target_accept_prob": 0.8,
         }
@@ -497,12 +492,10 @@ class ContinuousTimeAR1HMMSampler:
     def sample_y_nuts(
         self,
         *,
-        warmup_steps: Optional[int] = None,
-        num_samples: Optional[int] = None,
         max_tree_depth: Optional[int] = None,
         target_accept_prob: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Sample the full augmented latent path y_aug with Pyro NUTS."""
+    ) -> torch.Tensor:
+        """Sample the full augmented latent path y_aug with one-step Pyro NUTS."""
         if self.grid is None or self.y_aug is None:
             raise RuntimeError("Sampler must be initialized before sample_y_nuts().")
         if self.theta is None or self.log_tau_obs is None:
@@ -511,59 +504,44 @@ class ContinuousTimeAR1HMMSampler:
         grid = self.grid
         y_init = self.y_aug.clone()
         y_nuts_config = dict(self.y_nuts_config)
-        if warmup_steps is not None:
-            y_nuts_config["warmup_steps"] = warmup_steps
-        if num_samples is not None:
-            y_nuts_config["num_samples"] = num_samples
         if max_tree_depth is not None:
             y_nuts_config["max_tree_depth"] = max_tree_depth
         if target_accept_prob is not None:
             y_nuts_config["target_accept_prob"] = target_accept_prob
 
-        base_dist = dist.Normal(
-            torch.zeros_like(y_init),
-            torch.ones_like(y_init),
-        ).to_event(2)
-
-        def y_model() -> None:
-            y = pyro.sample("y_aug", base_dist)
-            target = self.logprob_y_given_z_theta(
-                y_aug=y,
+        def y_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
+            return -self.logprob_y_given_z_theta(
+                y_aug=params["y_aug"],
                 z_aug=grid.z_aug,
                 T_all=grid.T_all,
                 obs_idx_in_T_all=grid.obs_idx_in_T_all,
                 theta=self.theta,
                 log_tau_obs=self.log_tau_obs,
             )
-            pyro.factor("target_log_density", target - base_dist.log_prob(y))
 
         pyro.clear_param_store()
         kernel = NUTS(
-            y_model,
-            init_strategy=init_to_value(values={"y_aug": y_init}),
+            potential_fn=y_potential_fn,
             max_tree_depth=y_nuts_config["max_tree_depth"],
             target_accept_prob=y_nuts_config["target_accept_prob"],
         )
         mcmc = MCMC(
             kernel,
-            warmup_steps=y_nuts_config["warmup_steps"],
-            num_samples=y_nuts_config["num_samples"],
+            warmup_steps=0,
+            num_samples=1,
             disable_progbar=True,
         )
-        mcmc.run()
+        mcmc.run(initial_params={"y_aug": y_init})
         samples = mcmc.get_samples()["y_aug"]
-        diagnostics = self._extract_mcmc_diagnostics(mcmc)
-        return samples[-1].detach(), diagnostics
+        return samples[-1].detach()
 
     def sample_theta_nuts(
         self,
         *,
-        warmup_steps: Optional[int] = None,
-        num_samples: Optional[int] = None,
         max_tree_depth: Optional[int] = None,
         target_accept_prob: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Sample only the NLE transition/emission-density parameter theta with NUTS."""
+    ) -> torch.Tensor:
+        """Sample theta with one-step Pyro NUTS."""
         if self.grid is None or self.y_aug is None:
             raise RuntimeError("Sampler must be initialized before sample_theta_nuts().")
         if self.theta is None:
@@ -571,53 +549,38 @@ class ContinuousTimeAR1HMMSampler:
 
         grid = self.grid
         theta_nuts_config = dict(self.theta_nuts_config)
-        if warmup_steps is not None:
-            theta_nuts_config["warmup_steps"] = warmup_steps
-        if num_samples is not None:
-            theta_nuts_config["num_samples"] = num_samples
         if max_tree_depth is not None:
             theta_nuts_config["max_tree_depth"] = max_tree_depth
         if target_accept_prob is not None:
             theta_nuts_config["target_accept_prob"] = target_accept_prob
 
         prior_config = self.prior_config
-        init_values = {
-            "theta": self.theta.clone(),
-        }
 
-        def theta_model() -> None:
-            theta = pyro.sample(
-                "theta",
-                dist.Normal(prior_config["theta_loc"], prior_config["theta_scale"]).expand([self.K, self.theta_dim]).to_event(2),
-            )
-            log_lik = self.logprob_theta_given_y_z(
+        def theta_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
+            theta = params["theta"]
+            return -self.logprob_theta_given_y_z(
                 theta=theta,
                 y_aug=self.y_aug,
                 z_aug=grid.z_aug,
                 T_all=grid.T_all,
             )
-            # logprob_theta_given_y_z already includes the priors, so subtract them once.
-            log_prior = dist.Normal(prior_config["theta_loc"], prior_config["theta_scale"]).log_prob(theta).sum()
-            pyro.factor("likelihood_plus_prior_correction", log_lik - log_prior)
 
         pyro.clear_param_store()
         kernel = NUTS(
-            theta_model,
-            init_strategy=init_to_value(values=init_values),
+            potential_fn=theta_potential_fn,
             max_tree_depth=theta_nuts_config["max_tree_depth"],
             target_accept_prob=theta_nuts_config["target_accept_prob"],
         )
         mcmc = MCMC(
             kernel,
-            warmup_steps=theta_nuts_config["warmup_steps"],
-            num_samples=theta_nuts_config["num_samples"],
+            warmup_steps=0,
+            num_samples=1,
             disable_progbar=True,
         )
-        mcmc.run()
+        mcmc.run(initial_params={"theta": self.theta.clone()})
         samples = mcmc.get_samples()
-        diagnostics = self._extract_mcmc_diagnostics(mcmc)
         theta_sample = samples["theta"][-1].detach()
-        return theta_sample, diagnostics
+        return theta_sample
 
     def sample_log_tau_obs(self) -> torch.Tensor:
         """
@@ -917,7 +880,7 @@ class ContinuousTimeAR1HMMSampler:
             old_y=previous_y,
         )
 
-        y_sample, y_diag = self.sample_y_nuts()
+        y_sample = self.sample_y_nuts()
         self.y_aug = y_sample
 
         self.grid = _AugmentedGrid(
@@ -928,7 +891,7 @@ class ContinuousTimeAR1HMMSampler:
             T_pseudo=self.grid.T_pseudo,
         )
 
-        theta_sample, theta_diag = self.sample_theta_nuts()
+        theta_sample = self.sample_theta_nuts()
         self.theta = theta_sample
         self.log_tau_obs = self.sample_log_tau_obs()
 
@@ -944,8 +907,6 @@ class ContinuousTimeAR1HMMSampler:
             "grid_size": int(self.grid.T_all.shape[0]),
             "num_candidate_events": int(self.grid.is_jump_or_virtual_time.sum().item()),
             "num_true_segments": int(self.z_true.shape[0]),
-            "y_nuts": y_diag,
-            "theta_nuts": theta_diag,
             "log_tau_obs_update": "conjugate_inverse_gamma_gibbs",
             "Q_update": "conjugate_gamma_gibbs",
             "omega": float(self.omega),
@@ -1053,24 +1014,3 @@ class ContinuousTimeAR1HMMSampler:
             ).to(dtype=self.dtype)
             y_new[:, d] = interp
         return y_new.to(device=self.device)
-
-    def _extract_mcmc_diagnostics(self, mcmc: MCMC) -> Dict[str, Any]:
-        """Best-effort extraction of a few NUTS diagnostics from Pyro."""
-        try:
-            num_samples = int(getattr(mcmc, "num_samples", 0))
-        except Exception:
-            num_samples = 0
-        if num_samples < 2:
-            return {"note": "diagnostics skipped because num_samples < 2"}
-
-        try:
-            diagnostics = mcmc.diagnostics()
-        except Exception:
-            return {}
-
-        summary: Dict[str, Any] = {}
-        if isinstance(diagnostics, dict):
-            for key in ("acceptance rate", "divergences", "step size"):
-                if key in diagnostics:
-                    summary[key] = diagnostics[key]
-        return summary
