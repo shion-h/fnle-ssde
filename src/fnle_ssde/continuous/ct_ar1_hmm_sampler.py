@@ -604,7 +604,7 @@ class ContinuousTimeAR1HMMSampler:
         # If tau^2 ~ InvGamma(alpha, beta), then precision 1/tau^2 ~ Gamma(alpha, beta).
         precision = dist.Gamma(alpha.expand_as(beta), beta).sample()
         tau2 = precision.reciprocal().clamp_min(1e-16)
-        return 0.5 * torch.log(tau2).detach()
+        return 0.5 * torch.log(tau2)
 
     def sample_Q(self) -> torch.Tensor:
         """
