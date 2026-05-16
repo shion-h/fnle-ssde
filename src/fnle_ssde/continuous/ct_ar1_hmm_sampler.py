@@ -944,7 +944,7 @@ class ContinuousTimeAR1HMMSampler:
         """Return B = I + Q / Omega, then clamp/renormalize rows for numeric stability."""
         B = torch.eye(self.K, dtype=self.dtype, device=self.device) + self.Q / self.omega
         B = B.clamp_min(0.0)
-        B = B / B.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        B = B / B.sum(dim=1, keepdim=True)
         return B
 
     def _refresh_uniformization(self) -> None:
