@@ -27,7 +27,7 @@ that each Gibbs step remains easy to inspect and modify.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyro
 import pyro.distributions as dist
@@ -178,11 +178,6 @@ class ContinuousTimeAR1HMMSampler:
             "q_beta": 1.0,
         }
         if prior_config is not None:
-            # Accept old names, but internally keep theta as the NLE parameter only.
-            if "theta_nle_loc" in prior_config:
-                prior_config = {**prior_config, "theta_loc": prior_config["theta_nle_loc"]}
-            if "theta_nle_scale" in prior_config:
-                prior_config = {**prior_config, "theta_scale": prior_config["theta_nle_scale"]}
             self.prior_config.update(prior_config)
 
         self.history: Dict[str, List[Any]] = {
@@ -214,10 +209,8 @@ class ContinuousTimeAR1HMMSampler:
     def initialize(
         self,
         *,
-        initial_theta: Optional[torch.Tensor | Dict[str, torch.Tensor]] = None,
+        initial_theta: Optional[torch.Tensor] = None,
         initial_log_tau: Optional[torch.Tensor] = None,
-        initial_path_times: Optional[Sequence[float]] = None,
-        initial_path_states: Optional[Sequence[int]] = None,
         initial_state_probs: Optional[torch.Tensor] = None,
     ) -> None:
         """
@@ -226,38 +219,26 @@ class ContinuousTimeAR1HMMSampler:
         `initial_theta` is the NLE transition/emission-density parameter only. Pass
         observation noise separately as `initial_log_tau`.
 
-        Path convention
-        ---------------
-        - `initial_path_times` stores only true jump times in the open interval (0, T).
-        - `initial_path_states` stores the regime on each true-path segment, so its
-          length must be `len(initial_path_times) + 1`.
+        The initial true path has no jumps. Its single state is sampled from
+        `initial_state_probs`, unless that probability vector is overridden here.
         """
         if initial_state_probs is not None:
             probs = initial_state_probs.to(device=self.device, dtype=self.dtype)
             self.initial_state_probs = probs / probs.sum()
 
+        prior_config = self.prior_config
         if initial_theta is None:
-            empirical_scale = self.x_obs.std(dim=0).clamp_min(0.25)
-            theta_value = torch.zeros(self.K, self.theta_dim, device=self.device, dtype=self.dtype)
-            if initial_log_tau is None:
-                initial_log_tau = torch.log(empirical_scale * 0.3)
+            theta_loc = torch.as_tensor(prior_config["theta_loc"], dtype=self.dtype, device=self.device)
+            theta_scale = torch.as_tensor(prior_config["theta_scale"], dtype=self.dtype, device=self.device)
+            theta_value = dist.Normal(theta_loc, theta_scale).sample((self.K, self.theta_dim))
         else:
-            if isinstance(initial_theta, dict):
-                if initial_log_tau is None:
-                    # Legacy input only. New callers should pass initial_log_tau separately.
-                    initial_log_tau = initial_theta.get("log_tau")
-                if "theta" in initial_theta:
-                    theta_value = initial_theta["theta"]
-                elif "theta_nle" in initial_theta:
-                    # Backward-compatible input name for callers that still pass theta_nle.
-                    theta_value = initial_theta["theta_nle"]
-                else:
-                    raise ValueError("initial_theta dict must contain key 'theta'.")
-            else:
-                theta_value = initial_theta
-            if initial_log_tau is None:
-                empirical_scale = self.x_obs.std(dim=0).clamp_min(0.25)
-                initial_log_tau = torch.log(empirical_scale * 0.3)
+            theta_value = initial_theta
+
+        if initial_log_tau is None:
+            tau2_alpha = torch.as_tensor(prior_config["tau2_alpha"], dtype=self.dtype, device=self.device)
+            tau2_beta = torch.as_tensor(prior_config["tau2_beta"], dtype=self.dtype, device=self.device)
+            precision = dist.Gamma(tau2_alpha, tau2_beta).sample((self.D,))
+            initial_log_tau = 0.5 * torch.log(precision.reciprocal().clamp_min(1e-16))
 
         self.theta = theta_value.to(device=self.device, dtype=self.dtype).clone()
         self.log_tau = initial_log_tau.to(device=self.device, dtype=self.dtype).clone()
@@ -266,21 +247,9 @@ class ContinuousTimeAR1HMMSampler:
         if self.log_tau.shape != (self.D,):
             raise ValueError(f"log_tau must have shape ({self.D},).")
 
-        if initial_path_times is None or initial_path_states is None:
-            self.T_true = torch.empty(0, dtype=self.dtype, device=self.device)
-            self.z_true = torch.zeros(1, dtype=torch.long, device=self.device)
-        else:
-            path_times = torch.tensor(list(initial_path_times), dtype=self.dtype, device=self.device)
-            path_states = torch.tensor(list(initial_path_states), dtype=torch.long, device=self.device)
-            if path_times.numel() > 0:
-                if not torch.all(path_times[1:] > path_times[:-1]):
-                    raise ValueError("initial_path_times must be strictly increasing.")
-                if torch.any(path_times <= 0.0) or torch.any(path_times >= self.T):
-                    raise ValueError("initial_path_times must lie in the open interval (0, T).")
-            if path_states.numel() != path_times.numel() + 1:
-                raise ValueError("initial_path_states must have len(initial_path_times)+1 entries.")
-            self.T_true = path_times
-            self.z_true = path_states
+        self.T_true = torch.empty(0, dtype=self.dtype, device=self.device)
+        initial_state = dist.Categorical(probs=self.initial_state_probs).sample()
+        self.z_true = initial_state.reshape(1).to(dtype=torch.long, device=self.device)
 
         self.T_all = None
         self.z_aug = None
