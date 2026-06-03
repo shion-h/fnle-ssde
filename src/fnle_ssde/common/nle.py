@@ -1,4 +1,5 @@
 import time
+import warnings
 from pathlib import Path
 from tqdm import tqdm
 from typing import Tuple, List, Union
@@ -10,6 +11,15 @@ from .dynamics import Dynamics
 
 NStepsType = Union[int, Tuple[int], List[int]]
 PathLike = Union[str, Path]
+
+# nflows 0.14 still calls torch.triangular_solve inside LU transforms.
+# This is a dependency-level deprecation warning; suppress only that warning.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\.triangular_solve is deprecated.*",
+    category=UserWarning,
+    module=r"nflows\.transforms\.lu",
+)
 
 
 class NLEEstimator:
@@ -276,4 +286,6 @@ class NLEEstimator:
         return isinstance(n_steps, (tuple, list))
 
     def _load_model_cache(self, model_path: Path) -> dict:
-        return torch.load(model_path, map_location="cpu")
+        # The cache stores the trained estimator object, not only tensors.
+        # This intentionally uses pickle-backed loading, so only load trusted cache files.
+        return torch.load(model_path, map_location="cpu", weights_only=False)
