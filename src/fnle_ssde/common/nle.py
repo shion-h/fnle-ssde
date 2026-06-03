@@ -51,7 +51,8 @@ class NLEEstimator:
             theta: torch.Tensor, 
             x_ref: torch.Tensor, 
             ref_noize: float,
-            n_steps: NStepsType
+            n_steps: NStepsType,
+            n_transitions: int | None = None,
             ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Generate training data for one parameter sample.
@@ -60,13 +61,20 @@ class NLEEstimator:
             theta: Parameter vector
             x_ref: Reference trajectory
             n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
+            n_transitions: Number of transitions to generate for this theta. If None,
+                use every adjacent reference state, preserving the original behavior.
         """
         xt_chunk = []
         ctx_chunk = []
-        
-        for t in range(1, len(x_ref)):
-            # Use first state parameters (assuming single regime for training)
-            
+
+        if n_transitions is None:
+            ref_indices = range(1, len(x_ref))
+        else:
+            if n_transitions < 1:
+                raise ValueError("n_transitions must be positive.")
+            ref_indices = torch.randint(1, len(x_ref), size=(n_transitions,)).tolist()
+
+        for t in ref_indices:
             # Initial condition with small noise
             x_init = x_ref[t-1] + torch.randn_like(x_ref[t-1]) * ref_noize
             x_init = self.dynamics.to_device(x_init)
@@ -98,6 +106,7 @@ class NLEEstimator:
             x_ref: torch.Tensor, 
             ref_noize: float,
             n_steps: NStepsType,
+            samples_per_theta: int | None = None,
             ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate complete training dataset.
@@ -107,6 +116,9 @@ class NLEEstimator:
             x_ref: Reference trajectories for training
             ref_noize: Noise level for initial conditions
             n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
+            samples_per_theta: Number of transitions generated per parameter sample.
+                If None, use all adjacent reference states for each theta. Set to 1
+                to train on one transition per sampled theta.
         """
         all_xt = []
         all_ctx = []
@@ -115,7 +127,7 @@ class NLEEstimator:
         for _ in tqdm(range(n_params)):
             theta = self.sampling_dist.sample().cpu()
             xt_chunk, ctx_chunk = self.generate_training_data_one_theta(
-                theta, x_ref, ref_noize, n_steps)
+                theta, x_ref, ref_noize, n_steps, n_transitions=samples_per_theta)
             all_xt.extend(xt_chunk)
             all_ctx.extend(ctx_chunk)
 
@@ -128,7 +140,8 @@ class NLEEstimator:
               ref_noize: float = 0.02,
               n_steps: NStepsType = 50,
               batch_size: int = 256, lr: float = 5e-4, 
-              epochs: int = 50) -> 'NLEEstimator':
+              epochs: int = 50,
+              samples_per_theta: int | None = None) -> 'NLEEstimator':
         """
         Train the NLE estimator.
         
@@ -140,6 +153,9 @@ class NLEEstimator:
             batch_size: Training batch size
             lr: Learning rate
             epochs: Number of epochs
+            samples_per_theta: Number of transitions generated per sampled theta.
+                If None, preserve the original behavior and use len(x_ref)-1
+                transitions per theta. Set to 1 for one transition per theta.
         """
         self.conditions_on_n_steps = self._uses_n_steps_conditioning(n_steps)
 
@@ -162,7 +178,7 @@ class NLEEstimator:
 
         if xt_data is None or ctx_data is None:
             xt_data, ctx_data = self.generate_training_data(
-                n_params, x_ref, ref_noize, n_steps
+                n_params, x_ref, ref_noize, n_steps, samples_per_theta=samples_per_theta
             )
         print(f"Data generation took {time.time() - start_time:.2f}s,"
               f"samples: {len(ctx_data)}")
@@ -204,6 +220,7 @@ class NLEEstimator:
                 n_params=n_params,
                 ref_noize=ref_noize,
                 n_steps=n_steps,
+                samples_per_theta=samples_per_theta,
                 x_ref_shape=x_ref_shape,
             )
         
@@ -215,6 +232,7 @@ class NLEEstimator:
             n_params: int | None = None,
             ref_noize: float | None = None,
             n_steps: NStepsType | None = None,
+            samples_per_theta: int | None = None,
             x_ref_shape: Tuple[int, ...] | None = None) -> None:
         if self.estimator is None:
             raise ValueError("No trained estimator is available to save.")
@@ -230,6 +248,7 @@ class NLEEstimator:
                     "n_params": n_params,
                     "ref_noize": ref_noize,
                     "n_steps": n_steps,
+                    "samples_per_theta": samples_per_theta,
                     "x_ref_shape": x_ref_shape,
                 },
                 "member_variables": {
