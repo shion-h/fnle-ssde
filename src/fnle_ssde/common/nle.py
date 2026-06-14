@@ -2,14 +2,13 @@ import time
 import warnings
 from pathlib import Path
 from tqdm import tqdm
-from typing import Tuple, List, Union
+from typing import Literal, Tuple, List, Union
 import torch
 import pyro.distributions as dist
 from torch.distributions import Independent, Normal
 from sbi.inference import SNLE
 from .dynamics import Dynamics
 
-NStepsType = Union[int, Tuple[int], List[int]]
 PathLike = Union[str, Path]
 
 # nflows 0.14 still calls torch.triangular_solve inside LU transforms.
@@ -28,12 +27,16 @@ class NLEEstimator:
                  dynamics: Dynamics,
                  sampling_dist = None,
                  device: str = 'cpu',
-                 model_cache_path: PathLike | None = None):
+                 model_cache_path: PathLike | None = None,
+                 target_type: Literal["x_next", "scaled_dx"] = "x_next"):
         self.dynamics = dynamics
         self.device = device
         self.estimator = None
         self.conditions_on_n_steps = False
         self.model_cache_path = Path(model_cache_path) if model_cache_path is not None else None
+        self.target_type = target_type
+        if self.target_type not in {"x_next", "scaled_dx"}:
+            raise ValueError("target_type must be either 'x_next' or 'scaled_dx'.")
         
         if sampling_dist is None:
             self.sampling_dist = dist.MultivariateNormal(
@@ -51,7 +54,7 @@ class NLEEstimator:
             theta: torch.Tensor, 
             x_ref: torch.Tensor, 
             ref_noize: float,
-            n_steps: NStepsType,
+            max_n_steps: int | None = None,
             n_transitions: int | None = None,
             ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -60,7 +63,9 @@ class NLEEstimator:
         Args:
             theta: Parameter vector
             x_ref: Reference trajectory
-            n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
+            max_n_steps: If None, simulate one step and do not condition on n_steps.
+                If an int, sample n_steps uniformly from 1..max_n_steps and append
+                the sampled value to the context.
             n_transitions: Number of transitions to generate for this theta. If None,
                 use every adjacent reference state, preserving the original behavior.
         """
@@ -81,13 +86,13 @@ class NLEEstimator:
             
             # Simulate forward
             x_sim = x_init
-            sampled_n_steps = self._sample_n_steps(n_steps)
+            sampled_n_steps = self._sample_n_steps(max_n_steps)
             for _ in range(sampled_n_steps):
                 x_sim = self.dynamics.simulate_one_step(x_sim, theta)
                 x_sim = torch.clamp(x_sim, min=0.0, max=1e4)
             
             # Create context
-            if self._uses_n_steps_conditioning(n_steps):
+            if self.conditions_on_n_steps:
                 n_steps_tensor = torch.tensor(
                     [sampled_n_steps], device=x_init.device, dtype=x_init.dtype
                 )
@@ -95,7 +100,13 @@ class NLEEstimator:
             else:
                 context = torch.cat([theta, x_init], dim=-1)
             
-            xt_chunk.append(x_sim)
+            xt_chunk.append(
+                self._to_training_target(
+                    x_prev=x_init,
+                    x_next=x_sim,
+                    n_steps=sampled_n_steps,
+                )
+            )
             ctx_chunk.append(context)
         
         return xt_chunk, ctx_chunk
@@ -105,7 +116,7 @@ class NLEEstimator:
             n_params: int, 
             x_ref: torch.Tensor, 
             ref_noize: float,
-            n_steps: NStepsType,
+            max_n_steps: int | None = None,
             samples_per_theta: int | None = None,
             ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -115,7 +126,9 @@ class NLEEstimator:
             n_params: Number of parameter samples
             x_ref: Reference trajectories for training
             ref_noize: Noise level for initial conditions
-            n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
+            max_n_steps: If None, simulate one step and do not condition on n_steps.
+                If an int, sample n_steps uniformly from 1..max_n_steps and append
+                the sampled value to the context.
             samples_per_theta: Number of transitions generated per parameter sample.
                 If None, use all adjacent reference states for each theta. Set to 1
                 to train on one transition per sampled theta.
@@ -127,7 +140,7 @@ class NLEEstimator:
         for _ in tqdm(range(n_params)):
             theta = self.sampling_dist.sample().cpu()
             xt_chunk, ctx_chunk = self.generate_training_data_one_theta(
-                theta, x_ref, ref_noize, n_steps, n_transitions=samples_per_theta)
+                theta, x_ref, ref_noize, max_n_steps, n_transitions=samples_per_theta)
             all_xt.extend(xt_chunk)
             all_ctx.extend(ctx_chunk)
 
@@ -138,7 +151,7 @@ class NLEEstimator:
     
     def train(self, x_ref: torch.Tensor, n_params: int = 500, 
               ref_noize: float = 0.02,
-              n_steps: NStepsType = 50,
+              max_n_steps: int | None = None,
               batch_size: int = 256, lr: float = 5e-4, 
               epochs: int = 50,
               samples_per_theta: int | None = None) -> 'NLEEstimator':
@@ -149,7 +162,9 @@ class NLEEstimator:
             x_ref: Reference trajectories
             n_params: Number of parameter samples for training
             ref_noize: Noise level for initial conditions
-            n_steps: Fixed number of steps, or a length-1 tuple/list for random 1..max_n_steps
+            max_n_steps: If None, simulate one step and do not condition on n_steps.
+                If an int, sample n_steps uniformly from 1..max_n_steps and append
+                the sampled value to the context.
             batch_size: Training batch size
             lr: Learning rate
             epochs: Number of epochs
@@ -157,7 +172,9 @@ class NLEEstimator:
                 If None, preserve the original behavior and use len(x_ref)-1
                 transitions per theta. Set to 1 for one transition per theta.
         """
-        self.conditions_on_n_steps = self._uses_n_steps_conditioning(n_steps)
+        self.conditions_on_n_steps = max_n_steps is not None
+        if max_n_steps is not None and max_n_steps < 1:
+            raise ValueError("max_n_steps must be positive when specified.")
 
         start_time = time.time()
         xt_data = None
@@ -178,7 +195,7 @@ class NLEEstimator:
 
         if xt_data is None or ctx_data is None:
             xt_data, ctx_data = self.generate_training_data(
-                n_params, x_ref, ref_noize, n_steps, samples_per_theta=samples_per_theta
+                n_params, x_ref, ref_noize, max_n_steps, samples_per_theta=samples_per_theta
             )
         print(f"Data generation took {time.time() - start_time:.2f}s,"
               f"samples: {len(ctx_data)}")
@@ -219,7 +236,7 @@ class NLEEstimator:
                 self.model_cache_path,
                 n_params=n_params,
                 ref_noize=ref_noize,
-                n_steps=n_steps,
+                max_n_steps=max_n_steps,
                 samples_per_theta=samples_per_theta,
                 x_ref_shape=x_ref_shape,
             )
@@ -231,7 +248,7 @@ class NLEEstimator:
             model_path: PathLike,
             n_params: int | None = None,
             ref_noize: float | None = None,
-            n_steps: NStepsType | None = None,
+            max_n_steps: int | None = None,
             samples_per_theta: int | None = None,
             x_ref_shape: Tuple[int, ...] | None = None) -> None:
         if self.estimator is None:
@@ -245,9 +262,10 @@ class NLEEstimator:
                 "metadata": {
                     "device": self.device,
                     "conditions_on_n_steps": self.conditions_on_n_steps,
+                    "target_type": self.target_type,
                     "n_params": n_params,
                     "ref_noize": ref_noize,
-                    "n_steps": n_steps,
+                    "max_n_steps": max_n_steps,
                     "samples_per_theta": samples_per_theta,
                     "x_ref_shape": x_ref_shape,
                 },
@@ -256,6 +274,7 @@ class NLEEstimator:
                     "sampling_dist": self.sampling_dist,
                     "device": self.device,
                     "conditions_on_n_steps": self.conditions_on_n_steps,
+                    "target_type": self.target_type,
                 },
                 "xt_data": getattr(self, "xt_data", None),
                 "ctx_data": getattr(self, "ctx_data", None),
@@ -271,6 +290,8 @@ class NLEEstimator:
         metadata = cache.get("metadata", {})
         if "conditions_on_n_steps" in metadata:
             self.conditions_on_n_steps = metadata["conditions_on_n_steps"]
+        if "target_type" in metadata:
+            self.target_type = metadata["target_type"]
         self.cached_member_variables = cache.get("member_variables", {})
         self.xt_data = cache.get("xt_data")
         self.ctx_data = cache.get("ctx_data")
@@ -283,28 +304,94 @@ class NLEEstimator:
         print(f"Loaded NLE model from {model_path}")
         return self
 
-    def _sample_n_steps(self, n_steps: NStepsType) -> int:
-        if isinstance(n_steps, int):
-            if n_steps < 1:
-                raise ValueError("n_steps must be a positive integer.")
-            return n_steps
-
-        if isinstance(n_steps, (tuple, list)) and len(n_steps) == 1:
-            max_steps = n_steps[0]
-            if not isinstance(max_steps, int):
-                raise TypeError("Random n_steps max must be an integer.")
-            if max_steps < 1:
-                raise ValueError("Random n_steps max must be positive.")
-            return torch.randint(1, max_steps + 1, (1,)).item()
-
-        raise TypeError(
-            "n_steps must be an int or a length-1 tuple/list containing max_n_steps."
-        )
-
-    def _uses_n_steps_conditioning(self, n_steps: NStepsType) -> bool:
-        return isinstance(n_steps, (tuple, list))
+    def _sample_n_steps(self, max_n_steps: int | None) -> int:
+        if max_n_steps is None:
+            return 1
+        return torch.randint(1, max_n_steps + 1, (1,)).item()
 
     def _load_model_cache(self, model_path: Path) -> dict:
         # The cache stores the trained estimator object, not only tensors.
         # This intentionally uses pickle-backed loading, so only load trusted cache files.
         return torch.load(model_path, map_location="cpu", weights_only=False)
+
+    def _target_scale(
+            self,
+            n_steps: torch.Tensor,
+            dtype: torch.dtype,
+            device: torch.device) -> torch.Tensor:
+        delta_t = torch.as_tensor(n_steps, device=device, dtype=dtype) * float(self.dynamics.dt)
+        return torch.sqrt(delta_t).unsqueeze(-1)
+
+    def _to_training_target(
+            self,
+            x_prev: torch.Tensor,
+            x_next: torch.Tensor,
+            n_steps: int | torch.Tensor) -> torch.Tensor:
+        """Map x_next to the density-estimator target space."""
+        if self.target_type == "x_next":
+            return x_next
+        scale = self._target_scale(
+            torch.as_tensor(n_steps, device=x_next.device),
+            dtype=x_next.dtype,
+            device=x_next.device,
+        ).squeeze(0)
+        return (x_next - x_prev) / scale
+
+    def _target_to_x_next(
+            self,
+            x_prev: torch.Tensor,
+            target_sample: torch.Tensor,
+            n_steps: torch.Tensor) -> torch.Tensor:
+        """Map a density-estimator sample back to x_next space."""
+        if self.target_type == "x_next":
+            return target_sample
+        scale = self._target_scale(n_steps, dtype=target_sample.dtype, device=target_sample.device)
+        return x_prev + scale * target_sample
+
+    def _x_next_to_target(
+            self,
+            x_prev: torch.Tensor,
+            x_next: torch.Tensor,
+            n_steps: torch.Tensor) -> torch.Tensor:
+        """Map x_next observations to the density-estimator target space."""
+        if self.target_type == "x_next":
+            return x_next
+        scale = self._target_scale(n_steps, dtype=x_next.dtype, device=x_next.device)
+        return (x_next - x_prev) / scale
+
+    def transition_log_prob(
+            self,
+            x_next: torch.Tensor,
+            *,
+            context: torch.Tensor,
+            x_prev: torch.Tensor,
+            n_steps: torch.Tensor,
+            include_jacobian: bool = True) -> torch.Tensor:
+        """
+        Evaluate log p(x_next | x_prev, theta, n_steps).
+
+        For target_type='scaled_dx', the flow is trained on
+        r = (x_next - x_prev) / sqrt(n_steps * dt).  The Jacobian term is
+        included by default so the returned density is in x_next space.
+        """
+        if self.estimator is None:
+            raise ValueError("No trained estimator is available.")
+        target = self._x_next_to_target(x_prev=x_prev, x_next=x_next, n_steps=n_steps)
+        log_prob = self.estimator.log_prob(target.unsqueeze(0), condition=context)
+        if self.target_type == "scaled_dx" and include_jacobian:
+            D = x_next.shape[-1]
+            scale = self._target_scale(n_steps, dtype=x_next.dtype, device=x_next.device).squeeze(-1)
+            log_prob = log_prob - D * torch.log(scale)
+        return log_prob
+
+    def sample_transition(
+            self,
+            *,
+            context: torch.Tensor,
+            x_prev: torch.Tensor,
+            n_steps: torch.Tensor) -> torch.Tensor:
+        """Draw one x_next sample for each context row."""
+        if self.estimator is None:
+            raise ValueError("No trained estimator is available.")
+        target_sample = self.estimator.sample((1,), condition=context)[0]
+        return self._target_to_x_next(x_prev=x_prev, target_sample=target_sample, n_steps=n_steps)
