@@ -22,6 +22,11 @@ class NFlowAR1HMMEstimator(nn.Module):
                  learning_rate: float=0.01, 
                  device: str = 'cpu'):
         super(NFlowAR1HMMEstimator, self).__init__()
+        if nle_estimator.conditions_on_n_steps:
+            raise ValueError(
+                "NFlowAR1HMMEstimator expects an NLE trained without n_steps "
+                "conditioning. Train NLEEstimator with max_n_steps=None."
+            )
         
         self.n_states = n_states
         self.flow_model = nle_estimator.estimator
@@ -147,8 +152,6 @@ class NFlowAR1HMMEstimator(nn.Module):
         # rows_rev: [β_{T-2}, β_{T-3}, ..., β_0]（最後のゼロ行を末尾に持つ）
         log_beta_hat = torch.stack(list(reversed(rows_rev)), dim=0)      # (T-1, nS)
         return log_beta_hat
-
-
     
     def _compute_posteriors_single(self, X):
         """
