@@ -7,6 +7,7 @@ import torch
 import pyro.distributions as dist
 from torch.distributions import Independent, Normal
 from sbi.inference import SNLE
+from sbi.neural_nets.factory import likelihood_nn
 from .dynamics import Dynamics
 
 PathLike = Union[str, Path]
@@ -28,7 +29,11 @@ class NLEEstimator:
                  sampling_dist = None,
                  device: str = 'cpu',
                  model_cache_path: PathLike | None = None,
-                 target_type: Literal["x_next", "scaled_dx"] = "x_next"):
+                 target_type: Literal["x_next", "scaled_dx"] = "x_next",
+                 density_model: str = "nsf",
+                 hidden_features: int = 50,
+                 num_transforms: int = 5,
+                 num_bins: int = 10):
         self.dynamics = dynamics
         self.device = device
         self.estimator = None
@@ -37,6 +42,10 @@ class NLEEstimator:
         self.target_type = target_type
         if self.target_type not in {"x_next", "scaled_dx"}:
             raise ValueError("target_type must be either 'x_next' or 'scaled_dx'.")
+        self.density_model = density_model
+        self.hidden_features = int(hidden_features)
+        self.num_transforms = int(num_transforms)
+        self.num_bins = int(num_bins)
         
         if sampling_dist is None:
             self.sampling_dist = dist.MultivariateNormal(
@@ -215,7 +224,12 @@ class NLEEstimator:
         
         inf = SNLE(
             prior=context_prior,
-            density_estimator='nsf',
+            density_estimator=likelihood_nn(
+                model=self.density_model,
+                hidden_features=self.hidden_features,
+                num_transforms=self.num_transforms,
+                num_bins=self.num_bins,
+            ),
             device=self.device,
             show_progress_bars=True
         )
@@ -263,6 +277,10 @@ class NLEEstimator:
                     "device": self.device,
                     "conditions_on_n_steps": self.conditions_on_n_steps,
                     "target_type": self.target_type,
+                    "density_model": self.density_model,
+                    "hidden_features": self.hidden_features,
+                    "num_transforms": self.num_transforms,
+                    "num_bins": self.num_bins,
                     "n_params": n_params,
                     "ref_noize": ref_noize,
                     "max_n_steps": max_n_steps,
@@ -275,6 +293,10 @@ class NLEEstimator:
                     "device": self.device,
                     "conditions_on_n_steps": self.conditions_on_n_steps,
                     "target_type": self.target_type,
+                    "density_model": self.density_model,
+                    "hidden_features": self.hidden_features,
+                    "num_transforms": self.num_transforms,
+                    "num_bins": self.num_bins,
                 },
                 "xt_data": getattr(self, "xt_data", None),
                 "ctx_data": getattr(self, "ctx_data", None),
@@ -292,6 +314,14 @@ class NLEEstimator:
             self.conditions_on_n_steps = metadata["conditions_on_n_steps"]
         if "target_type" in metadata:
             self.target_type = metadata["target_type"]
+        if "density_model" in metadata:
+            self.density_model = metadata["density_model"]
+        if "hidden_features" in metadata:
+            self.hidden_features = metadata["hidden_features"]
+        if "num_transforms" in metadata:
+            self.num_transforms = metadata["num_transforms"]
+        if "num_bins" in metadata:
+            self.num_bins = metadata["num_bins"]
         self.cached_member_variables = cache.get("member_variables", {})
         self.xt_data = cache.get("xt_data")
         self.ctx_data = cache.get("ctx_data")
