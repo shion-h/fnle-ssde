@@ -91,7 +91,7 @@ class ContinuousTimeAR1HMMSampler:
             Uniformization rate factor. Omega = omega_scale * max_k(-Q_kk).
         nle_estimator:
             Trained/loaded NLEEstimator. Transition log densities are evaluated by
-            `nle_estimator.estimator.log_prob`.
+            `nle_estimator.transition_log_prob`.
         y_nuts_config / theta_nuts_config:
             Pyro NUTS settings used for the conditional updates.
         sir_config:
@@ -157,6 +157,8 @@ class ContinuousTimeAR1HMMSampler:
         self.theta_nuts_config = {
             "max_tree_depth": 4,
             "target_accept_prob": 0.8,
+            "warmup_steps": 0,
+            "num_samples": 1,
         }
         if theta_nuts_config is not None:
             self.theta_nuts_config.update(theta_nuts_config)
@@ -367,8 +369,16 @@ class ContinuousTimeAR1HMMSampler:
         if not cand_times:
             return torch.empty(0, dtype=self.dtype, device=self.device)
 
-        T_cand = torch.cat(cand_times)
-        return torch.unique(T_cand, sorted=True)
+        T_cand = torch.unique(torch.cat(cand_times), sorted=True)
+
+        # Candidate times that exactly coincide with retained grid points are not
+        # newly inserted points.  Keeping them in cand_idx would make SIR skip a
+        # y value that should be copied from the old grid.
+        if T_cand.numel() > 0:
+            retained_times = torch.cat([self.T_obs.to(device=self.device), self.T_true.to(device=self.device)])
+            if retained_times.numel() > 0:
+                T_cand = T_cand[~torch.isin(T_cand, retained_times)]
+        return T_cand
 
     def _delta_to_n_steps(self, delta: torch.Tensor) -> torch.Tensor:
         """
@@ -455,7 +465,7 @@ class ContinuousTimeAR1HMMSampler:
         target_accept_prob: Optional[float] = None,
     ) -> torch.Tensor:
         """Sample the full augmented latent path y_aug with one-step Pyro NUTS."""
-        if self.T_all is None or self.z_aug is None or self.obs_idx is None or self.y_aug is None:
+        if self.T_all is None or self.z_aug is None or self.obs_idx is None:
             raise RuntimeError("Sampler must be initialized before sample_y_nuts().")
         if self.theta is None or self.log_tau is None:
             raise RuntimeError("Sampler parameters have not been initialized.")
@@ -486,9 +496,10 @@ class ContinuousTimeAR1HMMSampler:
             kernel,
             warmup_steps=0,
             num_samples=1,
+            initial_params={"y_aug": y_init},
             disable_progbar=True,
         )
-        mcmc.run(initial_params={"y_aug": y_init})
+        mcmc.run()
         samples = mcmc.get_samples()["y_aug"]
         return samples[-1].detach()
 
@@ -528,11 +539,12 @@ class ContinuousTimeAR1HMMSampler:
         )
         mcmc = MCMC(
             kernel,
-            warmup_steps=0,
-            num_samples=1,
+            warmup_steps=theta_nuts_config["warmup_steps"],
+            num_samples=theta_nuts_config["num_samples"],
+            initial_params={"theta": self.theta.clone()},
             disable_progbar=True,
         )
-        mcmc.run(initial_params={"theta": self.theta.clone()})
+        mcmc.run()
         samples = mcmc.get_samples()
         theta_sample = samples["theta"][-1].detach()
         return theta_sample
@@ -629,8 +641,6 @@ class ContinuousTimeAR1HMMSampler:
         delta_batch: torch.Tensor,
     ) -> torch.Tensor:
         """Evaluate batched NLE transition log probabilities."""
-        if self.flow_model is None:
-            raise RuntimeError("NLE transition requested but no flow_model is available.")
         delta = torch.as_tensor(
             delta_batch,
             device=self.device,
@@ -646,8 +656,14 @@ class ContinuousTimeAR1HMMSampler:
             y_prev_batch=y_prev_batch,
             delta_batch=delta,
         )
-        # first dimension is not a batch, needed to be 1
-        return self.flow_model.log_prob(y_curr_batch.unsqueeze(0), condition=context)
+        n_steps = self._delta_to_n_steps(delta)
+        return self.nle_estimator.transition_log_prob(
+            x_next=y_curr_batch,
+            context=context,
+            x_prev=y_prev_batch,
+            n_steps=n_steps.to(device=y_prev_batch.device, dtype=y_prev_batch.dtype),
+            include_jacobian=True,
+        )
 
     def _build_transition_context(
         self,
@@ -661,13 +677,20 @@ class ContinuousTimeAR1HMMSampler:
         n_step_batch = n_steps.unsqueeze(-1).to(device=context.device, dtype=context.dtype)
         return torch.cat([context, n_step_batch], dim=-1)
 
-    def _sample_flow_one_per_context(self, context: torch.Tensor) -> torch.Tensor:
-        """Draw one NLE sample for each context row; returns shape (batch, D)."""
-        samples = self.flow_model.sample(1, context=context)
-        expected_shape = (context.shape[0], 1, self.D)
-        if samples.shape != expected_shape:
-            raise RuntimeError(f"Expected flow samples with shape {expected_shape}, got {tuple(samples.shape)}.")
-        return samples[:, 0, :].to(device=self.device, dtype=self.dtype)
+    def _sample_transition_one_per_context(
+        self,
+        context: torch.Tensor,
+        y_prev: torch.Tensor,
+        delta: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draw one transition sample per context row in y-space."""
+        n_steps = self._delta_to_n_steps(delta)
+        samples = self.nle_estimator.sample_transition(
+            context=context,
+            x_prev=y_prev,
+            n_steps=n_steps.to(device=y_prev.device, dtype=y_prev.dtype),
+        )
+        return samples.to(device=self.device, dtype=self.dtype)
 
     def _sample_forward_block_particles(
         self,
@@ -696,8 +719,12 @@ class ContinuousTimeAR1HMMSampler:
                     y_prev_batch=y_prev,
                     delta_batch=delta.expand(num_particles),
                 )
-                # batch size is num_paeticle
-                y_curr = self._sample_flow_one_per_context(context)
+                # batch size is num_particle
+                y_curr = self._sample_transition_one_per_context(
+                    context=context,
+                    y_prev=y_prev,
+                    delta=delta.expand(num_particles),
+                )
                 particles.append(y_curr)
                 y_prev = y_curr
                 prev_idx = idx
@@ -1022,6 +1049,8 @@ class ContinuousTimeAR1HMMSampler:
         if self.theta is None or self.log_tau is None:
             raise RuntimeError("Current parameters must be available before resampling y on a new grid.")
 
+        self.last_sir_cand_particles = []
+
         if self.T_all is None or self.y_aug is None or self.obs_idx is None:
             return self._initialize_y_on_grid(new_grid_times), {
                 "num_particles": float(num_particles),
@@ -1060,6 +1089,7 @@ class ContinuousTimeAR1HMMSampler:
             }
 
         ess_values: List[float] = []
+        sir_cand_particles: List[Dict[str, torch.Tensor]] = []
 
         inserted_idx_values = inserted_idx.tolist()
         block_start = inserted_idx_values[0]
@@ -1089,6 +1119,13 @@ class ContinuousTimeAR1HMMSampler:
                 new_z_aug=new_z_aug,
                 num_particles=num_particles,
             )
+            block_time = new_grid_times[block_start : block_end + 1].detach().cpu()
+            sir_cand_particles.append(
+                {
+                    "times": block_time,
+                    "particles": particles.detach().cpu(),
+                }
+            )
 
             right_y = y_sample[right_idx].unsqueeze(0).expand(num_particles, self.D)
             last_particle = particles[:, -1, :]
@@ -1108,10 +1145,13 @@ class ContinuousTimeAR1HMMSampler:
 
             chosen = dist.Categorical(probs=weights).sample()
             y_sample[block_start : block_end + 1] = particles[chosen]
+            sir_cand_particles[-1]["weights"] = weights.detach().cpu()
+            sir_cand_particles[-1]["chosen"] = chosen.detach().cpu().reshape(())
 
         ess_tensor = torch.tensor(ess_values, dtype=self.dtype)
         min_ess = float(ess_tensor.min().item())
         mean_ess = float(ess_tensor.mean().item())
+        self.last_sir_cand_particles = sir_cand_particles
 
         return y_sample, {
             "num_particles": float(num_particles),
