@@ -117,3 +117,49 @@ class LotkaVolterraDynamics(Dynamics):
             [sigma[0] * x[0] * x[1], 0.0],
             [0.0, sigma[1] * x[1] * x[0]]
         ], device=self.device, dtype=torch.float32)
+
+
+class FluoreChemicalLangevinDynamics(Dynamics):
+    r"""One-dimensional fluorescence chemical Langevin dynamics.
+
+    The SDE is
+
+        dY_t = alpha (beta - Y_t) dt
+               + sqrt(gamma (beta + Y_t)) dW_t.
+
+    The unconstrained parameter vector is
+    ``theta = (log alpha, log beta, log gamma)``. All three physical
+    parameters are obtained with an exponential transformation.
+    """
+
+    def __init__(self, dt: float = 0.01, device: str = "cpu"):
+        super().__init__(dt, device)
+        self.x_dim = 1
+        self.theta_dim = 3
+
+    def split_theta(
+        self, theta: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split parameters used by the drift and diffusion functions."""
+        if theta.shape[0] != self.theta_dim:
+            raise ValueError(
+                f"Expected {self.theta_dim} parameters, got {theta.shape[0]}."
+            )
+        # beta appears in both the drift and diffusion terms.
+        return theta[:2], theta[1:3]
+
+    def drift(
+        self, x: torch.Tensor, theta_drift: torch.Tensor
+    ) -> torch.Tensor:
+        """Return alpha * (beta - Y_t) as a one-dimensional vector."""
+        alpha, beta = torch.exp(theta_drift)
+        return alpha * (beta - x)
+
+    def diffusion(
+        self, x: torch.Tensor, theta_diffusion: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the 1 x 1 state-dependent diffusion matrix."""
+        beta, gamma = torch.exp(theta_diffusion)
+        # Full truncation keeps Euler-Maruyama finite if a step crosses -beta.
+        variance_rate = gamma * torch.clamp_min(beta + x[0], 0.0)
+        return torch.sqrt(variance_rate).reshape(1, 1)
