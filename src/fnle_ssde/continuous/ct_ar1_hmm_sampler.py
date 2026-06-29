@@ -70,6 +70,7 @@ class ContinuousTimeAR1HMMSampler:
         theta_nuts_config: Optional[Dict[str, Any]] = None,
         sir_config: Optional[Dict[str, Any]] = None,
         prior_config: Optional[Dict[str, Any]] = None,
+        switching_parameter_mask: Optional[torch.Tensor] = None,
         y0_prior_scale: float = 5.0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float64,
@@ -98,6 +99,10 @@ class ContinuousTimeAR1HMMSampler:
             Settings for SIR initialization of y at newly inserted candidate times.
         prior_config:
             Prior hyperparameters for theta and observation-noise variance.
+        switching_parameter_mask:
+            Boolean tensor of shape (theta_dim,). True dimensions have one
+            parameter per regime; False dimensions are shared across regimes.
+            If omitted, every parameter is regime-specific as before.
         y0_prior_scale:
             Optional fallback scale for initialization of y.
         """
@@ -120,6 +125,21 @@ class ContinuousTimeAR1HMMSampler:
         if self.flow_model is None:
             raise ValueError("nle_estimator.estimator must be trained/loaded before sampling.")
         self.theta_dim = int(nle_estimator.dynamics.theta_dim)
+        if switching_parameter_mask is None:
+            switching_parameter_mask = torch.ones(
+                self.theta_dim, dtype=torch.bool, device=self.device
+            )
+        else:
+            switching_parameter_mask = torch.as_tensor(
+                switching_parameter_mask, dtype=torch.bool, device=self.device
+            )
+        if switching_parameter_mask.shape != (self.theta_dim,):
+            raise ValueError(
+                "switching_parameter_mask must have shape "
+                f"({self.theta_dim},), got {tuple(switching_parameter_mask.shape)}."
+            )
+        self.switching_parameter_mask = switching_parameter_mask
+        self.shared_parameter_mask = ~switching_parameter_mask
         self.dynamics_dt = float(nle_estimator.dynamics.dt)
         if self.dynamics_dt <= 0.0:
             raise ValueError("nle_estimator.dynamics.dt must be positive.")
@@ -230,9 +250,12 @@ class ContinuousTimeAR1HMMSampler:
 
         prior_config = self.prior_config
         if initial_theta is None:
-            theta_loc = torch.as_tensor(prior_config["theta_loc"], dtype=self.dtype, device=self.device)
-            theta_scale = torch.as_tensor(prior_config["theta_scale"], dtype=self.dtype, device=self.device)
-            theta_value = dist.Normal(theta_loc, theta_scale).sample((self.K, self.theta_dim))
+            theta_loc, theta_scale = self._theta_prior_parameters()
+            theta_value = dist.Normal(theta_loc, theta_scale).sample((self.K,))
+            # Shared dimensions represent one random variable, not K independent draws.
+            theta_value[:, self.shared_parameter_mask] = theta_value[
+                0, self.shared_parameter_mask
+            ]
         else:
             theta_value = initial_theta
 
@@ -246,6 +269,7 @@ class ContinuousTimeAR1HMMSampler:
         self.log_tau = initial_log_tau.to(device=self.device, dtype=self.dtype).clone()
         if self.theta.shape != (self.K, self.theta_dim):
             raise ValueError(f"theta must have shape ({self.K}, {self.theta_dim}).")
+        self._validate_shared_theta(self.theta)
         if self.log_tau.shape != (self.D,):
             raise ValueError(f"log_tau must have shape ({self.D},).")
 
@@ -259,6 +283,71 @@ class ContinuousTimeAR1HMMSampler:
         self.obs_idx = None
         self.true_idx = None
         self.y_aug = None
+
+    def _theta_prior_parameters(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return theta prior location and scale as vectors of shape (theta_dim,)."""
+        theta_loc = torch.as_tensor(
+            self.prior_config["theta_loc"], dtype=self.dtype, device=self.device
+        ).broadcast_to((self.theta_dim,))
+        theta_scale = torch.as_tensor(
+            self.prior_config["theta_scale"], dtype=self.dtype, device=self.device
+        ).broadcast_to((self.theta_dim,))
+        if torch.any(theta_scale <= 0):
+            raise ValueError("theta prior scales must be positive.")
+        return theta_loc, theta_scale
+
+    def _validate_shared_theta(self, theta: torch.Tensor) -> None:
+        """Ensure expanded theta contains identical values in shared dimensions."""
+        if not torch.any(self.shared_parameter_mask):
+            return
+        shared = theta[:, self.shared_parameter_mask]
+        if not torch.allclose(shared, shared[0].expand_as(shared)):
+            raise ValueError(
+                "initial_theta must be identical across regimes for dimensions "
+                "marked False in switching_parameter_mask."
+            )
+
+    def _pack_theta(self, theta: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Pack expanded theta (K, P) into the non-redundant NUTS variables."""
+        packed: Dict[str, torch.Tensor] = {}
+        if torch.any(self.shared_parameter_mask):
+            packed["theta_shared"] = theta[0, self.shared_parameter_mask].clone()
+        if torch.any(self.switching_parameter_mask):
+            packed["theta_switching"] = theta[
+                :, self.switching_parameter_mask
+            ].clone()
+        return packed
+
+    def _expand_theta(self, packed: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Expand non-redundant NUTS variables to theta with shape (K, P)."""
+        columns: List[torch.Tensor] = []
+        shared_index = 0
+        switching_index = 0
+        for parameter_index in range(self.theta_dim):
+            if self.switching_parameter_mask[parameter_index]:
+                column = packed["theta_switching"][:, switching_index]
+                switching_index += 1
+            else:
+                column = packed["theta_shared"][shared_index].expand(self.K)
+                shared_index += 1
+            columns.append(column)
+        return torch.stack(columns, dim=1)
+
+    def _theta_log_prior(self, packed: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Evaluate each unique theta prior exactly once."""
+        theta_loc, theta_scale = self._theta_prior_parameters()
+        logp = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+        if torch.any(self.shared_parameter_mask):
+            logp = logp + dist.Normal(
+                theta_loc[self.shared_parameter_mask],
+                theta_scale[self.shared_parameter_mask],
+            ).log_prob(packed["theta_shared"]).sum()
+        if torch.any(self.switching_parameter_mask):
+            logp = logp + dist.Normal(
+                theta_loc[self.switching_parameter_mask],
+                theta_scale[self.switching_parameter_mask],
+            ).log_prob(packed["theta_switching"]).sum()
+        return logp
 
     def build_augmented_grid(
         self,
@@ -452,9 +541,8 @@ class ContinuousTimeAR1HMMSampler:
         theta, so it is intentionally omitted here. Observation noise is updated
         separately by sample_log_tau().
         """
-        prior_config = self.prior_config
-        logp = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        logp = logp + dist.Normal(prior_config["theta_loc"], prior_config["theta_scale"]).log_prob(theta).sum()
+        self._validate_shared_theta(theta)
+        logp = self._theta_log_prior(self._pack_theta(theta))
         logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
         return logp
 
@@ -520,10 +608,8 @@ class ContinuousTimeAR1HMMSampler:
         if target_accept_prob is not None:
             theta_nuts_config["target_accept_prob"] = target_accept_prob
 
-        prior_config = self.prior_config
-
         def theta_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
-            theta = params["theta"]
+            theta = self._expand_theta(params)
             return -self.logprob_theta_given_y_z(
                 theta=theta,
                 y_aug=self.y_aug,
@@ -541,13 +627,15 @@ class ContinuousTimeAR1HMMSampler:
             kernel,
             warmup_steps=theta_nuts_config["warmup_steps"],
             num_samples=theta_nuts_config["num_samples"],
-            initial_params={"theta": self.theta.clone()},
+            initial_params=self._pack_theta(self.theta),
             disable_progbar=True,
         )
         mcmc.run()
         samples = mcmc.get_samples()
-        theta_sample = samples["theta"][-1].detach()
-        return theta_sample
+        packed_sample = {
+            name: values[-1] for name, values in samples.items()
+        }
+        return self._expand_theta(packed_sample).detach()
 
     def sample_log_tau(self) -> torch.Tensor:
         """
