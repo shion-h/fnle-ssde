@@ -40,12 +40,12 @@ class ContinuousTimeAR1HMMSampler:
 
     Shapes
     ------
-    x_obs: (N, D)
+    x_obs: (N, obs_dim)
     T_obs: (N,)
     y_aug: (L+1, D)
     z_aug: (L+1,)
     theta: (K, theta_dim)       NLE transition/emission-density parameters only
-    log_tau: (D,)               observation-noise log scale, not part of theta
+    log_tau: (obs_dim,)         observation-noise log scale, not part of theta
     Q: (K, K)                   CTMC generator, sampled by Gamma conjugacy
 
     Conventions
@@ -71,6 +71,7 @@ class ContinuousTimeAR1HMMSampler:
         sir_config: Optional[Dict[str, Any]] = None,
         prior_config: Optional[Dict[str, Any]] = None,
         switching_parameter_mask: Optional[torch.Tensor] = None,
+        observed_dims: Optional[torch.Tensor] = None,
         y0_prior_scale: float = 5.0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float64,
@@ -103,6 +104,10 @@ class ContinuousTimeAR1HMMSampler:
             Boolean tensor of shape (theta_dim,). True dimensions have one
             parameter per regime; False dimensions are shared across regimes.
             If omitted, every parameter is regime-specific as before.
+        observed_dims:
+            Latent-state dimension indices represented by the columns of x_obs.
+            Must have shape (obs_dim,). If omitted, all latent dimensions must be
+            observed and x_obs must have D columns.
         y0_prior_scale:
             Optional fallback scale for initialization of y.
         """
@@ -118,13 +123,39 @@ class ContinuousTimeAR1HMMSampler:
         self.T_obs = obs_times.to(device=self.device, dtype=self.dtype)
         self.T = torch.tensor(float(T), device=self.device, dtype=self.dtype)
         self.K = int(self.Q.shape[0])
-        self.N, self.D = self.x_obs.shape
+        self.N, self.obs_dim = self.x_obs.shape
         self.y0_prior_scale = float(y0_prior_scale)
         self.nle_estimator = nle_estimator
         self.flow_model = nle_estimator.estimator
         if self.flow_model is None:
             raise ValueError("nle_estimator.estimator must be trained/loaded before sampling.")
         self.theta_dim = int(nle_estimator.dynamics.theta_dim)
+        self.D = int(nle_estimator.dynamics.x_dim)
+        if observed_dims is None:
+            if self.obs_dim != self.D:
+                raise ValueError(
+                    "observed_dims is required when x_obs does not contain every "
+                    f"latent dimension: obs_dim={self.obs_dim}, latent_dim={self.D}."
+                )
+            observed_dims = torch.arange(
+                self.D, dtype=torch.long, device=self.device
+            )
+        else:
+            observed_dims = torch.as_tensor(
+                observed_dims, dtype=torch.long, device=self.device
+            )
+        if observed_dims.shape != (self.obs_dim,):
+            raise ValueError(
+                f"observed_dims must have shape ({self.obs_dim},), "
+                f"got {tuple(observed_dims.shape)}."
+            )
+        if torch.any(observed_dims < 0) or torch.any(observed_dims >= self.D):
+            raise ValueError(
+                f"observed_dims entries must be in [0, {self.D - 1}]."
+            )
+        if torch.unique(observed_dims).numel() != observed_dims.numel():
+            raise ValueError("observed_dims entries must be unique.")
+        self.observed_dims = observed_dims
         if switching_parameter_mask is None:
             switching_parameter_mask = torch.ones(
                 self.theta_dim, dtype=torch.bool, device=self.device
@@ -262,7 +293,7 @@ class ContinuousTimeAR1HMMSampler:
         if initial_log_tau is None:
             tau2_alpha = torch.as_tensor(prior_config["tau2_alpha"], dtype=self.dtype, device=self.device)
             tau2_beta = torch.as_tensor(prior_config["tau2_beta"], dtype=self.dtype, device=self.device)
-            precision = dist.Gamma(tau2_alpha, tau2_beta).sample((self.D,))
+            precision = dist.Gamma(tau2_alpha, tau2_beta).sample((self.obs_dim,))
             initial_log_tau = 0.5 * torch.log(precision.reciprocal().clamp_min(1e-16))
 
         self.theta = theta_value.to(device=self.device, dtype=self.dtype).clone()
@@ -270,8 +301,10 @@ class ContinuousTimeAR1HMMSampler:
         if self.theta.shape != (self.K, self.theta_dim):
             raise ValueError(f"theta must have shape ({self.K}, {self.theta_dim}).")
         self._validate_shared_theta(self.theta)
-        if self.log_tau.shape != (self.D,):
-            raise ValueError(f"log_tau must have shape ({self.D},).")
+        if self.log_tau.shape != (self.obs_dim,):
+            raise ValueError(
+                f"log_tau must have shape ({self.obs_dim},)."
+            )
 
         self.T_true = torch.empty(0, dtype=self.dtype, device=self.device)
         initial_state = dist.Categorical(probs=self.initial_state_probs).sample()
@@ -484,11 +517,11 @@ class ContinuousTimeAR1HMMSampler:
         y: torch.Tensor,
         log_tau: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Diagonal Gaussian observation log density."""
+        """Diagonal Gaussian log density on the selected observed dimensions."""
         if log_tau is None:
             log_tau = self.log_tau
         tau = torch.exp(log_tau)
-        return dist.Normal(y, tau).log_prob(x).sum()
+        return dist.Normal(y[..., self.observed_dims], tau).log_prob(x).sum()
 
     def logprob_y_given_z_theta(
         self,
@@ -518,7 +551,7 @@ class ContinuousTimeAR1HMMSampler:
         ).log_prob(y_aug[0]).sum()
         logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
 
-        y_at_obs = y_aug[obs_idx]  # (N, D)
+        y_at_obs = y_aug[obs_idx][:, self.observed_dims]  # (N, obs_dim)
         tau = torch.exp(log_tau)
         logp = logp + dist.Normal(y_at_obs, tau).log_prob(self.x_obs).sum()
         return logp
@@ -653,9 +686,11 @@ class ContinuousTimeAR1HMMSampler:
             raise RuntimeError("Sampler must be initialized before sample_log_tau().")
 
         prior_config = self.prior_config
-        y_at_obs = self.y_aug[self.obs_idx]  # (N, D)
+        y_at_obs = self.y_aug[self.obs_idx][
+            :, self.observed_dims
+        ]  # (N, obs_dim)
         residual = self.x_obs - y_at_obs
-        ssr = (residual**2).sum(dim=0)  # (D,)
+        ssr = (residual**2).sum(dim=0)  # (obs_dim,)
 
         alpha = torch.as_tensor(prior_config["tau2_alpha"], dtype=self.dtype, device=self.device) + 0.5 * self.N
         beta = torch.as_tensor(prior_config["tau2_beta"], dtype=self.dtype, device=self.device) + 0.5 * ssr
@@ -1090,22 +1125,21 @@ class ContinuousTimeAR1HMMSampler:
 
     def _initialize_y_on_grid(self, T_all: torch.Tensor) -> torch.Tensor:
         """
-        Initialize y on a grid by linear interpolation of observations.
+        Initialize observed y dimensions by interpolation and unobserved ones at zero.
 
         This is only used for the first sweep or when the user does not provide y.
         """
-        if self.N == 1:
-            return self.x_obs[0].unsqueeze(0).repeat(T_all.shape[0], 1)
-
         obs_t = self.T_obs.detach().cpu()
         grid_t = T_all.detach().cpu()
-        y_np = torch.empty(T_all.shape[0], self.D, dtype=self.dtype)
-        for d in range(self.D):
-            x_d = self.x_obs[:, d].detach().cpu()
+        y_np = torch.zeros(T_all.shape[0], self.D, dtype=self.dtype)
+        for observation_column, latent_dimension in enumerate(
+            self.observed_dims.detach().cpu().tolist()
+        ):
+            x_d = self.x_obs[:, observation_column].detach().cpu()
             interp = torch.from_numpy(
                 __import__("numpy").interp(grid_t.numpy(), obs_t.numpy(), x_d.numpy(), left=x_d[0].item(), right=x_d[-1].item())
             ).to(dtype=self.dtype)
-            y_np[:, d] = interp
+            y_np[:, latent_dimension] = interp
         return y_np.to(device=self.device)
 
     def _sample_inserted_y_by_forward_sir(
