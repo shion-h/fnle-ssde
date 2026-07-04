@@ -225,3 +225,65 @@ class GeneExpressionCLEDynamics(Dynamics):
                 torch.stack([zeros, c * torch.sqrt(expression_rate)]),
             ]
         )
+
+
+class LatentMGeneExpressionCLEDynamics(Dynamics):
+    r"""Gene-expression CLE with latent M and fixed messenger decay rate.
+
+    The state is ``x = (M, Y)`` and beta is fixed to one:
+
+        dM_t = (alpha - M_t) dt
+               + sqrt(alpha + M_t) dW_t^(M),
+
+        dY_t = (gamma M_t - delta Y_t) dt
+               + c sqrt(gamma M_t + delta Y_t) dW_t^(Y).
+
+    The unconstrained parameter vector is
+    ``theta = (log alpha, log gamma, log delta, log c)``. All four inferred
+    physical parameters are obtained by exponentiation.
+    """
+
+    def __init__(self, dt: float = 0.01, device: str = "cpu"):
+        super().__init__(dt, device)
+        self.x_dim = 2
+        self.theta_dim = 4
+
+    def split_theta(
+        self, theta: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split parameters needed by the drift and diffusion functions."""
+        if theta.shape[0] != self.theta_dim:
+            raise ValueError(
+                f"Expected {self.theta_dim} parameters, got {theta.shape[0]}."
+            )
+        # Drift uses alpha, gamma, and delta; diffusion additionally uses c.
+        return theta[:3], theta
+
+    def drift(
+        self, x: torch.Tensor, theta_drift: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the drift vector for (M, Y) with beta fixed to one."""
+        alpha, gamma, delta = torch.exp(theta_drift)
+        M, Y = x[0], x[1]
+        return torch.stack(
+            [
+                alpha - M,
+                gamma * M - delta * Y,
+            ]
+        )
+
+    def diffusion(
+        self, x: torch.Tensor, theta_diffusion: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the diagonal 2 x 2 diffusion matrix."""
+        alpha, gamma, delta, c = torch.exp(theta_diffusion)
+        M, Y = x[0], x[1]
+        messenger_rate = alpha + M
+        expression_rate = gamma * M + delta * Y
+        zeros = torch.zeros((), dtype=x.dtype, device=x.device)
+        return torch.stack(
+            [
+                torch.stack([torch.sqrt(messenger_rate), zeros]),
+                torch.stack([zeros, c * torch.sqrt(expression_rate)]),
+            ]
+        )
