@@ -65,6 +65,8 @@ class NLEEstimator:
             ref_noize: float,
             max_n_steps: int | None = None,
             n_transitions: int | None = None,
+            observed_dims: torch.Tensor | None = None,
+            unobserved_init_dist: object | None = None,
             ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Generate training data for one parameter sample.
@@ -77,6 +79,10 @@ class NLEEstimator:
                 the sampled value to the context.
             n_transitions: Number of transitions to generate for this theta. If None,
                 use every adjacent reference state, preserving the original behavior.
+            observed_dims: Latent-state indices represented by x_ref columns. If
+                None, x_ref must contain the complete latent state.
+            unobserved_init_dist: Distribution whose sample fills latent dimensions
+                absent from x_ref.
         """
         xt_chunk = []
         ctx_chunk = []
@@ -89,8 +95,66 @@ class NLEEstimator:
             ref_indices = torch.randint(1, len(x_ref), size=(n_transitions,)).tolist()
 
         for t in ref_indices:
-            # Initial condition with small noise
-            x_init = x_ref[t-1] + torch.randn_like(x_ref[t-1]) * ref_noize
+            x_ref_value = x_ref[t - 1]
+            if observed_dims is None:
+                if x_ref_value.shape != (self.dynamics.x_dim,):
+                    raise ValueError(
+                        "Full-state x_ref rows must have shape "
+                        f"({self.dynamics.x_dim},)."
+                    )
+                x_init = x_ref_value + torch.randn_like(x_ref_value) * ref_noize
+            else:
+                observed_dims = torch.as_tensor(
+                    observed_dims, dtype=torch.long, device=x_ref_value.device
+                )
+                if x_ref_value.shape != (observed_dims.numel(),):
+                    raise ValueError(
+                        "x_ref columns must match the number of observed_dims."
+                    )
+                if torch.unique(observed_dims).numel() != observed_dims.numel():
+                    raise ValueError("observed_dims entries must be unique.")
+                if (
+                    torch.any(observed_dims < 0)
+                    or torch.any(observed_dims >= self.dynamics.x_dim)
+                ):
+                    raise ValueError("observed_dims contains an invalid state index.")
+
+                unobserved_mask = torch.ones(
+                    self.dynamics.x_dim,
+                    dtype=torch.bool,
+                    device=x_ref_value.device,
+                )
+                unobserved_mask[observed_dims] = False
+                num_unobserved = int(unobserved_mask.sum().item())
+                if num_unobserved == 0:
+                    raise ValueError(
+                        "Use observed_dims=None when x_ref contains the full state."
+                    )
+                if unobserved_init_dist is None:
+                    raise ValueError(
+                        "unobserved_init_dist is required when x_ref omits "
+                        "latent-state dimensions."
+                    )
+
+                x_init = torch.empty(
+                    self.dynamics.x_dim,
+                    dtype=x_ref_value.dtype,
+                    device=x_ref_value.device,
+                )
+                x_init[observed_dims] = (
+                    x_ref_value + torch.randn_like(x_ref_value) * ref_noize
+                )
+                unobserved_values = torch.as_tensor(
+                    unobserved_init_dist.sample(),
+                    dtype=x_ref_value.dtype,
+                    device=x_ref_value.device,
+                )
+                if unobserved_values.shape != (num_unobserved,):
+                    raise ValueError(
+                        "unobserved_init_dist.sample() must have shape "
+                        f"({num_unobserved},)."
+                    )
+                x_init[unobserved_mask] = unobserved_values
             x_init = self.dynamics.to_device(x_init)
             
             # Simulate forward
@@ -127,6 +191,8 @@ class NLEEstimator:
             ref_noize: float,
             max_n_steps: int | None = None,
             samples_per_theta: int | None = None,
+            observed_dims: torch.Tensor | None = None,
+            unobserved_init_dist: object | None = None,
             ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate complete training dataset.
@@ -141,6 +207,9 @@ class NLEEstimator:
             samples_per_theta: Number of transitions generated per parameter sample.
                 If None, use all adjacent reference states for each theta. Set to 1
                 to train on one transition per sampled theta.
+            observed_dims: Latent-state indices represented by x_ref columns.
+            unobserved_init_dist: Distribution used to initialize omitted latent
+                dimensions independently for each generated transition.
         """
         all_xt = []
         all_ctx = []
@@ -149,7 +218,14 @@ class NLEEstimator:
         for _ in tqdm(range(n_params)):
             theta = self.sampling_dist.sample().cpu()
             xt_chunk, ctx_chunk = self.generate_training_data_one_theta(
-                theta, x_ref, ref_noize, max_n_steps, n_transitions=samples_per_theta)
+                theta,
+                x_ref,
+                ref_noize,
+                max_n_steps,
+                n_transitions=samples_per_theta,
+                observed_dims=observed_dims,
+                unobserved_init_dist=unobserved_init_dist,
+            )
             all_xt.extend(xt_chunk)
             all_ctx.extend(ctx_chunk)
 
@@ -163,7 +239,9 @@ class NLEEstimator:
               max_n_steps: int | None = None,
               batch_size: int = 256, lr: float = 5e-4, 
               epochs: int = 50,
-              samples_per_theta: int | None = None) -> 'NLEEstimator':
+              samples_per_theta: int | None = None,
+              observed_dims: torch.Tensor | None = None,
+              unobserved_init_dist: object | None = None) -> 'NLEEstimator':
         """
         Train the NLE estimator.
         
@@ -180,6 +258,9 @@ class NLEEstimator:
             samples_per_theta: Number of transitions generated per sampled theta.
                 If None, preserve the original behavior and use len(x_ref)-1
                 transitions per theta. Set to 1 for one transition per theta.
+            observed_dims: Latent-state indices represented by x_ref columns.
+            unobserved_init_dist: Distribution used to initialize latent dimensions
+                that are not represented in x_ref.
         """
         self.conditions_on_n_steps = max_n_steps is not None
         if max_n_steps is not None and max_n_steps < 1:
@@ -204,7 +285,13 @@ class NLEEstimator:
 
         if xt_data is None or ctx_data is None:
             xt_data, ctx_data = self.generate_training_data(
-                n_params, x_ref, ref_noize, max_n_steps, samples_per_theta=samples_per_theta
+                n_params,
+                x_ref,
+                ref_noize,
+                max_n_steps,
+                samples_per_theta=samples_per_theta,
+                observed_dims=observed_dims,
+                unobserved_init_dist=unobserved_init_dist,
             )
         print(f"Data generation took {time.time() - start_time:.2f}s,"
               f"samples: {len(ctx_data)}")
@@ -253,6 +340,7 @@ class NLEEstimator:
                 max_n_steps=max_n_steps,
                 samples_per_theta=samples_per_theta,
                 x_ref_shape=x_ref_shape,
+                observed_dims=observed_dims,
             )
         
         return self
@@ -264,7 +352,8 @@ class NLEEstimator:
             ref_noize: float | None = None,
             max_n_steps: int | None = None,
             samples_per_theta: int | None = None,
-            x_ref_shape: Tuple[int, ...] | None = None) -> None:
+            x_ref_shape: Tuple[int, ...] | None = None,
+            observed_dims: torch.Tensor | None = None) -> None:
         if self.estimator is None:
             raise ValueError("No trained estimator is available to save.")
 
@@ -286,6 +375,11 @@ class NLEEstimator:
                     "max_n_steps": max_n_steps,
                     "samples_per_theta": samples_per_theta,
                     "x_ref_shape": x_ref_shape,
+                    "observed_dims": (
+                        observed_dims.detach().cpu()
+                        if observed_dims is not None
+                        else None
+                    ),
                 },
                 "member_variables": {
                     "dynamics": self.dynamics,
