@@ -72,7 +72,8 @@ class ContinuousTimeAR1HMMSampler:
         prior_config: Optional[Dict[str, Any]] = None,
         switching_parameter_mask: Optional[torch.Tensor] = None,
         observed_dims: Optional[torch.Tensor] = None,
-        y0_prior_scale: float = 5.0,
+        y0_prior_loc: float | torch.Tensor = 0.0,
+        y0_prior_scale: float | torch.Tensor = 5.0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float64,
         seed: int = 0,
@@ -108,8 +109,9 @@ class ContinuousTimeAR1HMMSampler:
             Latent-state dimension indices represented by the columns of x_obs.
             Must have shape (obs_dim,). If omitted, all latent dimensions must be
             observed and x_obs must have D columns.
-        y0_prior_scale:
-            Optional fallback scale for initialization of y.
+        y0_prior_loc / y0_prior_scale:
+            Gaussian prior location and scale for y at the initial time. Scalars
+            are broadcast across latent dimensions; vectors must have shape (D,).
         """
         self.device = device or x_obs.device
         self.dtype = dtype
@@ -124,13 +126,20 @@ class ContinuousTimeAR1HMMSampler:
         self.T = torch.tensor(float(T), device=self.device, dtype=self.dtype)
         self.K = int(self.Q.shape[0])
         self.N, self.obs_dim = self.x_obs.shape
-        self.y0_prior_scale = float(y0_prior_scale)
         self.nle_estimator = nle_estimator
         self.flow_model = nle_estimator.estimator
         if self.flow_model is None:
             raise ValueError("nle_estimator.estimator must be trained/loaded before sampling.")
         self.theta_dim = int(nle_estimator.dynamics.theta_dim)
         self.D = int(nle_estimator.dynamics.x_dim)
+        self.y0_prior_loc = torch.as_tensor(
+            y0_prior_loc, dtype=self.dtype, device=self.device
+        ).broadcast_to((self.D,))
+        self.y0_prior_scale = torch.as_tensor(
+            y0_prior_scale, dtype=self.dtype, device=self.device
+        ).broadcast_to((self.D,))
+        if torch.any(self.y0_prior_scale <= 0):
+            raise ValueError("y0_prior_scale entries must be positive.")
         if observed_dims is None:
             if self.obs_dim != self.D:
                 raise ValueError(
@@ -257,6 +266,8 @@ class ContinuousTimeAR1HMMSampler:
         self.obs_idx: Optional[torch.Tensor] = None
         self.true_idx: Optional[torch.Tensor] = None
         self.y_aug: Optional[torch.Tensor] = None
+        self.initial_y_times: Optional[torch.Tensor] = None
+        self.initial_y_values: Optional[torch.Tensor] = None
         self.initial_state_probs = torch.full((self.K,), 1.0 / self.K, dtype=self.dtype, device=self.device)
 
     def initialize(
@@ -265,6 +276,8 @@ class ContinuousTimeAR1HMMSampler:
         initial_theta: Optional[torch.Tensor] = None,
         initial_log_tau: Optional[torch.Tensor] = None,
         initial_state_probs: Optional[torch.Tensor] = None,
+        initial_y_times: Optional[torch.Tensor] = None,
+        initial_y_values: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Initialize theta, observation noise, and the true discrete path.
@@ -278,6 +291,33 @@ class ContinuousTimeAR1HMMSampler:
         if initial_state_probs is not None:
             probs = initial_state_probs.to(device=self.device, dtype=self.dtype)
             self.initial_state_probs = probs / probs.sum()
+
+        if (initial_y_times is None) != (initial_y_values is None):
+            raise ValueError(
+                "initial_y_times and initial_y_values must be provided together."
+            )
+        if initial_y_times is not None and initial_y_values is not None:
+            initial_y_times = initial_y_times.to(
+                device=self.device, dtype=self.dtype
+            )
+            initial_y_values = initial_y_values.to(
+                device=self.device, dtype=self.dtype
+            )
+            if initial_y_times.ndim != 1:
+                raise ValueError("initial_y_times must be one-dimensional.")
+            if initial_y_values.shape != (initial_y_times.shape[0], self.D):
+                raise ValueError(
+                    "initial_y_values must have shape "
+                    f"({initial_y_times.shape[0]}, {self.D})."
+                )
+            if not torch.all(initial_y_times[1:] > initial_y_times[:-1]):
+                raise ValueError("initial_y_times must be strictly increasing.")
+            if initial_y_times[0] > self.T_obs[0] or initial_y_times[-1] < self.T:
+                raise ValueError(
+                    "initial_y_times must cover the complete inference interval."
+                )
+        self.initial_y_times = initial_y_times
+        self.initial_y_values = initial_y_values
 
         prior_config = self.prior_config
         if initial_theta is None:
@@ -546,7 +586,7 @@ class ContinuousTimeAR1HMMSampler:
         if log_tau is None:
             log_tau = self.log_tau
         logp = dist.Normal(
-            torch.zeros(self.D, dtype=self.dtype, device=self.device),
+            self.y0_prior_loc,
             self.y0_prior_scale,
         ).log_prob(y_aug[0]).sum()
         logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
@@ -1125,21 +1165,41 @@ class ContinuousTimeAR1HMMSampler:
 
     def _initialize_y_on_grid(self, T_all: torch.Tensor) -> torch.Tensor:
         """
-        Initialize observed y dimensions by interpolation and unobserved ones at zero.
+        Initialize observed dimensions by interpolation and unobserved dimensions
+        at their initial-prior locations.
 
         This is only used for the first sweep or when the user does not provide y.
         """
         obs_t = self.T_obs.detach().cpu()
         grid_t = T_all.detach().cpu()
-        y_np = torch.zeros(T_all.shape[0], self.D, dtype=self.dtype)
-        for observation_column, latent_dimension in enumerate(
+        y_np = self.y0_prior_loc.detach().cpu().broadcast_to(
+            (T_all.shape[0], self.D)
+        ).clone()
+        if self.initial_y_times is not None and self.initial_y_values is not None:
+            reference_times = self.initial_y_times.detach().cpu().numpy()
+            reference_values = self.initial_y_values.detach().cpu()
+            for d in range(self.D):
+                y_np[:, d] = torch.from_numpy(
+                    __import__("numpy").interp(
+                        grid_t.numpy(),
+                        reference_times,
+                        reference_values[:, d].numpy(),
+                    )
+                ).to(dtype=self.dtype)
+        for idx_in_x, d in enumerate(
             self.observed_dims.detach().cpu().tolist()
         ):
-            x_d = self.x_obs[:, observation_column].detach().cpu()
+            x_j = self.x_obs[:, idx_in_x].detach().cpu()
             interp = torch.from_numpy(
-                __import__("numpy").interp(grid_t.numpy(), obs_t.numpy(), x_d.numpy(), left=x_d[0].item(), right=x_d[-1].item())
+                __import__("numpy").interp(
+                    grid_t.numpy(),
+                    obs_t.numpy(),
+                    x_j.numpy(),
+                    left=x_j[0].item(),
+                    right=x_j[-1].item()
+                )
             ).to(dtype=self.dtype)
-            y_np[:, latent_dimension] = interp
+            y_np[:, d] = interp
         return y_np.to(device=self.device)
 
     def _sample_inserted_y_by_forward_sir(
