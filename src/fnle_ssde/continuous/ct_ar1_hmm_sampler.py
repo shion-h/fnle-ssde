@@ -27,7 +27,7 @@ that each Gibbs step remains easy to inspect and modify.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pyro
 import pyro.distributions as dist
@@ -60,9 +60,9 @@ class ContinuousTimeAR1HMMSampler:
     def __init__(
         self,
         Q: torch.Tensor,
-        x_obs: torch.Tensor,
-        obs_times: torch.Tensor,
-        T: float,
+        x_obs: torch.Tensor | Sequence[torch.Tensor],
+        obs_times: torch.Tensor | Sequence[torch.Tensor],
+        T: float | Sequence[float],
         *,
         omega_scale: float = 1.5,
         nle_estimator: Any,
@@ -113,7 +113,8 @@ class ContinuousTimeAR1HMMSampler:
             Gaussian prior location and scale for y at the initial time. Scalars
             are broadcast across latent dimensions; vectors must have shape (D,).
         """
-        self.device = device or x_obs.device
+        first_x_obs = x_obs[0] if isinstance(x_obs, (list, tuple)) else x_obs
+        self.device = device or first_x_obs.device
         self.dtype = dtype
         self.rng = torch.Generator(device="cpu")
         self.rng.manual_seed(seed)
@@ -121,11 +122,35 @@ class ContinuousTimeAR1HMMSampler:
 
         self.Q = Q.to(device=self.device, dtype=self.dtype)
         self.omega_scale = float(omega_scale)
-        self.x_obs = x_obs.to(device=self.device, dtype=self.dtype)
-        self.T_obs = obs_times.to(device=self.device, dtype=self.dtype)
-        self.T = torch.tensor(float(T), device=self.device, dtype=self.dtype)
+        if isinstance(x_obs, (list, tuple)):
+            if not isinstance(obs_times, (list, tuple)):
+                raise ValueError("obs_times must be a list/tuple when x_obs is a list/tuple.")
+            if not isinstance(T, (list, tuple)):
+                T = [float(times[-1].item()) for times in obs_times]
+            if len(x_obs) != len(obs_times) or len(x_obs) != len(T):
+                raise ValueError("x_obs, obs_times, and T must have the same number of series.")
+            self.x_obs_list = [
+                x.to(device=self.device, dtype=self.dtype) for x in x_obs
+            ]
+            self.T_obs_list = [
+                times.to(device=self.device, dtype=self.dtype) for times in obs_times
+            ]
+            self.T_list = [
+                torch.tensor(float(t), device=self.device, dtype=self.dtype) for t in T
+            ]
+        else:
+            if isinstance(obs_times, (list, tuple)):
+                raise ValueError("obs_times must be a tensor when x_obs is a tensor.")
+            if isinstance(T, (list, tuple)):
+                raise ValueError("T must be a scalar when x_obs is a tensor.")
+            self.x_obs_list = [x_obs.to(device=self.device, dtype=self.dtype)]
+            self.T_obs_list = [obs_times.to(device=self.device, dtype=self.dtype)]
+            self.T_list = [torch.tensor(float(T), device=self.device, dtype=self.dtype)]
+
+        self.S = len(self.x_obs_list)
         self.K = int(self.Q.shape[0])
-        self.N, self.obs_dim = self.x_obs.shape
+        self.obs_dim = int(self.x_obs_list[0].shape[1])
+        self.N_list = [int(x.shape[0]) for x in self.x_obs_list]
         self.nle_estimator = nle_estimator
         self.flow_model = nle_estimator.estimator
         if self.flow_model is None:
@@ -153,6 +178,11 @@ class ContinuousTimeAR1HMMSampler:
             observed_dims = torch.as_tensor(
                 observed_dims, dtype=torch.long, device=self.device
             )
+        for series_idx, x_s in enumerate(self.x_obs_list):
+            if x_s.ndim != 2:
+                raise ValueError(f"x_obs for series {series_idx} must be two-dimensional.")
+            if x_s.shape[1] != self.obs_dim:
+                raise ValueError("All series must have the same observed dimension.")
         if observed_dims.shape != (self.obs_dim,):
             raise ValueError(
                 f"observed_dims must have shape ({self.obs_dim},), "
@@ -192,16 +222,19 @@ class ContinuousTimeAR1HMMSampler:
             raise ValueError("Q must be square with shape (K, K).")
         if not torch.allclose(self.Q.sum(dim=1), torch.zeros(self.K, dtype=self.dtype, device=self.device), atol=1e-8):
             raise ValueError("Each row of Q must sum to zero.")
-        if self.T_obs.ndim != 1 or self.T_obs.shape[0] != self.N:
-            raise ValueError("obs_times must have shape (N,).")
-        if self.N < 2:
-            raise ValueError("obs_times must contain at least the endpoints 0 and T.")
-        if not torch.all(self.T_obs[1:] > self.T_obs[:-1]):
-            raise ValueError("obs_times must be strictly increasing.")
-        if abs(float(self.T_obs[0].item())) > 1e-10:
-            raise ValueError("obs_times must start at 0.")
-        if abs(float(self.T_obs[-1].item()) - float(self.T.item())) > 1e-10:
-            raise ValueError("obs_times must end at T.")
+        for series_idx, (T_obs_s, T_s, N_s) in enumerate(
+            zip(self.T_obs_list, self.T_list, self.N_list)
+        ):
+            if T_obs_s.ndim != 1 or T_obs_s.shape[0] != N_s:
+                raise ValueError(f"obs_times for series {series_idx} must have shape (N_s,).")
+            if N_s < 2:
+                raise ValueError("Each series must contain at least the endpoints 0 and T_s.")
+            if not torch.all(T_obs_s[1:] > T_obs_s[:-1]):
+                raise ValueError(f"obs_times for series {series_idx} must be strictly increasing.")
+            if abs(float(T_obs_s[0].item())) > 1e-10:
+                raise ValueError(f"obs_times for series {series_idx} must start at 0.")
+            if abs(float(T_obs_s[-1].item()) - float(T_s.item())) > 1e-10:
+                raise ValueError(f"obs_times for series {series_idx} must end at T_s.")
 
         self.omega = 0.0
         self.B = torch.empty_like(self.Q)
@@ -257,17 +290,16 @@ class ContinuousTimeAR1HMMSampler:
 
         self.theta: Optional[torch.Tensor] = None
         self.log_tau: Optional[torch.Tensor] = None
-        self.T_true: Optional[torch.Tensor] = None
-        self.z_true: Optional[torch.Tensor] = None
-        self.T_all: Optional[torch.Tensor] = None
-        self.z_aug: Optional[torch.Tensor] = None
-        # True at times in T_true ∪ T_cand, i.e. times where FFBS uses B instead of I.
-        self.is_event_time: Optional[torch.Tensor] = None
-        self.obs_idx: Optional[torch.Tensor] = None
-        self.true_idx: Optional[torch.Tensor] = None
-        self.y_aug: Optional[torch.Tensor] = None
-        self.initial_y_times: Optional[torch.Tensor] = None
-        self.initial_y_values: Optional[torch.Tensor] = None
+        self.T_true_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.z_true_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.T_all_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.z_aug_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.is_event_time_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.obs_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.true_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.y_aug_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.initial_y_times_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.initial_y_values_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.initial_state_probs = torch.full((self.K,), 1.0 / self.K, dtype=self.dtype, device=self.device)
 
     def initialize(
@@ -312,13 +344,12 @@ class ContinuousTimeAR1HMMSampler:
                 )
             if not torch.all(initial_y_times[1:] > initial_y_times[:-1]):
                 raise ValueError("initial_y_times must be strictly increasing.")
-            if initial_y_times[0] > self.T_obs[0] or initial_y_times[-1] < self.T:
-                raise ValueError(
-                    "initial_y_times must cover the complete inference interval."
-                )
-        self.initial_y_times = initial_y_times
-        self.initial_y_values = initial_y_values
-
+            for series_idx, (T_obs_s, T_s) in enumerate(zip(self.T_obs_list, self.T_list)):
+                if initial_y_times[0] > T_obs_s[0] or initial_y_times[-1] < T_s:
+                    raise ValueError(
+                        "initial_y_times must cover the complete inference interval "
+                        f"for series {series_idx}."
+                    )
         prior_config = self.prior_config
         if initial_theta is None:
             theta_loc, theta_scale = self._theta_prior_parameters()
@@ -346,16 +377,23 @@ class ContinuousTimeAR1HMMSampler:
                 f"log_tau must have shape ({self.obs_dim},)."
             )
 
-        self.T_true = torch.empty(0, dtype=self.dtype, device=self.device)
-        initial_state = dist.Categorical(probs=self.initial_state_probs).sample()
-        self.z_true = initial_state.reshape(1).to(dtype=torch.long, device=self.device)
-
-        self.T_all = None
-        self.z_aug = None
-        self.is_event_time = None
-        self.obs_idx = None
-        self.true_idx = None
-        self.y_aug = None
+        for s in range(self.S):
+            initial_state = dist.Categorical(probs=self.initial_state_probs).sample()
+            self.T_true_list[s] = torch.empty(0, dtype=self.dtype, device=self.device)
+            self.z_true_list[s] = initial_state.reshape(1).to(
+                dtype=torch.long, device=self.device
+            )
+            self.T_all_list[s] = None
+            self.z_aug_list[s] = None
+            self.is_event_time_list[s] = None
+            self.obs_idx_list[s] = None
+            self.true_idx_list[s] = None
+            self.y_aug_list[s] = None
+            # A tensor-valued initial path is shared across series by default.
+            # Multi-series callers that need different initial paths can assign
+            # initial_y_times_list / initial_y_values_list before run().
+            self.initial_y_times_list[s] = initial_y_times
+            self.initial_y_values_list[s] = initial_y_values
 
     def _theta_prior_parameters(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return theta prior location and scale as vectors of shape (theta_dim,)."""
@@ -424,10 +462,15 @@ class ContinuousTimeAR1HMMSampler:
 
     def build_augmented_grid(
         self,
+        s: int,
         T_cand: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return augmented-grid arrays for T_all = T_true U T_cand U T_obs."""
-        if self.T_true is None or self.z_true is None:
+        T_true = self.T_true_list[s]
+        z_true = self.z_true_list[s]
+        T_obs = self.T_obs_list[s]
+        N = self.N_list[s]
+        if T_true is None or z_true is None:
             raise RuntimeError("Call initialize() before build_augmented_grid().")
 
         T_all_values: List[float] = []
@@ -443,10 +486,10 @@ class ContinuousTimeAR1HMMSampler:
         idx_cand = 0
         idx_obs = 0
         idx_all = 0
-        while idx_true < self.T_true.shape[0] or idx_cand < T_cand.shape[0] or idx_obs < self.N:
-            t_true = float(self.T_true[idx_true].item()) if idx_true < self.T_true.shape[0] else float("inf")
+        while idx_true < T_true.shape[0] or idx_cand < T_cand.shape[0] or idx_obs < N:
+            t_true = float(T_true[idx_true].item()) if idx_true < T_true.shape[0] else float("inf")
             t_cand = float(T_cand[idx_cand].item()) if idx_cand < T_cand.shape[0] else float("inf")
-            t_obs = float(self.T_obs[idx_obs].item()) if idx_obs < self.N else float("inf")
+            t_obs = float(T_obs[idx_obs].item()) if idx_obs < N else float("inf")
 
             next_time = min(t_true, t_cand, t_obs)
             from_true = t_true == next_time
@@ -470,7 +513,7 @@ class ContinuousTimeAR1HMMSampler:
         is_event_time = torch.tensor(is_event_values, dtype=torch.bool, device=self.device)
         obs_idx = torch.tensor(obs_idx_values, dtype=torch.long, device=self.device)
         cand_idx = torch.tensor(cand_idx_values, dtype=torch.long, device=self.device)
-        if obs_idx.shape[0] != self.N:
+        if obs_idx.shape[0] != N:
             raise RuntimeError("Observation time was not found on the merged grid.")
         if cand_idx.shape[0] != T_cand.shape[0]:
             raise RuntimeError("Candidate jump time was not found on the merged grid.")
@@ -486,9 +529,9 @@ class ContinuousTimeAR1HMMSampler:
             left = T_all[j]
             # T_true_idx is the number of true jumps at or before `left`.
             # The matching true-path state is z_true[T_true_idx].
-            while T_true_idx < self.T_true.shape[0] and self.T_true[T_true_idx] <= left:
+            while T_true_idx < T_true.shape[0] and T_true[T_true_idx] <= left:
                 T_true_idx += 1
-            interval_states[j] = self.z_true[T_true_idx]
+            interval_states[j] = z_true[T_true_idx]
 
         z_aug = torch.empty(T_all.shape[0], dtype=torch.long, device=self.device)
         # To fit z_aug indices with y_aug indices, duplicate the first interval state
@@ -497,7 +540,7 @@ class ContinuousTimeAR1HMMSampler:
 
         return T_all, z_aug, is_event_time, obs_idx, cand_idx
 
-    def add_candidate_jumps(self) -> torch.Tensor:
+    def add_candidate_jumps(self, s: int) -> torch.Tensor:
         """
         Add candidate jumps to the current true path using uniformization.
 
@@ -505,14 +548,18 @@ class ContinuousTimeAR1HMMSampler:
             Poisson((Omega - q_k) dt) = Poisson((Omega + Q_kk) dt)
         because q_k = -Q_kk.
         """
-        if self.T_true is None or self.z_true is None:
+        T_true = self.T_true_list[s]
+        z_true = self.z_true_list[s]
+        T_obs = self.T_obs_list[s]
+        T = self.T_list[s]
+        if T_true is None or z_true is None:
             raise RuntimeError("Call initialize() before add_candidate_jumps().")
 
         cand_times: List[torch.Tensor] = []
-        for j, state in enumerate(self.z_true.tolist()):
+        for j, state in enumerate(z_true.tolist()):
             # state is the regime on the interval between t0 and t1
-            t0 = 0.0 if j == 0 else self.T_true[j - 1].item()
-            t1 = self.T.item() if j == self.z_true.shape[0] - 1 else self.T_true[j].item()
+            t0 = 0.0 if j == 0 else T_true[j - 1].item()
+            t1 = T.item() if j == z_true.shape[0] - 1 else T_true[j].item()
             dt = t1 - t0
             if dt <= 0.0:
                 raise RuntimeError("dt <= 0 encountered when adding candidate jumps.")
@@ -537,7 +584,7 @@ class ContinuousTimeAR1HMMSampler:
         # newly inserted points.  Keeping them in cand_idx would make SIR skip a
         # y value that should be copied from the old grid.
         if T_cand.numel() > 0:
-            retained_times = torch.cat([self.T_obs.to(device=self.device), self.T_true.to(device=self.device)])
+            retained_times = torch.cat([T_obs.to(device=self.device), T_true.to(device=self.device)])
             if retained_times.numel() > 0:
                 T_cand = T_cand[~torch.isin(T_cand, retained_times)]
         return T_cand
@@ -569,6 +616,7 @@ class ContinuousTimeAR1HMMSampler:
         z_aug: torch.Tensor,
         T_all: torch.Tensor,
         obs_idx: torch.Tensor,
+        x_obs: Optional[torch.Tensor] = None,
         theta: Optional[torch.Tensor] = None,
         log_tau: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -585,6 +633,8 @@ class ContinuousTimeAR1HMMSampler:
             raise RuntimeError("Sampler theta has not been initialized.")
         if log_tau is None:
             log_tau = self.log_tau
+        if x_obs is None:
+            x_obs = self.x_obs_list[0]
         logp = dist.Normal(
             self.y0_prior_loc,
             self.y0_prior_scale,
@@ -593,7 +643,7 @@ class ContinuousTimeAR1HMMSampler:
 
         y_at_obs = y_aug[obs_idx][:, self.observed_dims]  # (N, obs_dim)
         tau = torch.exp(log_tau)
-        logp = logp + dist.Normal(y_at_obs, tau).log_prob(self.x_obs).sum()
+        logp = logp + dist.Normal(y_at_obs, tau).log_prob(x_obs).sum()
         return logp
 
     def logprob_theta_given_y_z(
@@ -619,14 +669,37 @@ class ContinuousTimeAR1HMMSampler:
         logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
         return logp
 
+    def _logprob_theta_all_series(self, theta: torch.Tensor) -> torch.Tensor:
+        """Shared-theta conditional log density summed over series s=1,...,S."""
+        self._validate_shared_theta(theta)
+        logp = self._theta_log_prior(self._pack_theta(theta))
+        for s in range(self.S):
+            y_aug_s = self.y_aug_list[s]
+            z_aug_s = self.z_aug_list[s]
+            T_all_s = self.T_all_list[s]
+            if y_aug_s is None or z_aug_s is None or T_all_s is None:
+                raise RuntimeError("All series must have y/z/T_all before theta update.")
+            logp = logp + self._compute_log_emission_given_z(
+                y_aug_s,
+                z_aug_s,
+                T_all_s,
+                theta,
+            )
+        return logp
+
     def sample_y_nuts(
         self,
+        s: int,
         y_init: torch.Tensor,
         max_tree_depth: Optional[int] = None,
         target_accept_prob: Optional[float] = None,
     ) -> torch.Tensor:
         """Sample the full augmented latent path y_aug with one-step Pyro NUTS."""
-        if self.T_all is None or self.z_aug is None or self.obs_idx is None:
+        T_all = self.T_all_list[s]
+        z_aug = self.z_aug_list[s]
+        obs_idx = self.obs_idx_list[s]
+        x_obs = self.x_obs_list[s]
+        if T_all is None or z_aug is None or obs_idx is None:
             raise RuntimeError("Sampler must be initialized before sample_y_nuts().")
         if self.theta is None or self.log_tau is None:
             raise RuntimeError("Sampler parameters have not been initialized.")
@@ -640,9 +713,10 @@ class ContinuousTimeAR1HMMSampler:
         def y_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
             return -self.logprob_y_given_z_theta(
                 y_aug=params["y_aug"],
-                z_aug=self.z_aug,
-                T_all=self.T_all,
-                obs_idx=self.obs_idx,
+                z_aug=z_aug,
+                T_all=T_all,
+                obs_idx=obs_idx,
+                x_obs=x_obs,
                 theta=self.theta,
                 log_tau=self.log_tau,
             )
@@ -670,8 +744,9 @@ class ContinuousTimeAR1HMMSampler:
         target_accept_prob: Optional[float] = None,
     ) -> torch.Tensor:
         """Sample theta with one-step Pyro NUTS."""
-        if self.T_all is None or self.z_aug is None or self.y_aug is None:
-            raise RuntimeError("Sampler must be initialized before sample_theta_nuts().")
+        for s in range(self.S):
+            if self.T_all_list[s] is None or self.z_aug_list[s] is None or self.y_aug_list[s] is None:
+                raise RuntimeError("Sampler must be initialized before sample_theta_nuts().")
         if self.theta is None:
             raise RuntimeError("Sampler theta has not been initialized.")
 
@@ -683,12 +758,7 @@ class ContinuousTimeAR1HMMSampler:
 
         def theta_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
             theta = self._expand_theta(params)
-            return -self.logprob_theta_given_y_z(
-                theta=theta,
-                y_aug=self.y_aug,
-                z_aug=self.z_aug,
-                T_all=self.T_all,
-            )
+            return -self._logprob_theta_all_series(theta)
 
         pyro.clear_param_store()
         kernel = NUTS(
@@ -722,17 +792,21 @@ class ContinuousTimeAR1HMMSampler:
 
         The stored parameter is log_tau[d] = 0.5 * log(tau_d^2).
         """
-        if self.obs_idx is None or self.y_aug is None:
-            raise RuntimeError("Sampler must be initialized before sample_log_tau().")
-
         prior_config = self.prior_config
-        y_at_obs = self.y_aug[self.obs_idx][
-            :, self.observed_dims
-        ]  # (N, obs_dim)
-        residual = self.x_obs - y_at_obs
-        ssr = (residual**2).sum(dim=0)  # (obs_dim,)
+        ssr = torch.zeros(self.obs_dim, dtype=self.dtype, device=self.device)
+        total_N = 0
+        for s in range(self.S):
+            y_aug_s = self.y_aug_list[s]
+            obs_idx_s = self.obs_idx_list[s]
+            x_obs_s = self.x_obs_list[s]
+            if y_aug_s is None or obs_idx_s is None:
+                raise RuntimeError("Sampler must be initialized before sample_log_tau().")
+            y_at_obs = y_aug_s[obs_idx_s][:, self.observed_dims]
+            residual = x_obs_s - y_at_obs
+            ssr = ssr + (residual**2).sum(dim=0)
+            total_N += int(x_obs_s.shape[0])
 
-        alpha = torch.as_tensor(prior_config["tau2_alpha"], dtype=self.dtype, device=self.device) + 0.5 * self.N
+        alpha = torch.as_tensor(prior_config["tau2_alpha"], dtype=self.dtype, device=self.device) + 0.5 * total_N
         beta = torch.as_tensor(prior_config["tau2_beta"], dtype=self.dtype, device=self.device) + 0.5 * ssr
 
         # If tau^2 ~ InvGamma(alpha, beta), then precision 1/tau^2 ~ Gamma(alpha, beta).
@@ -759,11 +833,6 @@ class ContinuousTimeAR1HMMSampler:
         This method has no side effects: assignment to self.Q and the required
         Omega/B refresh are handled by one_sweep().
         """
-        if self.T_true is None or self.z_true is None:
-            raise RuntimeError("Call initialize() before sample_Q().")
-        if self.z_true.shape[0] != self.T_true.shape[0] + 1:
-            raise RuntimeError("z_true must have len(T_true)+1 entries.")
-
         prior_config = self.prior_config
         q_alpha = torch.as_tensor(prior_config["q_alpha"], dtype=self.dtype, device=self.device)
         q_beta = torch.as_tensor(prior_config["q_beta"], dtype=self.dtype, device=self.device)
@@ -773,16 +842,25 @@ class ContinuousTimeAR1HMMSampler:
         dwell_time_k = torch.zeros(self.K, dtype=self.dtype, device=self.device)
         n_jumps_kk = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
 
-        for i, state in enumerate(self.z_true.tolist()):
-            t_left = 0.0 if i == 0 else self.T_true[i - 1]
-            t_right = self.T if i == self.z_true.shape[0] - 1 else self.T_true[i]
-            dwell_time_k[state] = dwell_time_k[state] + (t_right - t_left)
+        for s in range(self.S):
+            T_true_s = self.T_true_list[s]
+            z_true_s = self.z_true_list[s]
+            T_s = self.T_list[s]
+            if T_true_s is None or z_true_s is None:
+                raise RuntimeError("Call initialize() before sample_Q().")
+            if z_true_s.shape[0] != T_true_s.shape[0] + 1:
+                raise RuntimeError("z_true must have len(T_true)+1 entries.")
 
-        for i in range(self.T_true.shape[0]):
-            src = self.z_true[i].item()
-            dst = self.z_true[i + 1].item()
-            if src != dst:
-                n_jumps_kk[src, dst] = n_jumps_kk[src, dst] + 1.0
+            for i, state in enumerate(z_true_s.tolist()):
+                t_left = 0.0 if i == 0 else T_true_s[i - 1]
+                t_right = T_s if i == z_true_s.shape[0] - 1 else T_true_s[i]
+                dwell_time_k[state] = dwell_time_k[state] + (t_right - t_left)
+
+            for i in range(T_true_s.shape[0]):
+                src = z_true_s[i].item()
+                dst = z_true_s[i + 1].item()
+                if src != dst:
+                    n_jumps_kk[src, dst] = n_jumps_kk[src, dst] + 1.0
 
         Q = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
         for i in range(self.K):
@@ -970,7 +1048,7 @@ class ContinuousTimeAR1HMMSampler:
         )
         return log_probs.sum()
 
-    def sample_z_ffbs(self) -> torch.Tensor:
+    def sample_z_ffbs(self, s: int) -> torch.Tensor:
         """
         Sample z on the augmented grid with FFBS in log-space.
 
@@ -996,21 +1074,25 @@ class ContinuousTimeAR1HMMSampler:
         This matches the rest of the codebase: the latent regime attached to an NLE
         transition from y_aug[j-1] to y_aug[j] is z_aug[j].
         """
-        if self.T_all is None or self.z_aug is None or self.is_event_time is None or self.y_aug is None:
+        T_all = self.T_all_list[s]
+        z_aug = self.z_aug_list[s]
+        is_event_time = self.is_event_time_list[s]
+        y_aug = self.y_aug_list[s]
+        if T_all is None or z_aug is None or is_event_time is None or y_aug is None:
             raise RuntimeError("Sampler must be initialized before sample_z_ffbs().")
         if self.theta is None:
             raise RuntimeError("Sampler theta has not been initialized.")
 
-        L = self.T_all.shape[0]
+        L = T_all.shape[0]
         log_alpha = torch.empty(L, self.K, dtype=self.dtype, device=self.device)
         log_alpha[0] = torch.log(self.initial_state_probs.clamp_min(1e-32))
 
         log_B = torch.log(self.B.clamp_min(1e-32))
-        delta = self.T_all[1:] - self.T_all[:-1]
-        emission_logits = self._compute_log_emission_matrix(self.y_aug, self.theta, delta)
+        delta = T_all[1:] - T_all[:-1]
+        emission_logits = self._compute_log_emission_matrix(y_aug, self.theta, delta)
 
         for j in range(L - 1):
-            if self.is_event_time[j]:
+            if is_event_time[j]:
                 scores = log_alpha[j].unsqueeze(1) + log_B
                 log_alpha[j + 1] = emission_logits[j] + torch.logsumexp(scores, dim=0)
             else:
@@ -1023,7 +1105,7 @@ class ContinuousTimeAR1HMMSampler:
         z[L - 1] = dist.Categorical(logits=log_alpha[L - 1]).sample()
 
         for j in range(L - 2, -1, -1):
-            if self.is_event_time[j]:
+            if is_event_time[j]:
                 logits_prev = log_alpha[j] + log_B[:, z[j + 1]]
                 z[j] = dist.Categorical(logits=logits_prev).sample()
             else:
@@ -1072,65 +1154,106 @@ class ContinuousTimeAR1HMMSampler:
 
     def one_sweep(self) -> Dict[str, Any]:
         """Run one Gibbs sweep: augment grid, sample y, z, theta, tau, and Q."""
-        if (
-            self.T_true is None
-            or self.z_true is None
-            or self.theta is None
-            or self.log_tau is None
-        ):
+        if self.theta is None or self.log_tau is None:
             raise RuntimeError("Call initialize() before one_sweep().")
+        for s in range(self.S):
+            if self.T_true_list[s] is None or self.z_true_list[s] is None:
+                raise RuntimeError("Call initialize() before one_sweep().")
 
-        T_cand = self.add_candidate_jumps()
-        T_all, z_aug, is_event_time, obs_idx, cand_idx = self.build_augmented_grid(T_cand)
-        y_nuts_init, sir_info = self._sample_inserted_y_by_forward_sir(
-            new_grid_times=T_all,
-            new_z_aug=z_aug,
-            new_cand_idx=cand_idx,
-        )
-        self.T_all = T_all
-        self.z_aug = z_aug
-        self.is_event_time = is_event_time
-        self.obs_idx = obs_idx
-        self.y_aug = self.sample_y_nuts(y_nuts_init)
-        self.z_aug = self.sample_z_ffbs()
-        self.T_true, self.z_true, self.true_idx = self.prune_self_transitions(
-            T_all=self.T_all,
-            z_aug=self.z_aug,
-            is_event_time=self.is_event_time,
-        )
+        per_series_info: List[Dict[str, Any]] = []
+        for s in range(self.S):
+            T_cand = self.add_candidate_jumps(s)
+            T_all, z_aug, is_event_time, obs_idx, cand_idx = self.build_augmented_grid(s, T_cand)
+            y_nuts_init, sir_info = self._sample_inserted_y_by_forward_sir(
+                new_grid_times=T_all,
+                new_z_aug=z_aug,
+                new_cand_idx=cand_idx,
+                s=s,
+            )
+            self.T_all_list[s] = T_all
+            self.z_aug_list[s] = z_aug
+            self.is_event_time_list[s] = is_event_time
+            self.obs_idx_list[s] = obs_idx
+            self.y_aug_list[s] = self.sample_y_nuts(s, y_nuts_init)
+            self.z_aug_list[s] = self.sample_z_ffbs(s)
+            self.T_true_list[s], self.z_true_list[s], self.true_idx_list[s] = self.prune_self_transitions(
+                T_all=T_all,
+                z_aug=self.z_aug_list[s],
+                is_event_time=is_event_time,
+            )
+            per_series_info.append(
+                {
+                    "series": s + 1,
+                    "grid_size": int(T_all.shape[0]),
+                    "num_candidate_events": int(is_event_time.sum().item()),
+                    "num_true_segments": int(self.z_true_list[s].shape[0]),
+                    "sir_num_particles": sir_info["num_particles"],
+                    "sir_min_ess": sir_info["min_ess"],
+                    "sir_mean_ess": sir_info["mean_ess"],
+                }
+            )
 
         self.theta = self.sample_theta_nuts()
         self.log_tau = self.sample_log_tau()
         self.Q = self.sample_Q()
         self._refresh_uniformization()
 
+        finite_min_ess = [
+            info["sir_min_ess"]
+            for info in per_series_info
+            if info["sir_min_ess"] == info["sir_min_ess"]
+        ]
+        finite_mean_ess = [
+            info["sir_mean_ess"]
+            for info in per_series_info
+            if info["sir_mean_ess"] == info["sir_mean_ess"]
+        ]
         sweep_info = {
-            "grid_size": int(self.T_all.shape[0]),
-            "num_candidate_events": int(self.is_event_time.sum().item()),
-            "num_true_segments": int(self.z_true.shape[0]),
-            "sir_num_particles": sir_info["num_particles"],
-            "sir_min_ess": sir_info["min_ess"],
-            "sir_mean_ess": sir_info["mean_ess"],
+            "num_series": self.S,
+            "grid_size": sum(info["grid_size"] for info in per_series_info),
+            "num_candidate_events": sum(info["num_candidate_events"] for info in per_series_info),
+            "num_true_segments": sum(info["num_true_segments"] for info in per_series_info),
+            "per_series": per_series_info,
+            "sir_num_particles": self.sir_config["num_particles"],
+            "sir_min_ess": min(finite_min_ess) if finite_min_ess else float("nan"),
+            "sir_mean_ess": (
+                sum(finite_mean_ess) / len(finite_mean_ess)
+                if finite_mean_ess
+                else float("nan")
+            ),
             "log_tau_update": "conjugate_inverse_gamma_gibbs",
             "Q_update": "conjugate_gamma_gibbs",
             "omega": float(self.omega),
         }
 
-        self.history["y_aug"].append(self.y_aug.detach().cpu())
-        self.history["z_aug"].append(self.z_aug.detach().cpu())
-        self.history["T_all"].append(self.T_all.detach().cpu())
+        self.history["y_aug"].append([
+            y.detach().cpu() if y is not None else None for y in self.y_aug_list
+        ])
+        self.history["z_aug"].append([
+            z.detach().cpu() if z is not None else None for z in self.z_aug_list
+        ])
+        self.history["T_all"].append([
+            t.detach().cpu() if t is not None else None for t in self.T_all_list
+        ])
+        self.history["T_true"].append([
+            t.detach().cpu() if t is not None else None for t in self.T_true_list
+        ])
+        self.history["z_true"].append([
+            z.detach().cpu() if z is not None else None for z in self.z_true_list
+        ])
         self.history["theta"].append(self.theta.detach().cpu())
         self.history["log_tau"].append(self.log_tau.detach().cpu())
         self.history["Q"].append(self.Q.detach().cpu())
         self.history["omega"].append(float(self.omega))
-        self.history["T_true"].append(self.T_true.detach().cpu())
-        self.history["z_true"].append(self.z_true.detach().cpu())
         self.history["diagnostics"].append(sweep_info)
         return sweep_info
 
     def run(self, num_sweeps: int, verbose: bool = True) -> Dict[str, List[Any]]:
         """Run multiple Gibbs sweeps and return the stored history."""
-        if self.theta is None or self.log_tau is None or self.T_true is None or self.z_true is None:
+        if self.theta is None or self.log_tau is None or any(
+            T_true is None or z_true is None
+            for T_true, z_true in zip(self.T_true_list, self.z_true_list)
+        ):
             self.initialize()
 
         for sweep in range(num_sweeps):
@@ -1163,21 +1286,25 @@ class ContinuousTimeAR1HMMSampler:
         self.omega = float(max(self.omega_scale * max_exit, max_exit + 1e-6, 1e-6))
         self.B = self._build_uniformized_transition_matrix()
 
-    def _initialize_y_on_grid(self, T_all: torch.Tensor) -> torch.Tensor:
+    def _initialize_y_on_grid(self, s: int, T_all: torch.Tensor) -> torch.Tensor:
         """
         Initialize observed dimensions by interpolation and unobserved dimensions
         at their initial-prior locations.
 
         This is only used for the first sweep or when the user does not provide y.
         """
-        obs_t = self.T_obs.detach().cpu()
+        T_obs = self.T_obs_list[s]
+        x_obs = self.x_obs_list[s]
+        initial_y_times = self.initial_y_times_list[s]
+        initial_y_values = self.initial_y_values_list[s]
+        obs_t = T_obs.detach().cpu()
         grid_t = T_all.detach().cpu()
         y_np = self.y0_prior_loc.detach().cpu().broadcast_to(
             (T_all.shape[0], self.D)
         ).clone()
-        if self.initial_y_times is not None and self.initial_y_values is not None:
-            reference_times = self.initial_y_times.detach().cpu().numpy()
-            reference_values = self.initial_y_values.detach().cpu()
+        if initial_y_times is not None and initial_y_values is not None:
+            reference_times = initial_y_times.detach().cpu().numpy()
+            reference_values = initial_y_values.detach().cpu()
             for d in range(self.D):
                 y_np[:, d] = torch.from_numpy(
                     __import__("numpy").interp(
@@ -1189,7 +1316,7 @@ class ContinuousTimeAR1HMMSampler:
         for idx_in_x, d in enumerate(
             self.observed_dims.detach().cpu().tolist()
         ):
-            x_j = self.x_obs[:, idx_in_x].detach().cpu()
+            x_j = x_obs[:, idx_in_x].detach().cpu()
             interp = torch.from_numpy(
                 __import__("numpy").interp(
                     grid_t.numpy(),
@@ -1207,6 +1334,7 @@ class ContinuousTimeAR1HMMSampler:
         new_grid_times: torch.Tensor,
         new_z_aug: torch.Tensor,
         new_cand_idx: torch.Tensor,
+        s: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Sample newly inserted y values by forward SIR.
@@ -1233,8 +1361,13 @@ class ContinuousTimeAR1HMMSampler:
 
         self.last_sir_cand_particles = []
 
-        if self.T_all is None or self.y_aug is None or self.obs_idx is None:
-            return self._initialize_y_on_grid(new_grid_times), {
+        old_T_all = self.T_all_list[s]
+        old_y_aug = self.y_aug_list[s]
+        old_obs_idx = self.obs_idx_list[s]
+        old_true_idx = self.true_idx_list[s]
+
+        if old_T_all is None or old_y_aug is None or old_obs_idx is None:
+            return self._initialize_y_on_grid(s, new_grid_times), {
                 "num_particles": float(num_particles),
                 "min_ess": float("nan"),
                 "mean_ess": float("nan"),
@@ -1243,12 +1376,12 @@ class ContinuousTimeAR1HMMSampler:
         inserted_idx = new_cand_idx
         inserted_idx_set = set(inserted_idx.tolist())
 
-        retained_old_idx_list = self.obs_idx.tolist()
-        if self.true_idx is not None and self.true_idx.numel() > 0:
-            retained_old_idx_list.extend(self.true_idx.tolist())
+        retained_old_idx_list = old_obs_idx.tolist()
+        if old_true_idx is not None and old_true_idx.numel() > 0:
+            retained_old_idx_list.extend(old_true_idx.tolist())
         retained_old_idx_list = sorted(set(retained_old_idx_list))
         retained_old_idx_tensor = torch.tensor(retained_old_idx_list, dtype=torch.long, device=self.device)
-        retained_old_times = self.T_all[retained_old_idx_tensor]
+        retained_old_times = old_T_all[retained_old_idx_tensor]
 
         y_sample = torch.empty(new_grid_times.shape[0], self.D, dtype=self.dtype, device=self.device)
         retained_old_ptr = 0
@@ -1260,7 +1393,7 @@ class ContinuousTimeAR1HMMSampler:
                 raise RuntimeError("Ran out of retained old grid points while matching the new grid.")
             if retained_old_times[retained_old_ptr].item() != new_grid_times[new_idx].item():
                 raise RuntimeError("Non-candidate point on the new grid did not match the retained old grid.")
-            y_sample[new_idx] = self.y_aug[retained_old_idx_tensor[retained_old_ptr]].to(device=self.device, dtype=self.dtype)
+            y_sample[new_idx] = old_y_aug[retained_old_idx_tensor[retained_old_ptr]].to(device=self.device, dtype=self.dtype)
             retained_old_ptr += 1
 
         if inserted_idx.numel() == 0:
