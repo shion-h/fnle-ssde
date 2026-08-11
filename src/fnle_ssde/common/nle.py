@@ -5,7 +5,8 @@ from tqdm import tqdm
 from typing import Literal, Tuple, List, Union
 import torch
 import pyro.distributions as dist
-from torch.distributions import Independent, Normal
+from torch.distributions import Distribution, Independent, Normal
+from scipy.interpolate import CubicSpline
 from sbi.inference import SNLE
 from sbi.neural_nets.factory import likelihood_nn
 from .dynamics import Dynamics
@@ -66,7 +67,11 @@ class NLEEstimator:
             max_n_steps: int | None = None,
             n_transitions: int | None = None,
             observed_dims: torch.Tensor | None = None,
-            unobserved_init_dist: object | None = None,
+            unobserved_dims: torch.Tensor | None = None,
+            unobserved_init_dist: Distribution | None = None,
+            state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
+            noisy_init_strategy: Literal["clamp", "resample"] = "clamp",
+            max_noisy_init_attempts: int = 1000,
             ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Generate training data for one parameter sample.
@@ -81,8 +86,19 @@ class NLEEstimator:
                 use every adjacent reference state, preserving the original behavior.
             observed_dims: Latent-state indices represented by x_ref columns. If
                 None, x_ref must contain the complete latent state.
+            unobserved_dims: Complement of observed_dims, prepared once by
+                generate_training_data.
             unobserved_init_dist: Distribution whose sample fills latent dimensions
                 absent from x_ref.
+            state_clamp_bounds: Optional state-space bounds applied both after
+                constructing noisy x_init and after every simulated step. Use
+                None for an unrestricted state space, (0.0, None) for a
+                nonnegative state space, or (None, 1e4) for upper-only clipping.
+                A RuntimeWarning is emitted when a simulated step is clamped.
+            noisy_init_strategy: How to handle noisy initial states outside
+                state_clamp_bounds. "clamp" preserves the historical behavior;
+                "resample" redraws the complete initial state until it is valid.
+            max_noisy_init_attempts: Maximum draws for "resample".
         """
         xt_chunk = []
         ctx_chunk = []
@@ -90,71 +106,38 @@ class NLEEstimator:
         if n_transitions is None:
             ref_indices = range(1, len(x_ref))
         else:
-            if n_transitions < 1:
-                raise ValueError("n_transitions must be positive.")
             ref_indices = torch.randint(1, len(x_ref), size=(n_transitions,)).tolist()
 
         for t in ref_indices:
             x_ref_value = x_ref[t - 1]
-            if observed_dims is None:
-                if x_ref_value.shape != (self.dynamics.x_dim,):
-                    raise ValueError(
-                        "Full-state x_ref rows must have shape "
-                        f"({self.dynamics.x_dim},)."
-                    )
-                x_init = x_ref_value + torch.randn_like(x_ref_value) * ref_noize
-            else:
-                observed_dims = torch.as_tensor(
-                    observed_dims, dtype=torch.long, device=x_ref_value.device
+            attempts = (
+                max_noisy_init_attempts if noisy_init_strategy == "resample" else 1
+            )
+            for _ in range(attempts):
+                x_init = self._draw_noisy_initial_state(
+                    x_ref_value=x_ref_value,
+                    ref_noize=ref_noize,
+                    observed_dims=observed_dims,
+                    unobserved_dims=unobserved_dims,
+                    unobserved_init_dist=unobserved_init_dist,
                 )
-                if x_ref_value.shape != (observed_dims.numel(),):
-                    raise ValueError(
-                        "x_ref columns must match the number of observed_dims."
-                    )
-                if torch.unique(observed_dims).numel() != observed_dims.numel():
-                    raise ValueError("observed_dims entries must be unique.")
                 if (
-                    torch.any(observed_dims < 0)
-                    or torch.any(observed_dims >= self.dynamics.x_dim)
+                    noisy_init_strategy == "clamp"
+                    or self._is_within_bounds(x_init, state_clamp_bounds)
                 ):
-                    raise ValueError("observed_dims contains an invalid state index.")
-
-                unobserved_mask = torch.ones(
-                    self.dynamics.x_dim,
-                    dtype=torch.bool,
-                    device=x_ref_value.device,
+                    break
+            else:
+                raise RuntimeError(
+                    "Could not draw a noisy initial state inside "
+                    f"state_clamp_bounds={state_clamp_bounds} after "
+                    f"{max_noisy_init_attempts} attempts."
                 )
-                unobserved_mask[observed_dims] = False
-                num_unobserved = int(unobserved_mask.sum().item())
-                if num_unobserved == 0:
-                    raise ValueError(
-                        "Use observed_dims=None when x_ref contains the full state."
-                    )
-                if unobserved_init_dist is None:
-                    raise ValueError(
-                        "unobserved_init_dist is required when x_ref omits "
-                        "latent-state dimensions."
-                    )
-
-                x_init = torch.empty(
-                    self.dynamics.x_dim,
-                    dtype=x_ref_value.dtype,
-                    device=x_ref_value.device,
+            if noisy_init_strategy == "clamp":
+                x_init = self._clamp_to_bounds(
+                    x_init,
+                    state_clamp_bounds,
+                    argument_name="state_clamp_bounds",
                 )
-                x_init[observed_dims] = (
-                    x_ref_value + torch.randn_like(x_ref_value) * ref_noize
-                )
-                unobserved_values = torch.as_tensor(
-                    unobserved_init_dist.sample(),
-                    dtype=x_ref_value.dtype,
-                    device=x_ref_value.device,
-                )
-                if unobserved_values.shape != (num_unobserved,):
-                    raise ValueError(
-                        "unobserved_init_dist.sample() must have shape "
-                        f"({num_unobserved},)."
-                    )
-                x_init[unobserved_mask] = unobserved_values
             x_init = self.dynamics.to_device(x_init)
             
             # Simulate forward
@@ -162,7 +145,39 @@ class NLEEstimator:
             sampled_n_steps = self._sample_n_steps(max_n_steps)
             for _ in range(sampled_n_steps):
                 x_sim = self.dynamics.simulate_one_step(x_sim, theta)
-                x_sim = torch.clamp(x_sim, min=0.0, max=1e4)
+                if state_clamp_bounds is not None:
+                    lower, upper = state_clamp_bounds
+                    clamp_mask = torch.zeros_like(x_sim, dtype=torch.bool)
+                    lower_clamped = False
+                    upper_clamped = False
+                    if lower is not None:
+                        lower_clamped = bool(torch.any(x_sim < lower).item())
+                        clamp_mask |= x_sim < lower
+                    if upper is not None:
+                        upper_clamped = bool(torch.any(x_sim > upper).item())
+                        clamp_mask |= x_sim > upper
+                    if torch.any(clamp_mask):
+                        sides = []
+                        if lower_clamped:
+                            sides.append("lower")
+                        if upper_clamped:
+                            sides.append("upper")
+                        warnings.warn(
+                            "Simulated states were clamped while generating "
+                            f"NLE training data: side={'+'.join(sides)}, "
+                            f"bounds={state_clamp_bounds}. "
+                            "For upper clamping, consider reducing dynamics.dt "
+                            "or narrowing the training parameter range. For lower "
+                            "clamping, confirm the dynamics state space is constrained.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    if lower is not None and upper is not None:
+                        x_sim = torch.clamp(x_sim, min=lower, max=upper)
+                    elif lower is not None:
+                        x_sim = torch.clamp_min(x_sim, lower)
+                    elif upper is not None:
+                        x_sim = torch.clamp_max(x_sim, upper)
             
             # Create context
             if self.conditions_on_n_steps:
@@ -192,7 +207,10 @@ class NLEEstimator:
             max_n_steps: int | None = None,
             samples_per_theta: int | None = None,
             observed_dims: torch.Tensor | None = None,
-            unobserved_init_dist: object | None = None,
+            unobserved_init_dist: Distribution | None = None,
+            state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
+            noisy_init_strategy: Literal["clamp", "resample"] = "clamp",
+            max_noisy_init_attempts: int = 1000,
             ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate complete training dataset.
@@ -210,9 +228,24 @@ class NLEEstimator:
             observed_dims: Latent-state indices represented by x_ref columns.
             unobserved_init_dist: Distribution used to initialize omitted latent
                 dimensions independently for each generated transition.
+            state_clamp_bounds: Optional bounds applied to noisy initial states
+                and every subsequently simulated state. Use None to disable
+                clamping.
         """
         all_xt = []
         all_ctx = []
+
+        observed_dims, unobserved_dims = self._prepare_initial_state_dimensions(
+            x_ref=x_ref,
+            observed_dims=observed_dims,
+            unobserved_init_dist=unobserved_init_dist,
+        )
+        if samples_per_theta is not None and samples_per_theta < 1:
+            raise ValueError("samples_per_theta must be positive.")
+        if noisy_init_strategy not in {"clamp", "resample"}:
+            raise ValueError("noisy_init_strategy must be 'clamp' or 'resample'.")
+        if max_noisy_init_attempts < 1:
+            raise ValueError("max_noisy_init_attempts must be positive.")
         
         print(f"Generating training data from {n_params} parameter samples...")
         for _ in tqdm(range(n_params)):
@@ -224,7 +257,11 @@ class NLEEstimator:
                 max_n_steps,
                 n_transitions=samples_per_theta,
                 observed_dims=observed_dims,
+                unobserved_dims=unobserved_dims,
                 unobserved_init_dist=unobserved_init_dist,
+                state_clamp_bounds=state_clamp_bounds,
+                noisy_init_strategy=noisy_init_strategy,
+                max_noisy_init_attempts=max_noisy_init_attempts,
             )
             all_xt.extend(xt_chunk)
             all_ctx.extend(ctx_chunk)
@@ -234,19 +271,76 @@ class NLEEstimator:
 
         return xt_data, ctx_data
     
-    def train(self, x_ref: torch.Tensor, n_params: int = 500, 
+    @classmethod
+    def build_spline_reference_path(
+            cls,
+            obs_times: torch.Tensor,
+            x_obs: torch.Tensor,
+            reference_times: torch.Tensor,
+            spline_clamp_bounds: tuple[float | None, float | None] | None = (0.0, None),
+            ) -> torch.Tensor:
+        """Interpolate irregular observations onto a reference-time grid.
+
+        Natural cubic splines are the standard reference-path construction for
+        NLE training. Set ``spline_clamp_bounds=None`` when the state space
+        permits negative values.
+        """
+        obs_times = torch.as_tensor(obs_times)
+        x_obs = torch.as_tensor(x_obs)
+        reference_times = torch.as_tensor(reference_times)
+        if obs_times.ndim != 1 or reference_times.ndim != 1:
+            raise ValueError("obs_times and reference_times must be one-dimensional.")
+        if x_obs.ndim != 2 or x_obs.shape[0] != obs_times.numel():
+            raise ValueError("x_obs must have shape (len(obs_times), observed_dim).")
+        if obs_times.numel() < 2 or not torch.all(obs_times[1:] > obs_times[:-1]):
+            raise ValueError("obs_times must contain at least two increasing values.")
+        if reference_times.numel() < 2 or not torch.all(
+            reference_times[1:] > reference_times[:-1]
+        ):
+            raise ValueError("reference_times must contain increasing values.")
+        if reference_times[0] < obs_times[0] or reference_times[-1] > obs_times[-1]:
+            raise ValueError("reference_times must lie inside the observation interval.")
+
+        spline = CubicSpline(
+            obs_times.detach().cpu().numpy(),
+            x_obs.detach().cpu().numpy(),
+            axis=0,
+            bc_type="natural",
+        )
+        x_ref = torch.as_tensor(
+            spline(reference_times.detach().cpu().numpy()),
+            dtype=x_obs.dtype,
+            device=x_obs.device,
+        )
+        return cls._clamp_to_bounds(
+            x_ref,
+            spline_clamp_bounds,
+            argument_name="spline_clamp_bounds",
+        )
+
+    def train(self, x_ref: torch.Tensor | None = None, n_params: int = 500,
               ref_noize: float = 0.02,
               max_n_steps: int | None = None,
               batch_size: int = 256, lr: float = 5e-4, 
               epochs: int = 50,
+              stop_after_epochs: int = 20,
               samples_per_theta: int | None = None,
               observed_dims: torch.Tensor | None = None,
-              unobserved_init_dist: object | None = None) -> 'NLEEstimator':
+              unobserved_init_dist: Distribution | None = None,
+              state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
+              noisy_init_strategy: Literal["clamp", "resample"] = "clamp",
+              max_noisy_init_attempts: int = 1000,
+              obs_times: torch.Tensor | None = None,
+              x_obs: torch.Tensor | None = None,
+              reference_times: torch.Tensor | None = None,
+              spline_clamp_bounds: tuple[float | None, float | None] | None = (0.0, None),
+              ) -> 'NLEEstimator':
         """
         Train the NLE estimator.
         
         Args:
-            x_ref: Reference trajectories
+            x_ref: Reference trajectory. If omitted, it is constructed from
+                obs_times, x_obs, and reference_times by natural cubic spline.
             n_params: Number of parameter samples for training
             ref_noize: Noise level for initial conditions
             max_n_steps: If None, simulate one step and do not condition on n_steps.
@@ -255,13 +349,42 @@ class NLEEstimator:
             batch_size: Training batch size
             lr: Learning rate
             epochs: Number of epochs
+            stop_after_epochs: Stop after this many epochs without validation
+                improvement.
             samples_per_theta: Number of transitions generated per sampled theta.
                 If None, preserve the original behavior and use len(x_ref)-1
                 transitions per theta. Set to 1 for one transition per theta.
             observed_dims: Latent-state indices represented by x_ref columns.
             unobserved_init_dist: Distribution used to initialize latent dimensions
                 that are not represented in x_ref.
+            state_clamp_bounds: Optional state-space bounds applied to noisy
+                initial states and after each simulated step. Defaults to
+                [0, 1e4]. Use None for unconstrained state spaces.
+            noisy_init_strategy: Clamp or redraw noisy initial states that fall
+                outside state_clamp_bounds.
+            max_noisy_init_attempts: Maximum redraws under "resample".
+            obs_times: Irregular observation times used for spline construction.
+            x_obs: Observations with shape (N, observed_dim).
+            reference_times: Grid on which the spline reference path is evaluated.
+            spline_clamp_bounds: Optional bounds applied to the spline path.
         """
+        spline_inputs = (obs_times, x_obs, reference_times)
+        if x_ref is None:
+            if any(value is None for value in spline_inputs):
+                raise ValueError(
+                    "Provide x_ref, or provide obs_times, x_obs, and reference_times."
+                )
+            x_ref = self.build_spline_reference_path(
+                obs_times=obs_times,
+                x_obs=x_obs,
+                reference_times=reference_times,
+                spline_clamp_bounds=spline_clamp_bounds,
+            )
+        elif any(value is not None for value in spline_inputs):
+            raise ValueError(
+                "Do not provide obs_times, x_obs, or reference_times together with x_ref."
+            )
+
         self.conditions_on_n_steps = max_n_steps is not None
         if max_n_steps is not None and max_n_steps < 1:
             raise ValueError("max_n_steps must be positive when specified.")
@@ -278,6 +401,22 @@ class NLEEstimator:
             metadata = cache.get("metadata", {})
             if xt_data is not None and ctx_data is not None:
                 print(f"Loading cached training data from {self.model_cache_path}...")
+                if (
+                    state_clamp_bounds is not None
+                    and not metadata.get("state_clamp_applies_to_x_init", False)
+                ):
+                    raise ValueError(
+                        "Cached NLE training data predates applying "
+                        "state_clamp_bounds to noisy x_init. Use a different "
+                        "cache path to regenerate the training data."
+                    )
+                cached_strategy = metadata.get("noisy_init_strategy", "clamp")
+                if cached_strategy != noisy_init_strategy:
+                    raise ValueError(
+                        "Cached NLE training data used noisy_init_strategy="
+                        f"{cached_strategy!r}, requested {noisy_init_strategy!r}. "
+                        "Use a different cache path to regenerate the data."
+                    )
                 if "conditions_on_n_steps" in metadata:
                     self.conditions_on_n_steps = metadata["conditions_on_n_steps"]
                 xt_data = xt_data.to(self.device)
@@ -292,6 +431,9 @@ class NLEEstimator:
                 samples_per_theta=samples_per_theta,
                 observed_dims=observed_dims,
                 unobserved_init_dist=unobserved_init_dist,
+                state_clamp_bounds=state_clamp_bounds,
+                noisy_init_strategy=noisy_init_strategy,
+                max_noisy_init_attempts=max_noisy_init_attempts,
             )
         print(f"Data generation took {time.time() - start_time:.2f}s,"
               f"samples: {len(ctx_data)}")
@@ -326,6 +468,7 @@ class NLEEstimator:
         ).train(
             training_batch_size=batch_size,
             learning_rate=lr,
+            stop_after_epochs=stop_after_epochs,
             max_num_epochs=epochs
         )
         
@@ -338,9 +481,14 @@ class NLEEstimator:
                 n_params=n_params,
                 ref_noize=ref_noize,
                 max_n_steps=max_n_steps,
+                max_num_epochs=epochs,
+                stop_after_epochs=stop_after_epochs,
                 samples_per_theta=samples_per_theta,
                 x_ref_shape=x_ref_shape,
                 observed_dims=observed_dims,
+                state_clamp_bounds=state_clamp_bounds,
+                noisy_init_strategy=noisy_init_strategy,
+                max_noisy_init_attempts=max_noisy_init_attempts,
             )
         
         return self
@@ -351,9 +499,14 @@ class NLEEstimator:
             n_params: int | None = None,
             ref_noize: float | None = None,
             max_n_steps: int | None = None,
+            max_num_epochs: int | None = None,
+            stop_after_epochs: int | None = None,
             samples_per_theta: int | None = None,
             x_ref_shape: Tuple[int, ...] | None = None,
-            observed_dims: torch.Tensor | None = None) -> None:
+            observed_dims: torch.Tensor | None = None,
+            state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
+            noisy_init_strategy: Literal["clamp", "resample"] = "clamp",
+            max_noisy_init_attempts: int = 1000) -> None:
         if self.estimator is None:
             raise ValueError("No trained estimator is available to save.")
 
@@ -373,6 +526,8 @@ class NLEEstimator:
                     "n_params": n_params,
                     "ref_noize": ref_noize,
                     "max_n_steps": max_n_steps,
+                    "max_num_epochs": max_num_epochs,
+                    "stop_after_epochs": stop_after_epochs,
                     "samples_per_theta": samples_per_theta,
                     "x_ref_shape": x_ref_shape,
                     "observed_dims": (
@@ -380,6 +535,10 @@ class NLEEstimator:
                         if observed_dims is not None
                         else None
                     ),
+                    "state_clamp_bounds": state_clamp_bounds,
+                    "state_clamp_applies_to_x_init": True,
+                    "noisy_init_strategy": noisy_init_strategy,
+                    "max_noisy_init_attempts": max_noisy_init_attempts,
                 },
                 "member_variables": {
                     "dynamics": self.dynamics,
@@ -427,6 +586,143 @@ class NLEEstimator:
 
         print(f"Loaded NLE model from {model_path}")
         return self
+
+    @staticmethod
+    def _normalize_bounds(
+            bounds: tuple[float | None, float | None] | None,
+            *,
+            argument_name: str) -> tuple[float | None, float | None] | None:
+        """Validate optional lower/upper bounds and return a stable tuple."""
+        if bounds is None:
+            return None
+        if len(bounds) != 2:
+            raise ValueError(f"{argument_name} must contain (lower, upper).")
+        lower, upper = bounds
+        if lower is not None:
+            lower = float(lower)
+        if upper is not None:
+            upper = float(upper)
+        if lower is not None and upper is not None and lower > upper:
+            raise ValueError(
+                f"{argument_name} must satisfy lower <= upper."
+            )
+        return lower, upper
+
+    @staticmethod
+    def _clamp_to_bounds(
+            value: torch.Tensor,
+            bounds: tuple[float | None, float | None] | None,
+            *,
+            argument_name: str) -> torch.Tensor:
+        """Apply optional bounds without imposing a state-space assumption."""
+        normalized = NLEEstimator._normalize_bounds(
+            bounds,
+            argument_name=argument_name,
+        )
+        if normalized is None:
+            return value
+        lower, upper = normalized
+        if lower is not None and upper is not None:
+            return torch.clamp(value, min=lower, max=upper)
+        if lower is not None:
+            return torch.clamp_min(value, lower)
+        if upper is not None:
+            return torch.clamp_max(value, upper)
+        return value
+
+    @staticmethod
+    def _is_within_bounds(
+            value: torch.Tensor,
+            bounds: tuple[float | None, float | None] | None) -> bool:
+        """Return whether every component lies inside optional state bounds."""
+        normalized = NLEEstimator._normalize_bounds(
+            bounds,
+            argument_name="state_clamp_bounds",
+        )
+        if normalized is None:
+            return True
+        lower, upper = normalized
+        if lower is not None and torch.any(value < lower):
+            return False
+        if upper is not None and torch.any(value > upper):
+            return False
+        return True
+
+    def _prepare_initial_state_dimensions(
+            self,
+            *,
+            x_ref: torch.Tensor,
+            observed_dims: torch.Tensor | None,
+            unobserved_init_dist: Distribution | None,
+            ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Validate the fixed state layout once before generating transitions."""
+        if x_ref.ndim != 2:
+            raise ValueError("x_ref must have shape (num_reference_times, state_dim).")
+        if observed_dims is None:
+            if x_ref.shape[1] != self.dynamics.x_dim:
+                raise ValueError(
+                    f"Full-state x_ref must have {self.dynamics.x_dim} columns."
+                )
+            return None, None
+
+        observed_dims = torch.as_tensor(
+            observed_dims, dtype=torch.long, device=x_ref.device
+        )
+        if observed_dims.ndim != 1:
+            raise ValueError("observed_dims must be one-dimensional.")
+        if x_ref.shape[1] != observed_dims.numel():
+            raise ValueError("x_ref columns must match the number of observed_dims.")
+        if torch.unique(observed_dims).numel() != observed_dims.numel():
+            raise ValueError("observed_dims entries must be unique.")
+        if torch.any((observed_dims < 0) | (observed_dims >= self.dynamics.x_dim)):
+            raise ValueError("observed_dims contains an invalid state index.")
+
+        all_dims = torch.arange(self.dynamics.x_dim, device=x_ref.device)
+        unobserved_dims = all_dims[~torch.isin(all_dims, observed_dims)]
+        if unobserved_dims.numel() == 0:
+            raise ValueError("Use observed_dims=None when x_ref contains the full state.")
+        if unobserved_init_dist is None:
+            raise ValueError(
+                "unobserved_init_dist is required when x_ref omits "
+                "latent-state dimensions."
+            )
+        sample_shape = (
+            unobserved_init_dist.batch_shape + unobserved_init_dist.event_shape
+        )
+        if sample_shape != torch.Size([unobserved_dims.numel()]):
+            raise ValueError(
+                "unobserved_init_dist.sample() must have shape "
+                f"({unobserved_dims.numel()},)."
+            )
+        return observed_dims, unobserved_dims
+
+    def _draw_noisy_initial_state(
+            self,
+            *,
+            x_ref_value: torch.Tensor,
+            ref_noize: float,
+            observed_dims: torch.Tensor | None,
+            unobserved_dims: torch.Tensor | None,
+            unobserved_init_dist: Distribution | None) -> torch.Tensor:
+        """Draw one complete initial state around a reference-state row."""
+        noisy_reference = (
+            x_ref_value + torch.randn_like(x_ref_value) * ref_noize
+        )
+        if observed_dims is None:
+            return noisy_reference
+
+        x_init = torch.empty(
+            self.dynamics.x_dim,
+            dtype=x_ref_value.dtype,
+            device=x_ref_value.device,
+        )
+        x_init[observed_dims] = noisy_reference
+        x_init[unobserved_dims] = torch.as_tensor(
+            unobserved_init_dist.sample(),
+            dtype=x_ref_value.dtype,
+            device=x_ref_value.device,
+        )
+        return x_init
 
     def _sample_n_steps(self, max_n_steps: int | None) -> int:
         if max_n_steps is None:
