@@ -6,9 +6,10 @@
 
 .venv/
 
-# Track Python source and notebooks
+# Track source documents and notebooks
 !*.py
 !*.ipynb
+!*.R
 
 # Keep essential project metadata/config files
 !.gitignore
@@ -21,3 +22,4 @@ __pycache__/
 *.py[cod]
 *$py.class
 .ipynb_checkpoints/
+.r-lib/
