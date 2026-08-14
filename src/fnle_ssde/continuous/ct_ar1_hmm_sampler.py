@@ -27,6 +27,9 @@ that each Gibbs step remains easy to inspect and modify.
 
 from __future__ import annotations
 
+import os
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pyro
@@ -78,6 +81,7 @@ class ContinuousTimeAR1HMMSampler:
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float64,
         seed: int = 0,
+        latest_sample_path: Optional[str | os.PathLike[str]] = None,
     ) -> None:
         """
         Parameters
@@ -118,6 +122,9 @@ class ContinuousTimeAR1HMMSampler:
         y0_prior_loc / y0_prior_scale:
             Gaussian prior location and scale for y at the initial time. Scalars
             are broadcast across latent dimensions; vectors must have shape (D,).
+        latest_sample_path:
+            Optional monitoring file overwritten atomically after every completed
+            Gibbs sweep. The complete in-memory history is unchanged.
         """
         first_x_obs = x_obs[0] if isinstance(x_obs, (list, tuple)) else x_obs
         self.device = device or first_x_obs.device
@@ -125,6 +132,9 @@ class ContinuousTimeAR1HMMSampler:
         self.rng = torch.Generator(device="cpu")
         self.rng.manual_seed(seed)
         pyro.set_rng_seed(seed)
+        self.latest_sample_path = (
+            Path(latest_sample_path) if latest_sample_path is not None else None
+        )
 
         self.Q = Q.to(device=self.device, dtype=self.dtype)
         self.omega_scale = float(omega_scale)
@@ -241,6 +251,13 @@ class ContinuousTimeAR1HMMSampler:
             self.flow_model.to(self.device)
         if hasattr(self.flow_model, "eval"):
             self.flow_model.eval()
+        if hasattr(self.flow_model, "requires_grad_"):
+            # The trained NLE is a fixed density inside Gibbs inference.  Keeping
+            # its weights differentiable makes PyTorch retain unnecessary
+            # autograd tensors across repeated one-step NUTS runs.  Freezing the
+            # weights still permits gradients with respect to y and theta, which
+            # are the variables sampled by NUTS.
+            self.flow_model.requires_grad_(False)
 
         if self.Q.shape != (self.K, self.K):
             raise ValueError("Q must be square with shape (K, K).")
@@ -732,6 +749,222 @@ class ContinuousTimeAR1HMMSampler:
             )
         return logp
 
+    @torch.no_grad()
+    def complete_data_log_joint(self) -> Dict[str, Any]:
+        """Evaluate a component-wise complete-data log joint for diagnostics.
+
+        The latent path is scored on the canonical grid formed by observation
+        times and retained CTMC jump times.  Virtual uniformization candidates
+        are deliberately excluded, so this diagnostic does not change merely
+        because a sweep happened to introduce more auxiliary grid points.
+
+        The density is with respect to ``tau**2`` (the model parameter having an
+        inverse-gamma prior), rather than with respect to ``log_tau``.  Hence no
+        change-of-variables Jacobian for ``log_tau`` is included.
+        """
+        if self.theta is None or self.log_tau is None:
+            raise RuntimeError(
+                "Call initialize() and complete a sweep before evaluating the joint."
+            )
+
+        theta_prior = self._theta_log_prior(self._pack_theta(self.theta))
+
+        tau2 = torch.exp(2.0 * self.log_tau)
+        tau2_alpha = torch.as_tensor(
+            self.prior_config["tau2_alpha"],
+            dtype=self.dtype,
+            device=self.device,
+        ).broadcast_to(tau2.shape)
+        tau2_beta = torch.as_tensor(
+            self.prior_config["tau2_beta"],
+            dtype=self.dtype,
+            device=self.device,
+        ).broadcast_to(tau2.shape)
+        tau2_prior = dist.InverseGamma(tau2_alpha, tau2_beta).log_prob(tau2).sum()
+
+        q_alpha = torch.as_tensor(
+            self.prior_config["q_alpha"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        q_beta = torch.as_tensor(
+            self.prior_config["q_beta"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if q_alpha.ndim != 0 or q_beta.ndim != 0:
+            raise ValueError("q_alpha and q_beta must be scalars.")
+        off_diagonal = ~torch.eye(
+            self.K, dtype=torch.bool, device=self.device
+        )
+        Q_prior = dist.Gamma(q_alpha, q_beta).log_prob(
+            self.Q[off_diagonal]
+        ).sum()
+
+        initial_state = torch.zeros((), dtype=self.dtype, device=self.device)
+        ctmc_path = torch.zeros((), dtype=self.dtype, device=self.device)
+        latent_initial = torch.zeros((), dtype=self.dtype, device=self.device)
+        nle_transition = torch.zeros((), dtype=self.dtype, device=self.device)
+        observation = torch.zeros((), dtype=self.dtype, device=self.device)
+        num_latent_transitions = 0
+        num_observation_rows = 0
+        num_observation_values = 0
+        num_true_jumps = 0
+
+        for s in range(self.S):
+            T_all_s = self.T_all_list[s]
+            z_aug_s = self.z_aug_list[s]
+            y_aug_s = self.y_aug_list[s]
+            obs_idx_s = self.obs_idx_list[s]
+            true_idx_s = self.true_idx_list[s]
+            T_true_s = self.T_true_list[s]
+            z_true_s = self.z_true_list[s]
+            if any(
+                value is None
+                for value in (
+                    T_all_s,
+                    z_aug_s,
+                    y_aug_s,
+                    obs_idx_s,
+                    true_idx_s,
+                    T_true_s,
+                    z_true_s,
+                )
+            ):
+                raise RuntimeError(
+                    "Complete a Gibbs sweep before evaluating the complete-data joint."
+                )
+
+            canonical_idx = torch.unique(
+                torch.cat([obs_idx_s, true_idx_s]), sorted=True
+            )
+            if canonical_idx.numel() < 2:
+                raise RuntimeError(
+                    "The canonical grid must contain at least the interval endpoints."
+                )
+            canonical_times = T_all_s[canonical_idx]
+            canonical_y = y_aug_s[canonical_idx]
+            right_idx = canonical_idx[1:]
+            interval_states = z_aug_s[right_idx]
+            delta = canonical_times[1:] - canonical_times[:-1]
+
+            latent_initial = latent_initial + dist.Normal(
+                self.y0_prior_loc,
+                self.y0_prior_scale,
+            ).log_prob(canonical_y[0]).sum()
+            nle_transition = nle_transition + self._evaluate_batched_transition_logprobs(
+                y_prev_batch=canonical_y[:-1],
+                y_curr_batch=canonical_y[1:],
+                theta_batch=self.theta[interval_states],
+                delta_batch=delta,
+            ).sum()
+            observation = observation + self.observation_logprob(
+                self.x_obs_list[s],
+                y_aug_s[obs_idx_s],
+                self.log_tau,
+            )
+
+            initial_state = initial_state + torch.log(
+                self.initial_state_probs[z_true_s[0]]
+            )
+            path_boundaries = torch.cat(
+                [
+                    torch.zeros(1, dtype=self.dtype, device=self.device),
+                    T_true_s,
+                    self.T_list[s].reshape(1),
+                ]
+            )
+            dwell_times = path_boundaries[1:] - path_boundaries[:-1]
+            ctmc_path = ctmc_path + (
+                self.Q[z_true_s, z_true_s] * dwell_times
+            ).sum()
+            if T_true_s.numel() > 0:
+                ctmc_path = ctmc_path + torch.log(
+                    self.Q[z_true_s[:-1], z_true_s[1:]]
+                ).sum()
+
+            num_latent_transitions += int(canonical_idx.numel() - 1)
+            num_observation_rows += int(self.x_obs_list[s].shape[0])
+            num_observation_values += int(self.x_obs_list[s].numel())
+            num_true_jumps += int(T_true_s.numel())
+
+        components = {
+            "theta_prior": float(theta_prior.item()),
+            "tau2_prior": float(tau2_prior.item()),
+            "Q_prior": float(Q_prior.item()),
+            "initial_state": float(initial_state.item()),
+            "ctmc_path": float(ctmc_path.item()),
+            "latent_initial": float(latent_initial.item()),
+            "nle_transition": float(nle_transition.item()),
+            "observation": float(observation.item()),
+        }
+        total = sum(components.values())
+        return {
+            "definition": "complete_data_on_observation_and_true_jump_grid",
+            "tau_measure": "tau_squared",
+            "components": components,
+            "total": total,
+            "counts": {
+                "num_series": self.S,
+                "num_latent_transitions": num_latent_transitions,
+                "num_observation_rows": num_observation_rows,
+                "num_observation_values": num_observation_values,
+                "num_true_jumps": num_true_jumps,
+            },
+            "nle_transition_mean": (
+                components["nle_transition"] / num_latent_transitions
+                if num_latent_transitions
+                else float("nan")
+            ),
+            "observation_mean": (
+                components["observation"] / num_observation_values
+                if num_observation_values
+                else float("nan")
+            ),
+        }
+
+    def _latest_sample_payload(self) -> Dict[str, Any]:
+        """Build the monitoring payload from the most recently stored sweep."""
+        if not self.history["diagnostics"]:
+            raise RuntimeError("No completed sweep is available to save.")
+        sample_keys = (
+            "y_aug",
+            "z_aug",
+            "T_all",
+            "T_true",
+            "z_true",
+            "theta",
+            "log_tau",
+            "Q",
+            "omega",
+        )
+        return {
+            "schema_version": 1,
+            "completed_sweeps": len(self.history["diagnostics"]),
+            "sample": {key: self.history[key][-1] for key in sample_keys},
+            "diagnostics": self.history["diagnostics"][-1],
+        }
+
+    def _save_latest_sample(self) -> None:
+        """Atomically overwrite the externally readable latest-sample file."""
+        target = self.latest_sample_path
+        if target is None:
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        os.close(file_descriptor)
+        temporary_path = Path(temporary_name)
+        try:
+            with temporary_path.open("wb") as handle:
+                torch.save(self._latest_sample_payload(), handle)
+            os.replace(temporary_path, target)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
     def sample_y_nuts(
         self,
         s: int,
@@ -1098,6 +1331,7 @@ class ContinuousTimeAR1HMMSampler:
         )
         return log_probs.sum()
 
+    @torch.no_grad()
     def sample_z_ffbs(self, s: int) -> torch.Tensor:
         """
         Sample z on the augmented grid with FFBS in log-space.
@@ -1247,6 +1481,7 @@ class ContinuousTimeAR1HMMSampler:
         self.log_tau = self.sample_log_tau()
         self.Q = self.sample_Q()
         self._refresh_uniformization()
+        log_joint = self.complete_data_log_joint()
 
         finite_min_ess = [
             info["sir_min_ess"]
@@ -1274,6 +1509,7 @@ class ContinuousTimeAR1HMMSampler:
             "log_tau_update": "conjugate_inverse_gamma_gibbs",
             "Q_update": "conjugate_gamma_gibbs",
             "omega": float(self.omega),
+            "log_joint": log_joint,
         }
 
         self.history["y_aug"].append([
@@ -1296,6 +1532,7 @@ class ContinuousTimeAR1HMMSampler:
         self.history["Q"].append(self.Q.detach().cpu())
         self.history["omega"].append(float(self.omega))
         self.history["diagnostics"].append(sweep_info)
+        self._save_latest_sample()
         return sweep_info
 
     def run(self, num_sweeps: int, verbose: bool = True) -> Dict[str, List[Any]]:
