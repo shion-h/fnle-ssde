@@ -132,6 +132,7 @@ def initialize_gibbs_sampler(
     y_tree_depth: int = 3,
     theta_tree_depth: int = 3,
     sir_particles: int = 100,
+    latest_sample_path: Path | str | None = None,
 ) -> tuple[ContinuousTimeAR1HMMSampler, dict[str, torch.Tensor]]:
     """Construct the common paper sampler and initialize it reproducibly."""
     from .continuous import ContinuousTimeAR1HMMSampler
@@ -177,6 +178,7 @@ def initialize_gibbs_sampler(
         ).broadcast_to((x_obs.shape[1],)),
         dtype=torch.float32,
         seed=seed,
+        latest_sample_path=latest_sample_path,
     )
     sampler.initialize(
         initial_theta=initial_theta,
