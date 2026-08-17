@@ -168,7 +168,8 @@ class FluoreChemicalLangevinDynamics(Dynamics):
 class GeneExpressionCLEDynamics(Dynamics):
     r"""Two-dimensional chemical Langevin gene-expression dynamics.
 
-    The state is ``x = (M, Y)`` and the SDE is implemented as
+    ``M`` is the mRNA copy number and ``Y`` is the protein copy number. The
+    state is ``x = (M, Y)`` and the SDE is implemented as
 
         dM_t = (alpha - beta M_t) dt
                + sqrt(alpha + beta M_t) dW_t^(M),
@@ -216,20 +217,21 @@ class GeneExpressionCLEDynamics(Dynamics):
         """Return the diagonal 2 x 2 diffusion matrix."""
         alpha, beta, gamma, delta, c = torch.exp(theta_diffusion)
         M, Y = x[0], x[1]
-        messenger_rate = alpha + beta * M
-        expression_rate = gamma * M + delta * Y
+        mrna_rate = alpha + beta * M
+        protein_rate = gamma * M + delta * Y
         zeros = torch.zeros((), dtype=x.dtype, device=x.device)
         return torch.stack(
             [
-                torch.stack([torch.sqrt(messenger_rate), zeros]),
-                torch.stack([zeros, c * torch.sqrt(expression_rate)]),
+                torch.stack([torch.sqrt(mrna_rate), zeros]),
+                torch.stack([zeros, c * torch.sqrt(protein_rate)]),
             ]
         )
 
 
 class LatentMGeneExpressionCLEDynamics(Dynamics):
-    r"""Gene-expression CLE with latent M and fixed messenger decay rate.
+    r"""Gene-expression CLE with latent mRNA and fixed mRNA degradation rate.
 
+    ``M`` is the latent mRNA copy number and ``Y`` is the protein copy number.
     The state is ``x = (M, Y)`` and beta is fixed to one:
 
         dM_t = (alpha - M_t) dt
@@ -278,12 +280,12 @@ class LatentMGeneExpressionCLEDynamics(Dynamics):
         """Return the diagonal 2 x 2 diffusion matrix."""
         alpha, gamma, delta, c = torch.exp(theta_diffusion)
         M, Y = x[0], x[1]
-        messenger_rate = alpha + M
-        expression_rate = gamma * M + delta * Y
+        mrna_rate = alpha + M
+        protein_rate = gamma * M + delta * Y
         zeros = torch.zeros((), dtype=x.dtype, device=x.device)
         return torch.stack(
             [
-                torch.stack([torch.sqrt(messenger_rate), zeros]),
-                torch.stack([zeros, c * torch.sqrt(expression_rate)]),
+                torch.stack([torch.sqrt(mrna_rate), zeros]),
+                torch.stack([zeros, c * torch.sqrt(protein_rate)]),
             ]
         )
