@@ -36,6 +36,7 @@ import pyro
 import pyro.distributions as dist
 from pyro.infer import MCMC, NUTS
 import torch
+from torch.distributions import Distribution, constraints
 
 class ContinuousTimeAR1HMMSampler:
     """
@@ -47,7 +48,7 @@ class ContinuousTimeAR1HMMSampler:
     T_obs: (N,)
     y_aug: (L+1, D)
     z_aug: (L+1,)
-    theta: (K, theta_dim)       NLE transition/emission-density parameters only
+    theta: (K, theta_dim)       real-valued NLE parameter coordinates
     log_tau: (obs_dim,)         observation-noise log scale, not part of theta
     Q: (K, K)                   CTMC generator, sampled by Gamma conjugacy
 
@@ -73,6 +74,7 @@ class ContinuousTimeAR1HMMSampler:
         theta_nuts_config: Optional[Dict[str, Any]] = None,
         sir_config: Optional[Dict[str, Any]] = None,
         prior_config: Optional[Dict[str, Any]] = None,
+        theta_prior: Optional[Distribution] = None,
         switching_parameter_mask: Optional[torch.Tensor] = None,
         fixed_parameter_mask: Optional[torch.Tensor] = None,
         observed_dims: Optional[torch.Tensor] = None,
@@ -106,6 +108,14 @@ class ContinuousTimeAR1HMMSampler:
             Settings for SIR initialization of y at newly inserted candidate times.
         prior_config:
             Prior hyperparameters for theta and observation-noise variance.
+            `theta_loc` and `theta_scale` define the legacy Normal prior in the
+            NLE theta coordinate when `theta_prior` is omitted.
+        theta_prior:
+            Optional component-wise prior in the real-valued NLE theta coordinate.
+            It must have batch shape `(theta_dim,)`, scalar event shape, and real
+            support, and its log density must evaluate on the sampler's device
+            and dtype. A physical-scale prior can be converted with
+            `nle_estimator.dynamics.pullback_theta_prior()`.
         switching_parameter_mask:
             Boolean tensor of shape (theta_dim,). True dimensions have one
             parameter per regime; False dimensions are shared across regimes.
@@ -315,6 +325,9 @@ class ContinuousTimeAR1HMMSampler:
         }
         if prior_config is not None:
             self.prior_config.update(prior_config)
+        self.theta_prior = theta_prior
+        if self.theta_prior is not None:
+            self._validate_explicit_theta_prior()
 
         self.history: Dict[str, List[Any]] = {
             "y_aug": [],
@@ -356,8 +369,8 @@ class ContinuousTimeAR1HMMSampler:
         """
         Initialize theta, observation noise, and the true discrete path.
 
-        `initial_theta` is the NLE transition/emission-density parameter only. Pass
-        observation noise separately as `initial_log_tau`.
+        `initial_theta` is expressed in the real-valued NLE parameter coordinate.
+        Pass observation noise separately as `initial_log_tau`.
 
         The initial true path has no jumps. Its single state is sampled from
         `initial_state_probs`, unless that probability vector is overridden here.
@@ -394,8 +407,11 @@ class ContinuousTimeAR1HMMSampler:
                     )
         prior_config = self.prior_config
         if initial_theta is None:
-            theta_loc, theta_scale = self._theta_prior_parameters()
-            theta_value = dist.Normal(theta_loc, theta_scale).sample((self.K,))
+            if self.theta_prior is None:
+                theta_loc, theta_scale = self._theta_prior_parameters()
+                theta_value = dist.Normal(theta_loc, theta_scale).sample((self.K,))
+            else:
+                theta_value = self.theta_prior.sample((self.K,))
             # Shared dimensions represent one random variable, not K independent draws.
             theta_value[:, self.shared_parameter_mask] = theta_value[
                 0, self.shared_parameter_mask
@@ -443,7 +459,7 @@ class ContinuousTimeAR1HMMSampler:
             self.initial_y_values_list[s] = initial_y_values
 
     def _theta_prior_parameters(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return theta prior location and scale as vectors of shape (theta_dim,)."""
+        """Return legacy NLE-coordinate Normal parameters of shape (theta_dim,)."""
         theta_loc = torch.as_tensor(
             self.prior_config["theta_loc"], dtype=self.dtype, device=self.device
         ).broadcast_to((self.theta_dim,))
@@ -453,6 +469,52 @@ class ContinuousTimeAR1HMMSampler:
         if torch.any(theta_scale <= 0):
             raise ValueError("theta prior scales must be positive.")
         return theta_loc, theta_scale
+
+    def _validate_explicit_theta_prior(self) -> None:
+        """Validate the component-wise prior supplied in the NLE coordinate."""
+        if not isinstance(self.theta_prior, Distribution):
+            raise TypeError("theta_prior must be a torch Distribution.")
+        expected_batch_shape = torch.Size((self.theta_dim,))
+        if self.theta_prior.batch_shape != expected_batch_shape:
+            raise ValueError(
+                "theta_prior must have batch_shape "
+                f"{tuple(expected_batch_shape)}, got "
+                f"{tuple(self.theta_prior.batch_shape)}."
+            )
+        if self.theta_prior.event_shape != torch.Size():
+            raise ValueError(
+                "theta_prior must be component-wise with an empty event_shape; "
+                "do not wrap it in Independent."
+            )
+        if self.theta_prior.support != constraints.real:
+            raise ValueError(
+                "theta_prior must have real support in the NLE theta coordinate. "
+                "Use dynamics.pullback_theta_prior() for a constrained physical prior."
+            )
+        probe = torch.zeros(
+            self.theta_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        try:
+            probe_log_prob = self.theta_prior.log_prob(probe)
+        except (RuntimeError, ValueError) as error:
+            raise ValueError(
+                "theta_prior must be constructed on a device compatible with the sampler."
+            ) from error
+        if probe_log_prob.shape != expected_batch_shape:
+            raise ValueError(
+                "theta_prior.log_prob(theta) must return one value per theta dimension."
+            )
+        if (
+            probe_log_prob.device != self.device
+            or probe_log_prob.dtype != self.dtype
+        ):
+            raise ValueError(
+                "theta_prior.log_prob(theta) must use the sampler's device and dtype "
+                f"({self.device}, {self.dtype}); got "
+                f"({probe_log_prob.device}, {probe_log_prob.dtype})."
+            )
 
     def _validate_theta_structure(self, theta: torch.Tensor) -> None:
         """Validate shared columns and the values retained for fixed columns."""
@@ -508,6 +570,26 @@ class ContinuousTimeAR1HMMSampler:
 
     def _theta_log_prior(self, packed: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Evaluate each unique theta prior exactly once."""
+        if self.theta_prior is not None:
+            theta = self._expand_theta(packed)
+            elementwise_logp = self.theta_prior.log_prob(theta)
+            expected_shape = torch.Size((self.K, self.theta_dim))
+            if elementwise_logp.shape != expected_shape:
+                raise RuntimeError(
+                    "theta_prior.log_prob(theta) returned shape "
+                    f"{tuple(elementwise_logp.shape)}, expected {tuple(expected_shape)}."
+                )
+            logp = torch.zeros((), dtype=self.dtype, device=self.device)
+            if torch.any(self.shared_parameter_mask):
+                logp = logp + elementwise_logp[
+                    0, self.shared_parameter_mask
+                ].sum()
+            if torch.any(self.switching_parameter_mask):
+                logp = logp + elementwise_logp[
+                    :, self.switching_parameter_mask
+                ].sum()
+            return logp
+
         theta_loc, theta_scale = self._theta_prior_parameters()
         logp = torch.tensor(0.0, dtype=self.dtype, device=self.device)
         if torch.any(self.shared_parameter_mask):
@@ -761,6 +843,10 @@ class ContinuousTimeAR1HMMSampler:
         The density is with respect to ``tau**2`` (the model parameter having an
         inverse-gamma prior), rather than with respect to ``log_tau``.  Hence no
         change-of-variables Jacobian for ``log_tau`` is included.
+
+        The theta-prior component is with respect to the real-valued NLE
+        coordinate. If ``theta_prior`` was pulled back from physical scale, its
+        ``log_prob`` already contains the corresponding Jacobian.
         """
         if self.theta is None or self.log_tau is None:
             raise RuntimeError(
@@ -901,6 +987,7 @@ class ContinuousTimeAR1HMMSampler:
         total = sum(components.values())
         return {
             "definition": "complete_data_on_observation_and_true_jump_grid",
+            "theta_measure": "nle_coordinate",
             "tau_measure": "tau_squared",
             "components": components,
             "total": total,

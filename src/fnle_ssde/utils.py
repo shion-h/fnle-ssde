@@ -8,13 +8,14 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from torch.distributions import Independent, Uniform
+from torch.distributions import Distribution, Independent, Uniform
 
 from .common.nle import NLEEstimator
 from .prior import (
     make_prior_config,
     sample_generator_matrix,
-    sample_initial_log_theta,
+    sample_initial_theta_from_normal_prior,
+    sample_initial_theta_from_prior,
 )
 
 if TYPE_CHECKING:
@@ -49,10 +50,24 @@ def build_spline_nle(
     num_bins: int = 10,
 ) -> NLEEstimator:
     """Load an NLE cache or train an NSF from a spline through observations."""
+    if theta_lower.shape != theta_upper.shape:
+        raise ValueError("theta_lower and theta_upper must have the same shape.")
+    if torch.any(theta_lower >= theta_upper):
+        raise ValueError("theta_lower must be strictly less than theta_upper.")
+    theta_nle_a = dynamics.to_nle_theta(theta_lower)
+    theta_nle_b = dynamics.to_nle_theta(theta_upper)
+    theta_nle_lower = torch.minimum(theta_nle_a, theta_nle_b)
+    theta_nle_upper = torch.maximum(theta_nle_a, theta_nle_b)
+    if not torch.all(torch.isfinite(theta_nle_lower)) or not torch.all(
+        torch.isfinite(theta_nle_upper)
+    ):
+        raise ValueError("Physical theta bounds must map to finite NLE coordinates.")
+    if torch.any(theta_nle_lower >= theta_nle_upper):
+        raise ValueError("Physical theta bounds map to an empty NLE interval.")
     nle = NLEEstimator(
         dynamics=dynamics,
         sampling_dist=Independent(
-            Uniform(torch.log(theta_lower), torch.log(theta_upper)), 1
+            Uniform(theta_nle_lower, theta_nle_upper), 1
         ),
         device="cpu",
         model_cache_path=cache_path,
@@ -133,8 +148,14 @@ def initialize_gibbs_sampler(
     theta_tree_depth: int = 3,
     sir_particles: int = 100,
     latest_sample_path: Path | str | None = None,
+    theta_prior: Distribution | None = None,
 ) -> tuple[ContinuousTimeAR1HMMSampler, dict[str, torch.Tensor]]:
-    """Construct the common paper sampler and initialize it reproducibly."""
+    """Construct the common paper sampler and initialize it reproducibly.
+
+    ``theta_prior`` is a component-wise distribution in the real NLE
+    coordinate. Convert a physical-scale prior first with
+    ``nle.dynamics.pullback_theta_prior(physical_prior)``.
+    """
     from .continuous import ContinuousTimeAR1HMMSampler
 
     seed_all(seed)
@@ -143,13 +164,24 @@ def initialize_gibbs_sampler(
         theta_lower.numel(), tau2_beta, tau2_alpha=tau2_alpha
     )
     if initial_theta is None:
-        initial_theta = sample_initial_log_theta(
-            prior_config,
-            theta_lower,
-            theta_upper,
-            switching_mask,
-            num_regimes=num_regimes,
-        )
+        if theta_prior is None:
+            initial_theta = sample_initial_theta_from_normal_prior(
+                prior_config,
+                theta_lower,
+                theta_upper,
+                switching_mask,
+                dynamics=nle.dynamics,
+                num_regimes=num_regimes,
+            )
+        else:
+            initial_theta = sample_initial_theta_from_prior(
+                theta_prior,
+                theta_lower,
+                theta_upper,
+                switching_mask,
+                dynamics=nle.dynamics,
+                num_regimes=num_regimes,
+            )
     if Q is None:
         Q = sample_generator_matrix(
             num_regimes,
@@ -172,6 +204,7 @@ def initialize_gibbs_sampler(
         },
         sir_config={"num_particles": sir_particles},
         prior_config=prior_config,
+        theta_prior=theta_prior,
         y0_prior_loc=x_obs[0],
         y0_prior_scale=torch.as_tensor(
             y0_prior_scale, dtype=x_obs.dtype, device=x_obs.device
@@ -218,8 +251,18 @@ def posterior_outside_support(
     history: dict[str, list[object]],
     theta_lower: torch.Tensor,
     theta_upper: torch.Tensor,
+    *,
+    dynamics: Any | None = None,
 ) -> float:
-    """Return the fraction of sweeps with any theta outside the NLE support."""
-    theta = torch.stack(history["theta"]).exp()
+    """Return the fraction of sweeps with theta outside physical NLE support.
+
+    Omitting ``dynamics`` retains the historical exponential conversion.
+    """
+    theta_nle = torch.stack(history["theta"])
+    theta = (
+        theta_nle.exp()
+        if dynamics is None
+        else dynamics.to_physical_theta(theta_nle)
+    )
     outside = ((theta < theta_lower) | (theta > theta_upper)).flatten(1).any(1)
     return float(outside.float().mean())

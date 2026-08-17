@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from torch.distributions import Gamma, Normal
+from torch.distributions import Distribution, Gamma, Normal
 
 
 def make_prior_config(
@@ -90,6 +90,110 @@ def sample_initial_log_theta(
     # A shared component is one random variable, not one draw per regime.
     theta[:, ~switching_mask] = theta[0, ~switching_mask]
     return theta
+
+
+def sample_initial_theta_from_normal_prior(
+    prior_config: dict[str, Any],
+    theta_lower: torch.Tensor,
+    theta_upper: torch.Tensor,
+    switching_mask: torch.Tensor,
+    *,
+    dynamics: Any,
+    num_regimes: int,
+) -> torch.Tensor:
+    """Draw legacy-Normal theta inside physical NLE-training bounds.
+
+    The Normal prior is defined in the real-valued NLE coordinate. Physical
+    bounds are mapped back through the transform owned by ``dynamics``.
+    """
+    if theta_lower.shape != theta_upper.shape:
+        raise ValueError("theta_lower and theta_upper must have the same shape.")
+    if switching_mask.shape != theta_lower.shape:
+        raise ValueError("switching_mask must have the same shape as theta bounds.")
+    if torch.any(theta_lower >= theta_upper):
+        raise ValueError("theta_lower must be strictly less than theta_upper.")
+    if num_regimes < 1:
+        raise ValueError("num_regimes must be positive.")
+
+    bound_a = dynamics.to_nle_theta(theta_lower)
+    bound_b = dynamics.to_nle_theta(theta_upper)
+    lower = torch.minimum(bound_a, bound_b)
+    upper = torch.maximum(bound_a, bound_b)
+    if not torch.all(torch.isfinite(lower)) or not torch.all(torch.isfinite(upper)):
+        raise ValueError("Physical theta bounds must map to finite NLE coordinates.")
+    if torch.any(lower >= upper):
+        raise ValueError("Physical theta bounds map to an empty NLE interval.")
+
+    loc = torch.as_tensor(
+        prior_config["theta_loc"], dtype=lower.dtype, device=lower.device
+    ).broadcast_to(lower.shape)
+    scale = torch.as_tensor(
+        prior_config["theta_scale"], dtype=lower.dtype, device=lower.device
+    ).broadcast_to(lower.shape)
+    theta = sample_truncated_normal(
+        loc,
+        scale,
+        lower,
+        upper,
+        sample_shape=torch.Size((num_regimes,)),
+    )
+    switching = switching_mask.to(device=theta.device, dtype=torch.bool)
+    theta[:, ~switching] = theta[0, ~switching]
+    return theta
+
+
+def sample_initial_theta_from_prior(
+    theta_prior: Distribution,
+    theta_lower: torch.Tensor,
+    theta_upper: torch.Tensor,
+    switching_mask: torch.Tensor,
+    *,
+    dynamics: Any,
+    num_regimes: int,
+    max_attempts: int = 1_000,
+) -> torch.Tensor:
+    """Draw NLE-coordinate theta whose physical value lies in NLE support."""
+    if not isinstance(theta_prior, Distribution):
+        raise TypeError("theta_prior must be a torch Distribution.")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive.")
+    if num_regimes < 1:
+        raise ValueError("num_regimes must be positive.")
+    if theta_lower.shape != theta_upper.shape:
+        raise ValueError("theta_lower and theta_upper must have the same shape.")
+    if switching_mask.shape != theta_lower.shape:
+        raise ValueError("switching_mask must have the same shape as theta bounds.")
+    if torch.any(theta_lower >= theta_upper):
+        raise ValueError("theta_lower must be strictly less than theta_upper.")
+    if theta_prior.batch_shape != theta_lower.shape:
+        raise ValueError(
+            "theta_prior batch_shape must match the physical theta bounds."
+        )
+    if theta_prior.event_shape != torch.Size():
+        raise ValueError("theta_prior must have an empty event_shape.")
+
+    for _ in range(max_attempts):
+        theta = theta_prior.sample((num_regimes,)).clone()
+        switching = switching_mask.to(device=theta.device, dtype=torch.bool)
+        theta[:, ~switching] = theta[0, ~switching]
+        physical_theta = dynamics.to_physical_theta(theta)
+        lower = theta_lower.to(
+            device=physical_theta.device,
+            dtype=physical_theta.dtype,
+        )
+        upper = theta_upper.to(
+            device=physical_theta.device,
+            dtype=physical_theta.dtype,
+        )
+        if torch.all(torch.isfinite(physical_theta)) and torch.all(
+            (physical_theta >= lower) & (physical_theta <= upper)
+        ):
+            return theta
+
+    raise RuntimeError(
+        "Could not draw initial theta inside the physical NLE support after "
+        f"{max_attempts} attempts."
+    )
 
 
 def sample_generator_matrix(

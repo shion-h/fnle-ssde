@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -40,7 +41,7 @@ def state_at_times(
 
 
 def match_regime_labels(theta: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
-    """Match estimated state labels to truth by mean squared log-parameter error."""
+    """Match state labels by mean squared error in the NLE theta coordinate."""
     order = min(
         itertools.permutations(range(truth.shape[0])),
         key=lambda permutation: float(
@@ -58,10 +59,15 @@ def posterior_summary(
     num_regimes: int,
     start: int = 0,
     theta_truth: torch.Tensor | None = None,
+    dynamics: Any | None = None,
     y_interval: tuple[float, float] = (0.025, 0.975),
     theta_interval: tuple[float, float] = (0.05, 0.95),
 ) -> dict[str, torch.Tensor]:
-    """Summarize one series at requested y and z evaluation times."""
+    """Summarize one series at requested y and z evaluation times.
+
+    ``dynamics`` converts stored NLE-coordinate theta to physical scale. If it
+    is omitted, the historical exponential conversion is retained.
+    """
     selected = single_series_history(history, start=start)
     y = torch.stack(
         [
@@ -75,13 +81,18 @@ def posterior_summary(
             for T_all, z_aug in zip(selected["T_all"], selected["z_aug"])
         ]
     )
-    theta_log = torch.stack(selected["theta"])
+    theta_nle = torch.stack(selected["theta"])
     order = (
-        match_regime_labels(theta_log.mean(0), theta_truth)
+        match_regime_labels(theta_nle.mean(0), theta_truth)
         if theta_truth is not None
         else torch.arange(num_regimes)
     )
-    theta = theta_log[:, order].exp()
+    theta_nle = theta_nle[:, order]
+    theta = (
+        theta_nle.exp()
+        if dynamics is None
+        else dynamics.to_physical_theta(theta_nle)
+    )
     z_prob = torch.nn.functional.one_hot(z, num_classes=num_regimes).float().mean(0)
     z_prob = z_prob[:, order]
     return {

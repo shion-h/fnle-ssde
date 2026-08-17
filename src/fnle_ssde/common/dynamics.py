@@ -1,8 +1,22 @@
 from abc import ABC, abstractmethod
-import torch
 from typing import Tuple
 
+import torch
+from torch.distributions import Distribution, TransformedDistribution
+from torch.distributions.transforms import ExpTransform, Transform, identity_transform
+
+
 class Dynamics(ABC):
+    """Base dynamics with an explicit NLE-to-physical theta transform.
+
+    The NLE and Gibbs sampler always use an unconstrained, real-valued theta.
+    ``theta_transform`` maps that coordinate to the parameters consumed by
+    ``split_theta()``, ``drift()``, and ``diffusion()``. Subclasses that do not
+    override it retain the identity mapping.
+    """
+
+    theta_transform: Transform = identity_transform
+
     def __init__(self, dt, device):
         self.dt = dt
         self.device = device
@@ -11,18 +25,41 @@ class Dynamics(ABC):
         """Ensure tensor is on the correct device."""
         return tensor.to(self.device) if tensor.device != self.device else tensor
 
+    def to_physical_theta(self, theta: torch.Tensor) -> torch.Tensor:
+        """Map the real-valued NLE theta coordinate to physical parameters."""
+        return self.theta_transform(theta)
+
+    def to_nle_theta(self, physical_theta: torch.Tensor) -> torch.Tensor:
+        """Map physical parameters to the real-valued NLE theta coordinate."""
+        return self.theta_transform.inv(physical_theta)
+
+    def pullback_theta_prior(
+        self,
+        physical_prior: Distribution,
+    ) -> TransformedDistribution:
+        """Express a physical-scale prior in the NLE theta coordinate.
+
+        ``TransformedDistribution`` supplies the change-of-variables Jacobian,
+        so the result can be passed directly as the sampler's ``theta_prior``.
+        """
+        return TransformedDistribution(
+            physical_prior,
+            [self.theta_transform.inv],
+        )
+
     def simulate_one_step(
             self, x: torch.Tensor, 
             theta: torch.Tensor) -> torch.Tensor:
-        # split_theta使う前提なのにthetaがtuple
         """
         Simulate one step of the SDE.
         
         Args:
             x: Current state
-            emission_params: (A matrix, log std) for current HMM state
+            theta: Real-valued NLE parameter coordinate. It is transformed to
+                the physical scale before the dynamics are evaluated.
         """
-        theta_drift, theta_diffusion = self.split_theta(theta)
+        physical_theta = self.to_physical_theta(theta)
+        theta_drift, theta_diffusion = self.split_theta(physical_theta)
         theta_drift = self.to_device(theta_drift)
         theta_diffusion = self.to_device(theta_diffusion)
         x = self.to_device(x)
@@ -50,7 +87,9 @@ class Dynamics(ABC):
         return x_list
 
     @abstractmethod
-    def split_theta(self, theta: torch.Tensor) -> Tuple[torch.Tensor]:
+    def split_theta(
+        self, theta: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         pass
 
     @abstractmethod
@@ -66,18 +105,22 @@ class Dynamics(ABC):
 
 class LotkaVolterraDynamics(Dynamics):
     """Lotka-Volterra predator-prey dynamics."""
+
+    theta_transform = ExpTransform()
+
     def __init__(self, dt: float = 0.01, 
                  device: str = 'cpu'):
         super().__init__(dt, device)
         self.x_dim = 2  # predator and prey
         self.theta_dim = 6  # 4 drift param and 2 diffusion param
     
-    def split_theta(self, theta: torch.Tensor) -> Tuple[torch.Tensor]:
+    def split_theta(
+        self, theta: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         return (theta[:4], theta[4:6])
 
     def drift(self, x: torch.Tensor,
               theta_drift: torch.Tensor) -> torch.Tensor:
-        # thetaは実数で与えられる想定→ここでexp使う
         """
         Compute drift term for Lotka-Volterra SDE.
         
@@ -87,7 +130,7 @@ class LotkaVolterraDynamics(Dynamics):
             device: Device for computation
         """
         assert theta_drift.shape[0] == 4, "Expected 4 parameters for drift (alpha, beta, gamma, delta)"
-        alpha, beta, gamma, delta = torch.exp(theta_drift)
+        alpha, beta, gamma, delta = theta_drift
         predator, prey = x[0], x[1]
         
         f_predator = gamma * prey * predator - delta * predator
@@ -110,7 +153,7 @@ class LotkaVolterraDynamics(Dynamics):
         assert theta_diffusion.shape[0] == 2, "Expected 2 parameters for diffusion (sigma1, sigma2)"
 
         # Handle sigma dimensions
-        sigma = torch.exp(theta_diffusion)
+        sigma = theta_diffusion
         
         # State-dependent diffusion matrix
         return torch.tensor([
@@ -132,6 +175,8 @@ class FluoreChemicalLangevinDynamics(Dynamics):
     parameters are obtained with an exponential transformation.
     """
 
+    theta_transform = ExpTransform()
+
     def __init__(self, dt: float = 0.01, device: str = "cpu"):
         super().__init__(dt, device)
         self.x_dim = 1
@@ -152,14 +197,14 @@ class FluoreChemicalLangevinDynamics(Dynamics):
         self, x: torch.Tensor, theta_drift: torch.Tensor
     ) -> torch.Tensor:
         """Return alpha * (beta - Y_t) as a one-dimensional vector."""
-        alpha, beta = torch.exp(theta_drift)
+        alpha, beta = theta_drift
         return alpha * (beta - x)
 
     def diffusion(
         self, x: torch.Tensor, theta_diffusion: torch.Tensor
     ) -> torch.Tensor:
         """Return the 1 x 1 state-dependent diffusion matrix."""
-        beta, gamma = torch.exp(theta_diffusion)
+        beta, gamma = theta_diffusion
         # Full truncation keeps Euler-Maruyama finite if a step crosses -beta.
         variance_rate = gamma * torch.clamp_min(beta + x[0], 0.0)
         return torch.sqrt(variance_rate).reshape(1, 1)
@@ -182,6 +227,8 @@ class GeneExpressionCLEDynamics(Dynamics):
     parameters are obtained by exponentiation.
     """
 
+    theta_transform = ExpTransform()
+
     def __init__(self, dt: float = 0.01, device: str = "cpu"):
         super().__init__(dt, device)
         self.x_dim = 2
@@ -202,7 +249,7 @@ class GeneExpressionCLEDynamics(Dynamics):
         self, x: torch.Tensor, theta_drift: torch.Tensor
     ) -> torch.Tensor:
         """Return the drift vector for (M, Y)."""
-        alpha, beta, gamma, delta = torch.exp(theta_drift)
+        alpha, beta, gamma, delta = theta_drift
         M, Y = x[0], x[1]
         return torch.stack(
             [
@@ -215,7 +262,7 @@ class GeneExpressionCLEDynamics(Dynamics):
         self, x: torch.Tensor, theta_diffusion: torch.Tensor
     ) -> torch.Tensor:
         """Return the diagonal 2 x 2 diffusion matrix."""
-        alpha, beta, gamma, delta, c = torch.exp(theta_diffusion)
+        alpha, beta, gamma, delta, c = theta_diffusion
         M, Y = x[0], x[1]
         mrna_rate = alpha + beta * M
         protein_rate = gamma * M + delta * Y
@@ -245,6 +292,8 @@ class LatentMGeneExpressionCLEDynamics(Dynamics):
     physical parameters are obtained by exponentiation.
     """
 
+    theta_transform = ExpTransform()
+
     def __init__(self, dt: float = 0.01, device: str = "cpu"):
         super().__init__(dt, device)
         self.x_dim = 2
@@ -265,7 +314,7 @@ class LatentMGeneExpressionCLEDynamics(Dynamics):
         self, x: torch.Tensor, theta_drift: torch.Tensor
     ) -> torch.Tensor:
         """Return the drift vector for (M, Y) with beta fixed to one."""
-        alpha, gamma, delta = torch.exp(theta_drift)
+        alpha, gamma, delta = theta_drift
         M, Y = x[0], x[1]
         return torch.stack(
             [
@@ -278,7 +327,7 @@ class LatentMGeneExpressionCLEDynamics(Dynamics):
         self, x: torch.Tensor, theta_diffusion: torch.Tensor
     ) -> torch.Tensor:
         """Return the diagonal 2 x 2 diffusion matrix."""
-        alpha, gamma, delta, c = torch.exp(theta_diffusion)
+        alpha, gamma, delta, c = theta_diffusion
         M, Y = x[0], x[1]
         mrna_rate = alpha + M
         protein_rate = gamma * M + delta * Y
