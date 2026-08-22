@@ -107,19 +107,33 @@ def initialize_random_ctmc_path(
     sampler: ContinuousTimeAR1HMMSampler,
     *,
     expected_num_intervals: float = 20.0,
-    seed: int = 0,
+    seed: int | None = None,
 ) -> None:
-    """Initialize each series with random jump times and non-self transitions."""
-    generator = torch.Generator(device="cpu").manual_seed(seed)
+    """Initialize random paths using the sampler's continuing CTMC RNG stream."""
+    if expected_num_intervals < 1.0:
+        raise ValueError("expected_num_intervals must be at least one.")
+    generator = sampler.rng
+    if seed is not None:
+        generator.manual_seed(seed)
     for series_index, duration in enumerate(sampler.T_list):
         num_intervals = 1 + int(
             torch.poisson(
-                torch.tensor(expected_num_intervals - 1.0), generator=generator
+                torch.tensor(
+                    expected_num_intervals - 1.0,
+                    dtype=sampler.time_dtype,
+                ),
+                generator=generator,
             )
         )
+        duration_value = float(duration.item())
         jump_times = torch.sort(
-            torch.rand(num_intervals - 1, generator=generator) * duration
-        ).values.to(device=sampler.device, dtype=sampler.dtype)
+            torch.rand(
+                num_intervals - 1,
+                generator=generator,
+                dtype=sampler.time_dtype,
+            )
+            * duration_value
+        ).values.to(device=sampler.device, dtype=sampler.time_dtype)
         states = torch.empty(num_intervals, dtype=torch.long)
         states[0] = torch.randint(sampler.K, (1,), generator=generator)
         for index in range(1, num_intervals):
@@ -149,12 +163,16 @@ def initialize_gibbs_sampler(
     sir_particles: int = 100,
     latest_sample_path: Path | str | None = None,
     theta_prior: Distribution | None = None,
+    time_dtype: torch.dtype = torch.float64,
 ) -> tuple[ContinuousTimeAR1HMMSampler, dict[str, torch.Tensor]]:
     """Construct the common paper sampler and initialize it reproducibly.
 
     ``theta_prior`` is a component-wise distribution in the real NLE
     coordinate. Convert a physical-scale prior first with
     ``nle.dynamics.pullback_theta_prior(physical_prior)``.
+
+    ``time_dtype`` controls only observation, jump, candidate, and augmented-grid
+    times. Model states, parameters, and NLE calls remain float32.
     """
     from .continuous import ContinuousTimeAR1HMMSampler
 
@@ -210,6 +228,7 @@ def initialize_gibbs_sampler(
             y0_prior_scale, dtype=x_obs.dtype, device=x_obs.device
         ).broadcast_to((x_obs.shape[1],)),
         dtype=torch.float32,
+        time_dtype=time_dtype,
         seed=seed,
         latest_sample_path=latest_sample_path,
     )
