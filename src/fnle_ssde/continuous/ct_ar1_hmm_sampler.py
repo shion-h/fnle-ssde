@@ -27,10 +27,11 @@ that each Gibbs step remains easy to inspect and modify.
 
 from __future__ import annotations
 
+import heapq
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import pyro
 import pyro.distributions as dist
@@ -82,6 +83,7 @@ class ContinuousTimeAR1HMMSampler:
         y0_prior_scale: float | torch.Tensor = 5.0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float64,
+        time_dtype: torch.dtype = torch.float64,
         seed: int = 0,
         latest_sample_path: Optional[str | os.PathLike[str]] = None,
     ) -> None:
@@ -132,6 +134,11 @@ class ContinuousTimeAR1HMMSampler:
         y0_prior_loc / y0_prior_scale:
             Gaussian prior location and scale for y at the initial time. Scalars
             are broadcast across latent dimensions; vectors must have shape (D,).
+        time_dtype:
+            Floating-point dtype used for observation, jump, candidate, and
+            augmented-grid times. Time differences are computed in this dtype and
+            converted to the NLE dtype only after subtraction. Must be float32 or
+            float64; float64 is the default to make exact time collisions negligible.
         latest_sample_path:
             Optional monitoring file overwritten atomically after every completed
             Gibbs sweep. The complete in-memory history is unchanged.
@@ -139,6 +146,9 @@ class ContinuousTimeAR1HMMSampler:
         first_x_obs = x_obs[0] if isinstance(x_obs, (list, tuple)) else x_obs
         self.device = device or first_x_obs.device
         self.dtype = dtype
+        if time_dtype not in (torch.float32, torch.float64):
+            raise ValueError("time_dtype must be torch.float32 or torch.float64.")
+        self.time_dtype = time_dtype
         self.rng = torch.Generator(device="cpu")
         self.rng.manual_seed(seed)
         pyro.set_rng_seed(seed)
@@ -159,10 +169,12 @@ class ContinuousTimeAR1HMMSampler:
                 x.to(device=self.device, dtype=self.dtype) for x in x_obs
             ]
             self.T_obs_list = [
-                times.to(device=self.device, dtype=self.dtype) for times in obs_times
+                times.to(device=self.device, dtype=self.time_dtype)
+                for times in obs_times
             ]
             self.T_list = [
-                torch.tensor(float(t), device=self.device, dtype=self.dtype) for t in T
+                torch.tensor(float(t), device=self.device, dtype=self.time_dtype)
+                for t in T
             ]
         else:
             if isinstance(obs_times, (list, tuple)):
@@ -170,8 +182,12 @@ class ContinuousTimeAR1HMMSampler:
             if isinstance(T, (list, tuple)):
                 raise ValueError("T must be a scalar when x_obs is a tensor.")
             self.x_obs_list = [x_obs.to(device=self.device, dtype=self.dtype)]
-            self.T_obs_list = [obs_times.to(device=self.device, dtype=self.dtype)]
-            self.T_list = [torch.tensor(float(T), device=self.device, dtype=self.dtype)]
+            self.T_obs_list = [
+                obs_times.to(device=self.device, dtype=self.time_dtype)
+            ]
+            self.T_list = [
+                torch.tensor(float(T), device=self.device, dtype=self.time_dtype)
+            ]
 
         self.S = len(self.x_obs_list)
         self.K = int(self.Q.shape[0])
@@ -352,6 +368,7 @@ class ContinuousTimeAR1HMMSampler:
         self.is_event_time_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.obs_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.true_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.pseudo_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.y_aug_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.initial_y_times_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.initial_y_values_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
@@ -385,7 +402,7 @@ class ContinuousTimeAR1HMMSampler:
             )
         if initial_y_times is not None and initial_y_values is not None:
             initial_y_times = initial_y_times.to(
-                device=self.device, dtype=self.dtype
+                device=self.device, dtype=self.time_dtype
             )
             initial_y_values = initial_y_values.to(
                 device=self.device, dtype=self.dtype
@@ -442,7 +459,9 @@ class ContinuousTimeAR1HMMSampler:
 
         for s in range(self.S):
             initial_state = dist.Categorical(probs=self.initial_state_probs).sample()
-            self.T_true_list[s] = torch.empty(0, dtype=self.dtype, device=self.device)
+            self.T_true_list[s] = torch.empty(
+                0, dtype=self.time_dtype, device=self.device
+            )
             self.z_true_list[s] = initial_state.reshape(1).to(
                 dtype=torch.long, device=self.device
             )
@@ -451,6 +470,7 @@ class ContinuousTimeAR1HMMSampler:
             self.is_event_time_list[s] = None
             self.obs_idx_list[s] = None
             self.true_idx_list[s] = None
+            self.pseudo_idx_list[s] = None
             self.y_aug_list[s] = None
             # A tensor-valued initial path is shared across series by default.
             # Multi-series callers that need different initial paths can assign
@@ -604,6 +624,67 @@ class ContinuousTimeAR1HMMSampler:
             ).log_prob(packed["theta_switching"]).sum()
         return logp
 
+    def _iter_merged_time_sources(
+        self,
+        s: int,
+        *,
+        context: str,
+        sources: Sequence[Tuple[str, torch.Tensor]],
+    ) -> Iterator[Tuple[str, int, float]]:
+        """Yield tagged, strictly increasing times from sorted source tensors."""
+
+        def tagged_records(
+            source_name: str,
+            times: torch.Tensor,
+        ) -> Iterator[Tuple[float, str, int]]:
+            for position, time in enumerate(times):
+                yield (
+                    time.item(),
+                    source_name,
+                    position,
+                )
+
+        streams = []
+        for source_name, source_times in sources:
+            times = source_times.to(
+                device=self.device,
+                dtype=self.time_dtype,
+            )
+            if times.ndim != 1:
+                raise ValueError(
+                    f"{source_name} times for series {s + 1} must be one-dimensional."
+                )
+            if not torch.all(torch.isfinite(times)):
+                raise ValueError(
+                    f"{source_name} times for series {s + 1} must be finite."
+                )
+            if times.numel() > 1 and torch.any(times[1:] <= times[:-1]):
+                bad_position = int(
+                    torch.nonzero(
+                        times[1:] <= times[:-1], as_tuple=False
+                    )[0].item()
+                )
+                raise RuntimeError(
+                    f"{source_name} times for series {s + 1} must be strictly "
+                    f"increasing; positions {bad_position} and {bad_position + 1} "
+                    f"contain {float(times[bad_position].item())} and "
+                    f"{float(times[bad_position + 1].item())}."
+                )
+            streams.append(tagged_records(source_name, times))
+
+        previous_time: Optional[float] = None
+        previous_source: Optional[str] = None
+        merged = heapq.merge(*streams, key=lambda record: record[0])
+        for time_value, source_name, position in merged:
+            if previous_time is not None and time_value == previous_time:
+                raise RuntimeError(
+                    f"Duplicate time {time_value} in {context} merge for series "
+                    f"{s + 1}: sources {previous_source} and {source_name}."
+                )
+            previous_time = time_value
+            previous_source = source_name
+            yield source_name, position, time_value
+
     def build_augmented_grid(
         self,
         s: int,
@@ -617,43 +698,39 @@ class ContinuousTimeAR1HMMSampler:
         if T_true is None or z_true is None:
             raise RuntimeError("Call initialize() before build_augmented_grid().")
 
+        T_true = T_true.to(device=self.device, dtype=self.time_dtype)
+        T_cand = T_cand.to(device=self.device, dtype=self.time_dtype)
+        self.T_true_list[s] = T_true
+
         T_all_values: List[float] = []
         is_event_values: List[bool] = []
         obs_idx_values: List[int] = []
         cand_idx_values: List[int] = []
 
-        # K-way merge of the sorted sets T_true, T_cand, and T_obs.
-        # This avoids building T_all by concatenate+unique and avoids searching
-        # T_all again to mark event times.  Exact ties are collapsed by recording
-        # which source sequences attained the selected next_time.
-        idx_true = 0
-        idx_cand = 0
-        idx_obs = 0
-        idx_all = 0
-        while idx_true < T_true.shape[0] or idx_cand < T_cand.shape[0] or idx_obs < N:
-            t_true = float(T_true[idx_true].item()) if idx_true < T_true.shape[0] else float("inf")
-            t_cand = float(T_cand[idx_cand].item()) if idx_cand < T_cand.shape[0] else float("inf")
-            t_obs = float(T_obs[idx_obs].item()) if idx_obs < N else float("inf")
-
-            next_time = min(t_true, t_cand, t_obs)
-            from_true = t_true == next_time
-            from_cand = t_cand == next_time
-            from_obs = t_obs == next_time
-
-            T_all_values.append(next_time)
-            is_event_values.append(from_true or from_cand)
-
-            if from_true:
-                idx_true += 1
-            if from_cand:
+        sources = (
+            ("T_true", T_true),
+            ("T_cand", T_cand),
+            ("T_obs", T_obs),
+        )
+        for idx_all, (source_name, _, time_value) in enumerate(
+            self._iter_merged_time_sources(
+                s,
+                context="augmented-grid",
+                sources=sources,
+            )
+        ):
+            T_all_values.append(time_value)
+            is_event_values.append(source_name in ("T_true", "T_cand"))
+            if source_name == "T_cand":
                 cand_idx_values.append(idx_all)
-                idx_cand += 1
-            if from_obs:
+            elif source_name == "T_obs":
                 obs_idx_values.append(idx_all)
-                idx_obs += 1
-            idx_all += 1
 
-        T_all = torch.tensor(T_all_values, dtype=self.dtype, device=self.device)
+        T_all = torch.tensor(
+            T_all_values,
+            dtype=self.time_dtype,
+            device=self.device,
+        )
         is_event_time = torch.tensor(is_event_values, dtype=torch.bool, device=self.device)
         obs_idx = torch.tensor(obs_idx_values, dtype=torch.long, device=self.device)
         cand_idx = torch.tensor(cand_idx_values, dtype=torch.long, device=self.device)
@@ -662,27 +739,104 @@ class ContinuousTimeAR1HMMSampler:
         if cand_idx.shape[0] != T_cand.shape[0]:
             raise RuntimeError("Candidate jump time was not found on the merged grid.")
 
+        z_aug = self._expand_true_path_onto_grid(s, T_all)
+        return T_all, z_aug, is_event_time, obs_idx, cand_idx
+
+    def _expand_true_path_onto_grid(
+        self,
+        s: int,
+        times: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return point states with z[j] assigned to interval [times[j-1], times[j]]."""
+        T_true = self.T_true_list[s]
+        z_true = self.z_true_list[s]
+        if T_true is None or z_true is None:
+            raise RuntimeError("Call initialize() before assigning states to a grid.")
+        if times.ndim != 1 or times.shape[0] < 2:
+            raise ValueError("times must be one-dimensional and include 0 and T.")
+
         # Point-state representation on T_all.
         # z_aug[j+1] is the regime on [T_all[j], T_all[j+1]], and z_aug[0]
         # duplicates the first interval state. z_true is not padded: z_true[r] is
         # the regime on true-path segment r.
-        interval_states = torch.empty(T_all.shape[0] - 1, dtype=torch.long, device=self.device)
+        interval_states = torch.empty(
+            times.shape[0] - 1, dtype=torch.long, device=self.device
+        )
         T_true_idx = 0
-        for j in range(T_all.shape[0] - 1):
+        for j in range(times.shape[0] - 1):
             # time at the left of the interval
-            left = T_all[j]
+            left = times[j]
             # T_true_idx is the number of true jumps at or before `left`.
             # The matching true-path state is z_true[T_true_idx].
             while T_true_idx < T_true.shape[0] and T_true[T_true_idx] <= left:
                 T_true_idx += 1
             interval_states[j] = z_true[T_true_idx]
 
-        z_aug = torch.empty(T_all.shape[0], dtype=torch.long, device=self.device)
+        z_aug = torch.empty(times.shape[0], dtype=torch.long, device=self.device)
         # To fit z_aug indices with y_aug indices, duplicate the first interval state
         z_aug[0] = interval_states[0]
         z_aug[1:] = interval_states
+        return z_aug
 
-        return T_all, z_aug, is_event_time, obs_idx, cand_idx
+    def _build_sir_work_grid(
+        self,
+        s: int,
+        T_cand: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Four-way merge T_obs, T_true, old T_pseudo, and new T_cand.
+
+        Returns the temporary union grid, a mask identifying old pseudo points,
+        and a mask identifying new candidate points that require SIR sampling.
+        """
+        old_T_all = self.T_all_list[s]
+        old_pseudo_idx = self.pseudo_idx_list[s]
+        T_true = self.T_true_list[s]
+        if any(
+            value is None
+            for value in (
+                old_T_all,
+                old_pseudo_idx,
+                T_true,
+            )
+        ):
+            raise RuntimeError("The previous augmented grid is incomplete.")
+
+        T_obs = self.T_obs_list[s]
+        old_T_all = old_T_all.to(device=self.device, dtype=self.time_dtype)
+        T_true = T_true.to(device=self.device, dtype=self.time_dtype)
+        T_cand = T_cand.to(device=self.device, dtype=self.time_dtype)
+        self.T_all_list[s] = old_T_all
+        self.T_true_list[s] = T_true
+        T_pseudo = old_T_all[old_pseudo_idx]
+        source_times = (
+            ("T_obs", T_obs),
+            ("T_true", T_true),
+            ("T_pseudo", T_pseudo),
+            ("T_cand", T_cand),
+        )
+
+        times_for_sir: List[float] = []
+        is_old_pseudo: List[bool] = []
+        is_new_candidate: List[bool] = []
+
+        for source_name, _, time_value in self._iter_merged_time_sources(
+            s,
+            context="SIR work-grid",
+            sources=source_times,
+        ):
+            times_for_sir.append(time_value)
+            is_old_pseudo.append(source_name == "T_pseudo")
+            is_new_candidate.append(source_name == "T_cand")
+
+        return (
+            torch.tensor(
+                times_for_sir,
+                dtype=self.time_dtype,
+                device=self.device,
+            ),
+            torch.tensor(is_old_pseudo, dtype=torch.bool, device=self.device),
+            torch.tensor(is_new_candidate, dtype=torch.bool, device=self.device),
+        )
 
     def add_candidate_jumps(self, s: int) -> torch.Tensor:
         """
@@ -694,7 +848,6 @@ class ContinuousTimeAR1HMMSampler:
         """
         T_true = self.T_true_list[s]
         z_true = self.z_true_list[s]
-        T_obs = self.T_obs_list[s]
         T = self.T_list[s]
         if T_true is None or z_true is None:
             raise RuntimeError("Call initialize() before add_candidate_jumps().")
@@ -712,26 +865,30 @@ class ContinuousTimeAR1HMMSampler:
             if rate <= 0.0:
                 raise RuntimeError("omega must be greater than max_k(-Q_kk) to ensure a positive candidate jump rate.")
 
-            num_candidate = torch.poisson(torch.tensor(rate * dt, dtype=self.dtype)).to(torch.long).item()
+            num_candidate = int(
+                torch.poisson(
+                    torch.tensor(rate * dt, dtype=self.time_dtype),
+                    generator=self.rng,
+                ).item()
+            )
             if num_candidate == 0:
                 continue
 
-            u = torch.rand(num_candidate, generator=self.rng, dtype=self.dtype)
+            u = torch.rand(
+                num_candidate,
+                generator=self.rng,
+                dtype=self.time_dtype,
+            )
             times = t0 + dt * u
             cand_times.append(times.to(device=self.device))
         if not cand_times:
-            return torch.empty(0, dtype=self.dtype, device=self.device)
+            return torch.empty(
+                0, dtype=self.time_dtype, device=self.device
+            )
 
-        T_cand = torch.unique(torch.cat(cand_times), sorted=True)
-
-        # Candidate times that exactly coincide with retained grid points are not
-        # newly inserted points.  Keeping them in cand_idx would make SIR skip a
-        # y value that should be copied from the old grid.
-        if T_cand.numel() > 0:
-            retained_times = torch.cat([T_obs.to(device=self.device), T_true.to(device=self.device)])
-            if retained_times.numel() > 0:
-                T_cand = T_cand[~torch.isin(T_cand, retained_times)]
-        return T_cand
+        # Do not silently remove exact duplicates. The source-aware merge checks
+        # them as invariant violations and reports both colliding sources.
+        return torch.sort(torch.cat(cand_times)).values
 
     def _delta_to_n_steps(self, delta: torch.Tensor) -> torch.Tensor:
         """
@@ -740,6 +897,14 @@ class ContinuousTimeAR1HMMSampler:
         The NLE was trained on simulator steps of size `dynamics.dt`, so an
         interval Delta is mapped to the continuous step count Delta / dt.
         """
+        if not torch.all(torch.isfinite(delta)):
+            raise ValueError("Transition time differences must be finite.")
+        if torch.any(delta <= 0):
+            smallest = float(delta.min().detach().cpu().item())
+            raise RuntimeError(
+                "Transition time differences must be strictly positive; "
+                f"smallest delta is {smallest}."
+            )
         return delta / self.dynamics_dt
 
     def observation_logprob(
@@ -955,7 +1120,9 @@ class ContinuousTimeAR1HMMSampler:
             )
             path_boundaries = torch.cat(
                 [
-                    torch.zeros(1, dtype=self.dtype, device=self.device),
+                    torch.zeros(
+                        1, dtype=self.time_dtype, device=self.device
+                    ),
                     T_true_s,
                     self.T_list[s].reshape(1),
                 ]
@@ -1306,9 +1473,9 @@ class ContinuousTimeAR1HMMSampler:
     def _sample_forward_block_particles(
         self,
         left_y: torch.Tensor,
-        block_indices: List[int],
-        new_grid_times: torch.Tensor,
-        new_z_aug: torch.Tensor,
+        left_time: torch.Tensor,
+        block_times: torch.Tensor,
+        block_states: torch.Tensor,
         num_particles: int,
     ) -> torch.Tensor:
         """
@@ -1319,12 +1486,14 @@ class ContinuousTimeAR1HMMSampler:
         """
         particles: List[torch.Tensor] = []
         y_prev = left_y.unsqueeze(0).expand(num_particles, self.D)
-        prev_idx = block_indices[0] - 1
+        previous_time = left_time
 
         with torch.no_grad():
-            for idx in block_indices:
-                delta = new_grid_times[idx] - new_grid_times[prev_idx]
-                theta_batch = self.theta[new_z_aug[idx]].unsqueeze(0).expand(num_particles, self.theta_dim)
+            for block_time, state in zip(block_times, block_states):
+                delta = block_time - previous_time
+                theta_batch = self.theta[state].unsqueeze(0).expand(
+                    num_particles, self.theta_dim
+                )
                 context = self._build_transition_context(
                     theta_batch=theta_batch,
                     y_prev_batch=y_prev,
@@ -1338,7 +1507,7 @@ class ContinuousTimeAR1HMMSampler:
                 )
                 particles.append(y_curr)
                 y_prev = y_curr
-                prev_idx = idx
+                previous_time = block_time
 
         return torch.stack(particles, dim=1)
 
@@ -1490,38 +1659,30 @@ class ContinuousTimeAR1HMMSampler:
         T_all: torch.Tensor,
         z_aug: torch.Tensor,
         is_event_time: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Convert the sampled augmented skeleton back to a true jump path.
+        Partition sampled event points into true and pseudo jumps.
 
-        Only candidate times where the state actually changes are retained as true jumps.
-        Returned z_true is not padded: z_true[r] is the state on true segment r.
-        z_true[j]: state in [T_true[j], T_true[j+1]]
+        Event points with a state change form T_true; self-transition event points
+        form T_pseudo and are represented by `pseudo_idx` into T_all. Returned
+        z_true is not padded: z_true[r] is the state on true segment r.
         """
-        T_true_value: List[float] = []
-        true_idx_value: List[int] = []
-        # z_true[j] is the regime on [T_true[j-1], T_true[j]],
-        # so we start with z_aug[1](equals z_aug[0]).
-        z_true_value: List[int] = [int(z_aug[1].item())]
-
-        # T_all[1], ... T_all[T_all.shape[0] - 2]
-        # z_aug[2], ... z_aug[T_all.shape[0] - 1]
-        for j in range(1, T_all.shape[0] - 1):
-            # not obs, and state changes across this interval
-            if bool(is_event_time[j]):
-                if int(z_aug[j + 1].item()) != int(z_aug[j].item()):
-                    T_true_value.append(float(T_all[j].item()))
-                    true_idx_value.append(j)
-                    z_true_value.append(int(z_aug[j + 1].item()))
-
-        T_true = torch.tensor(T_true_value, dtype=self.dtype, device=self.device)
-        z_true = torch.tensor(z_true_value, dtype=torch.long, device=self.device)
-        true_idx = torch.tensor(
-            true_idx_value,
-            dtype=torch.long,
-            device=self.device,
+        interior_event_idx = torch.nonzero(
+            is_event_time[1:-1], as_tuple=False
+        ).squeeze(-1) + 1
+        state_changed = (
+            z_aug[interior_event_idx + 1] != z_aug[interior_event_idx]
         )
-        return T_true, z_true, true_idx
+        true_idx = interior_event_idx[state_changed]
+        pseudo_idx = interior_event_idx[~state_changed]
+
+        # Index T_all directly so true and pseudo times retain their exact stored
+        # floating-point representations for the next source-aware merge.
+        T_true = T_all[true_idx].clone()
+        z_true = torch.cat(
+            [z_aug[1].reshape(1), z_aug[true_idx + 1]]
+        ).to(dtype=torch.long, device=self.device)
+        return T_true, z_true, true_idx, pseudo_idx
 
     def one_sweep(self) -> Dict[str, Any]:
         """Run one Gibbs sweep: augment grid, sample y, z, theta, tau, and Q."""
@@ -1547,7 +1708,12 @@ class ContinuousTimeAR1HMMSampler:
             self.obs_idx_list[s] = obs_idx
             self.y_aug_list[s] = self.sample_y_nuts(s, y_nuts_init)
             self.z_aug_list[s] = self.sample_z_ffbs(s)
-            self.T_true_list[s], self.z_true_list[s], self.true_idx_list[s] = self.prune_self_transitions(
+            (
+                self.T_true_list[s],
+                self.z_true_list[s],
+                self.true_idx_list[s],
+                self.pseudo_idx_list[s],
+            ) = self.prune_self_transitions(
                 T_all=T_all,
                 z_aug=self.z_aug_list[s],
                 is_event_time=is_event_time,
@@ -1713,9 +1879,10 @@ class ContinuousTimeAR1HMMSampler:
         """
         Sample newly inserted y values by forward SIR.
 
-        Points corresponding to old observations and old retained true jumps keep
-        their previous y values. For each contiguous block of inserted candidate
-        times, use
+        T_obs, T_true, old T_pseudo, and new T_cand are merged while retaining
+        source indices. Every old-grid point temporarily keeps its previous y
+        value. New candidate times between adjacent old-grid points form inserted
+        blocks. For each such block, use
 
             q(block) = p(block | y_left)
 
@@ -1724,7 +1891,9 @@ class ContinuousTimeAR1HMMSampler:
             p(block, y_right | y_left)
               = p(block | y_left) p(y_right | block_last),
 
-        so SIR weights only require the right-boundary likelihood.
+        so SIR weights only require the right-boundary likelihood. After all new
+        values are sampled, only values on `new_grid_times` are returned; old-only
+        candidate points have served as bridge endpoints and are then marginalized.
         """
         num_particles = int(self.sir_config["num_particles"])
         if num_particles < 1:
@@ -1735,42 +1904,40 @@ class ContinuousTimeAR1HMMSampler:
 
         self.last_sir_cand_particles = []
 
-        old_T_all = self.T_all_list[s]
         old_y_aug = self.y_aug_list[s]
-        old_obs_idx = self.obs_idx_list[s]
-        old_true_idx = self.true_idx_list[s]
 
-        if old_T_all is None or old_y_aug is None or old_obs_idx is None:
+        if self.T_all_list[s] is None or old_y_aug is None:
             return self._initialize_y_on_grid(s, new_grid_times), {
                 "num_particles": float(num_particles),
                 "min_ess": float("nan"),
                 "mean_ess": float("nan"),
             }
 
-        inserted_idx = new_cand_idx
-        inserted_idx_set = set(inserted_idx.tolist())
+        if new_z_aug.shape[0] != new_grid_times.shape[0]:
+            raise ValueError("new_z_aug and new_grid_times must have equal length.")
 
-        retained_old_idx_list = old_obs_idx.tolist()
-        if old_true_idx is not None and old_true_idx.numel() > 0:
-            retained_old_idx_list.extend(old_true_idx.tolist())
-        retained_old_idx_list = sorted(set(retained_old_idx_list))
-        retained_old_idx_tensor = torch.tensor(retained_old_idx_list, dtype=torch.long, device=self.device)
-        retained_old_times = old_T_all[retained_old_idx_tensor]
+        T_cand = new_grid_times[new_cand_idx]
+        times_for_sir, is_old_pseudo, is_new_candidate = (
+            self._build_sir_work_grid(s, T_cand)
+        )
+        work_z_aug = self._expand_true_path_onto_grid(s, times_for_sir)
+        y_work = torch.empty(
+            times_for_sir.shape[0], self.D, dtype=self.dtype, device=self.device
+        )
+        has_old_y = ~is_new_candidate
+        y_work[has_old_y] = old_y_aug.to(
+            device=self.device, dtype=self.dtype
+        )
+        if torch.any(~has_old_y & ~is_new_candidate):
+            raise RuntimeError(
+                "A temporary-grid point had neither an old y nor a new candidate source."
+            )
 
-        y_sample = torch.empty(new_grid_times.shape[0], self.D, dtype=self.dtype, device=self.device)
-        retained_old_ptr = 0
-        for new_idx in range(new_grid_times.shape[0]):
-            # Candidate times are filled by SIR below.
-            if new_idx in inserted_idx_set:
-                continue
-            if retained_old_ptr >= retained_old_times.shape[0]:
-                raise RuntimeError("Ran out of retained old grid points while matching the new grid.")
-            if retained_old_times[retained_old_ptr].item() != new_grid_times[new_idx].item():
-                raise RuntimeError("Non-candidate point on the new grid did not match the retained old grid.")
-            y_sample[new_idx] = old_y_aug[retained_old_idx_tensor[retained_old_ptr]].to(device=self.device, dtype=self.dtype)
-            retained_old_ptr += 1
-
+        inserted_idx = torch.nonzero(is_new_candidate, as_tuple=False).squeeze(-1)
         if inserted_idx.numel() == 0:
+            y_sample = y_work[~is_old_pseudo]
+            if y_sample.shape[0] != new_grid_times.shape[0]:
+                raise RuntimeError("Four-way merge produced the wrong new-grid size.")
             return y_sample, {
                 "num_particles": float(num_particles),
                 "min_ess": float("nan"),
@@ -1780,46 +1947,50 @@ class ContinuousTimeAR1HMMSampler:
         ess_values: List[float] = []
         sir_cand_particles: List[Dict[str, torch.Tensor]] = []
 
-        inserted_idx_values = inserted_idx.tolist()
-        block_start = inserted_idx_values[0]
-        block_end = inserted_idx_values[0]
-        inserted_blocks: List[Tuple[int, int]] = []
-        # Making inserted_blocks
-        for idx in inserted_idx_values[1:]:
-            if idx == block_end + 1:
-                block_end = idx
-            else:
-                inserted_blocks.append((block_start, block_end))
-                block_start = idx
-                block_end = idx
-        inserted_blocks.append((block_start, block_end))
+        block_start = 0
+        while block_start < inserted_idx.shape[0]:
+            block_end = block_start + 1
+            while (
+                block_end < inserted_idx.shape[0]
+                and int(inserted_idx[block_end].item())
+                == int(inserted_idx[block_end - 1].item()) + 1
+            ):
+                block_end += 1
 
-        for block_start, block_end in inserted_blocks:
-            left_idx = block_start - 1
-            right_idx = block_end + 1
-            if left_idx < 0 or right_idx >= new_grid_times.shape[0]:
-                raise RuntimeError("Inserted block must be bracketed by retained grid points.")
+            block_work_idx = inserted_idx[block_start:block_end]
+            left_idx = int(block_work_idx[0].item()) - 1
+            right_idx = int(block_work_idx[-1].item()) + 1
+            if left_idx < 0 or right_idx >= times_for_sir.shape[0]:
+                raise RuntimeError("Inserted block must be bracketed by old-grid points.")
+            if not bool(has_old_y[left_idx]) or not bool(has_old_y[right_idx]):
+                raise RuntimeError("Inserted block endpoints must carry old y values.")
+
+            block_times = times_for_sir[block_work_idx]
+            block_states = work_z_aug[block_work_idx]
 
             # particles: (num_particles, block_size, D)
             particles = self._sample_forward_block_particles(
-                left_y=y_sample[left_idx],
-                block_indices=list(range(block_start, block_end + 1)),
-                new_grid_times=new_grid_times,
-                new_z_aug=new_z_aug,
+                left_y=y_work[left_idx],
+                left_time=times_for_sir[left_idx],
+                block_times=block_times,
+                block_states=block_states,
                 num_particles=num_particles,
             )
-            block_time = new_grid_times[block_start : block_end + 1].detach().cpu()
             sir_cand_particles.append(
                 {
-                    "times": block_time,
+                    "times": block_times.detach().cpu(),
                     "particles": particles.detach().cpu(),
                 }
             )
 
-            right_y = y_sample[right_idx].unsqueeze(0).expand(num_particles, self.D)
+            right_y = y_work[right_idx].unsqueeze(0).expand(
+                num_particles, self.D
+            )
             last_particle = particles[:, -1, :]
-            right_delta = new_grid_times[right_idx] - new_grid_times[block_end]
-            right_theta = self.theta[new_z_aug[right_idx]].unsqueeze(0).expand(num_particles, self.theta_dim)
+            right_delta = times_for_sir[right_idx] - block_times[-1]
+            right_theta = self.theta[work_z_aug[right_idx]].unsqueeze(0).expand(
+                num_particles, self.theta_dim
+            )
             with torch.no_grad():
                 log_weights = self._evaluate_batched_transition_logprobs(
                     y_prev_batch=last_particle,
@@ -1833,14 +2004,19 @@ class ContinuousTimeAR1HMMSampler:
             ess_values.append(float(ess.detach().cpu().item()))
 
             chosen = dist.Categorical(probs=weights).sample()
-            y_sample[block_start : block_end + 1] = particles[chosen]
+            y_work[block_work_idx] = particles[chosen]
             sir_cand_particles[-1]["weights"] = weights.detach().cpu()
             sir_cand_particles[-1]["chosen"] = chosen.detach().cpu().reshape(())
+            block_start = block_end
 
         ess_tensor = torch.tensor(ess_values, dtype=self.dtype)
         min_ess = float(ess_tensor.min().item())
         mean_ess = float(ess_tensor.mean().item())
         self.last_sir_cand_particles = sir_cand_particles
+
+        y_sample = y_work[~is_old_pseudo]
+        if y_sample.shape[0] != new_grid_times.shape[0]:
+            raise RuntimeError("Four-way merge produced the wrong new-grid size.")
 
         return y_sample, {
             "num_particles": float(num_particles),
