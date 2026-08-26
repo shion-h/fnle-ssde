@@ -162,6 +162,81 @@ class LotkaVolterraDynamics(Dynamics):
         ], device=self.device, dtype=torch.float32)
 
 
+class SIRDynamics(Dynamics):
+    r"""Chemical-Langevin susceptible-infected-recovered dynamics.
+
+    For a fixed population size ``N``, the state is ``x = (S, I, R)`` and
+
+        dS_t = -a_t dt - sqrt(a_t) dW_t^(infection),
+        dI_t = (a_t - r_t) dt
+               + sqrt(a_t) dW_t^(infection)
+               - sqrt(r_t) dW_t^(recovery),
+        dR_t = r_t dt + sqrt(r_t) dW_t^(recovery),
+
+    where ``a_t = beta S_t I_t / N`` and ``r_t = gamma I_t``. The
+    unconstrained parameter vector is ``theta = (log beta, log gamma)``.
+    Euler-Maruyama proposals are projected onto the nonnegative simplex so
+    that ``S + I + R = N`` remains true numerically.
+    """
+
+    theta_transform = ExpTransform()
+
+    def __init__(
+        self,
+        dt: float = 0.01,
+        population_size: float = 1_000.0,
+        device: str = "cpu",
+    ):
+        super().__init__(dt, device)
+        self.x_dim = 3
+        self.theta_dim = 2
+        self.population_size = population_size
+
+    def split_theta(
+        self, theta: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Both reaction rates enter the drift and diffusion terms."""
+        return theta, theta
+
+    def drift(
+        self, x: torch.Tensor, theta_drift: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the SIR drift vector."""
+        beta, gamma = theta_drift
+        susceptible, infected, _ = x
+        infection = beta * susceptible * infected / self.population_size
+        recovery = gamma * infected
+        return torch.stack((-infection, infection - recovery, recovery))
+
+    def diffusion(
+        self, x: torch.Tensor, theta_diffusion: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the 3 x 3 reaction-noise loading matrix."""
+        beta, gamma = theta_diffusion
+        susceptible, infected, _ = x
+        infection = torch.sqrt(
+            (beta * susceptible * infected / self.population_size).clamp_min(0.0)
+        )
+        recovery = torch.sqrt((gamma * infected).clamp_min(0.0))
+        zero = torch.zeros_like(infection)
+        return torch.stack(
+            (
+                torch.stack((-infection, zero, zero)),
+                torch.stack((infection, -recovery, zero)),
+                torch.stack((zero, recovery, zero)),
+            )
+        )
+
+    def simulate_one_step(
+        self, x: torch.Tensor, theta: torch.Tensor
+    ) -> torch.Tensor:
+        """Take one step while preserving nonnegativity and population size."""
+        proposal = super().simulate_one_step(x, theta).clamp_min(0.0)
+        return proposal * (
+            self.population_size / proposal.sum().clamp_min(1e-8)
+        )
+
+
 class FluoreChemicalLangevinDynamics(Dynamics):
     r"""One-dimensional fluorescence chemical Langevin dynamics.
 
