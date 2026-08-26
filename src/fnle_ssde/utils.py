@@ -48,6 +48,7 @@ def build_spline_nle(
     hidden_features: int = 50,
     num_transforms: int = 5,
     num_bins: int = 10,
+    training_data_cache_path: Path | None = None,
 ) -> NLEEstimator:
     """Load an NLE cache or train an NSF from a spline through observations."""
     if theta_lower.shape != theta_upper.shape:
@@ -99,6 +100,7 @@ def build_spline_nle(
         state_clamp_bounds=(0.0, 1e4),
         noisy_init_strategy=noisy_init_strategy,
         max_noisy_init_attempts=1_000,
+        training_data_cache_path=training_data_cache_path,
     )
     return nle
 
@@ -158,9 +160,12 @@ def initialize_gibbs_sampler(
     initial_theta: torch.Tensor | None = None,
     initial_log_tau: torch.Tensor | None = None,
     y0_prior_scale: float | torch.Tensor = 0.5,
+    y_mh_config: dict[str, Any] | None = None,
+    theta_mh_config: dict[str, Any] | None = None,
     y_tree_depth: int = 3,
     theta_tree_depth: int = 3,
     sir_particles: int = 100,
+    use_t_pseudo_in_sir: bool = True,
     latest_sample_path: Path | str | None = None,
     theta_prior: Distribution | None = None,
     time_dtype: torch.dtype = torch.float64,
@@ -173,6 +178,9 @@ def initialize_gibbs_sampler(
 
     ``time_dtype`` controls only observation, jump, candidate, and augmented-grid
     times. Model states, parameters, and NLE calls remain float32.
+
+    Set ``use_t_pseudo_in_sir=False`` to marginalize the previous sweep's pseudo
+    points rather than retaining their y values as SIR bridge boundaries.
     """
     from .continuous import ContinuousTimeAR1HMMSampler
 
@@ -215,12 +223,28 @@ def initialize_gibbs_sampler(
         omega_scale=3.0,
         nle_estimator=nle,
         switching_parameter_mask=switching_mask,
-        y_nuts_config={"max_tree_depth": y_tree_depth, "target_accept_prob": 0.8},
-        theta_nuts_config={
-            "max_tree_depth": theta_tree_depth,
-            "target_accept_prob": 0.8,
+        y_mh_config=(
+            y_mh_config
+            if y_mh_config is not None
+            else {
+                "method": "nuts",
+                "max_tree_depth": y_tree_depth,
+                "target_accept_prob": 0.8,
+            }
+        ),
+        theta_mh_config=(
+            theta_mh_config
+            if theta_mh_config is not None
+            else {
+                "method": "nuts",
+                "max_tree_depth": theta_tree_depth,
+                "target_accept_prob": 0.8,
+            }
+        ),
+        sir_config={
+            "num_particles": sir_particles,
+            "use_t_pseudo_in_sir": use_t_pseudo_in_sir,
         },
-        sir_config={"num_particles": sir_particles},
         prior_config=prior_config,
         theta_prior=theta_prior,
         y0_prior_loc=x_obs[0],

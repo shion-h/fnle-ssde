@@ -334,6 +334,7 @@ class NLEEstimator:
               x_obs: torch.Tensor | None = None,
               reference_times: torch.Tensor | None = None,
               spline_clamp_bounds: tuple[float | None, float | None] | None = (0.0, None),
+              training_data_cache_path: PathLike | None = None,
               ) -> 'NLEEstimator':
         """
         Train the NLE estimator.
@@ -367,6 +368,9 @@ class NLEEstimator:
             x_obs: Observations with shape (N, observed_dim).
             reference_times: Grid on which the spline reference path is evaluated.
             spline_clamp_bounds: Optional bounds applied to the spline path.
+            training_data_cache_path: Optional separate cache for generated
+                training tensors. This allows interrupted training to restart
+                without rerunning the simulator.
         """
         spline_inputs = (obs_times, x_obs, reference_times)
         if x_ref is None:
@@ -393,6 +397,21 @@ class NLEEstimator:
         xt_data = None
         ctx_data = None
         x_ref_shape = tuple(x_ref.shape)
+        training_data_cache_path = (
+            Path(training_data_cache_path)
+            if training_data_cache_path is not None
+            else None
+        )
+
+        if training_data_cache_path is not None and training_data_cache_path.exists():
+            print(f"Loading cached training data from {training_data_cache_path}...")
+            training_data_cache = torch.load(
+                training_data_cache_path,
+                map_location=self.device,
+                weights_only=False,
+            )
+            xt_data = training_data_cache["xt_data"]
+            ctx_data = training_data_cache["ctx_data"]
 
         if self.model_cache_path is not None and self.model_cache_path.exists():
             cache = self._load_model_cache(self.model_cache_path)
@@ -435,6 +454,16 @@ class NLEEstimator:
                 noisy_init_strategy=noisy_init_strategy,
                 max_noisy_init_attempts=max_noisy_init_attempts,
             )
+            if training_data_cache_path is not None:
+                training_data_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "xt_data": xt_data.detach().cpu(),
+                        "ctx_data": ctx_data.detach().cpu(),
+                    },
+                    training_data_cache_path,
+                )
+                print(f"Saved training data to {training_data_cache_path}")
         print(f"Data generation took {time.time() - start_time:.2f}s,"
               f"samples: {len(ctx_data)}")
         
