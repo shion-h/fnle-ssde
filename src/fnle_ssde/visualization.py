@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+from matplotlib.text import Text
 import numpy as np
 import torch
 
@@ -176,9 +177,20 @@ def plot_parameter_bars(
     ax.tick_params(axis="x", labelsize=7)
 
 
-def save_figure(fig: plt.Figure, path: Path, *, dpi: int = 300) -> None:
-    """Save and close a Matplotlib figure."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+def save_figure(
+    fig: plt.Figure,
+    path: Path,
+    *,
+    dpi: int = 300,
+    additional_paths: tuple[Path, ...] = (),
+    font_scale: float = 1.0,
+) -> None:
+    """Save one figure to one or more paths, then close it."""
+    if font_scale != 1.0:
+        for text in fig.findobj(Text):
+            text.set_fontsize(text.get_fontsize() * font_scale)
+    for output in (path, *additional_paths):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=dpi, bbox_inches="tight")
+        print(f"saved: {output}")
     plt.close(fig)
-    print(f"saved: {path}")
