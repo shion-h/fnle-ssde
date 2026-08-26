@@ -3,9 +3,10 @@ Continuous-time AR(1)-HMM Gibbs sampler in a single research-oriented file.
 
 This implementation combines:
 1. Uniformization / candidate jumps for the continuous-time discrete state path z(t)
-2. Conditional NUTS updates for the continuous latent trajectory y on an augmented grid
+2. Conditional NUTS or MALA updates for the continuous latent trajectory y
+   on an augmented grid
 3. FFBS updates for the discrete state skeleton on the same augmented grid
-4. Conditional NUTS updates for the NLE transition parameters
+4. Conditional NUTS or MALA updates for the NLE transition parameters
 5. Conjugate Gibbs updates for the diagonal observation noise
 6. Conjugate Gibbs updates for the CTMC generator Q
 
@@ -35,7 +36,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import pyro
 import pyro.distributions as dist
-from pyro.infer import MCMC, NUTS
+from pyro.infer import HMC, MCMC, NUTS
 import torch
 from torch.distributions import Distribution, constraints
 
@@ -71,8 +72,8 @@ class ContinuousTimeAR1HMMSampler:
         *,
         omega_scale: float = 1.5,
         nle_estimator: Any,
-        y_nuts_config: Optional[Dict[str, Any]] = None,
-        theta_nuts_config: Optional[Dict[str, Any]] = None,
+        y_mh_config: Optional[Dict[str, Any]] = None,
+        theta_mh_config: Optional[Dict[str, Any]] = None,
         sir_config: Optional[Dict[str, Any]] = None,
         prior_config: Optional[Dict[str, Any]] = None,
         theta_prior: Optional[Distribution] = None,
@@ -104,10 +105,19 @@ class ContinuousTimeAR1HMMSampler:
         nle_estimator:
             Trained/loaded NLEEstimator. Transition log densities are evaluated by
             `nle_estimator.transition_log_prob`.
-        y_nuts_config / theta_nuts_config:
-            Pyro NUTS settings used for the conditional updates.
+        y_mh_config / theta_mh_config:
+            MH settings for the corresponding conditional update. Set ``method``
+            to ``"nuts"`` and provide ``max_tree_depth`` and
+            ``target_accept_prob``, or set it to ``"mala"`` and provide
+            ``step_size``. MALA uses one-step Pyro HMC; its step size is the
+            leapfrog epsilon, so the equivalent Langevin proposal has noise
+            variance epsilon squared. Exactly one MH transition is performed per
+            Gibbs sweep.
         sir_config:
-            Settings for SIR initialization of y at newly inserted candidate times.
+            Settings for SIR initialization of y at newly inserted candidate
+            times. ``num_particles`` controls the number of particles.
+            ``use_t_pseudo_in_sir`` determines whether y values at the previous
+            sweep's pseudo-event times are retained as bridge boundaries.
         prior_config:
             Prior hyperparameters for theta and observation-noise variance.
             `theta_loc` and `theta_scale` define the legacy Normal prior in the
@@ -280,9 +290,9 @@ class ContinuousTimeAR1HMMSampler:
         if hasattr(self.flow_model, "requires_grad_"):
             # The trained NLE is a fixed density inside Gibbs inference.  Keeping
             # its weights differentiable makes PyTorch retain unnecessary
-            # autograd tensors across repeated one-step NUTS runs.  Freezing the
+            # autograd tensors across repeated one-step MCMC runs. Freezing the
             # weights still permits gradients with respect to y and theta, which
-            # are the variables sampled by NUTS.
+            # are the variables sampled by NUTS or MALA.
             self.flow_model.requires_grad_(False)
 
         if self.Q.shape != (self.K, self.K):
@@ -307,27 +317,23 @@ class ContinuousTimeAR1HMMSampler:
         self.B = torch.empty_like(self.Q)
         self._refresh_uniformization()
 
-        self.y_nuts_config = {
-            "max_tree_depth": 4,
-            "target_accept_prob": 0.8,
-        }
-        if y_nuts_config is not None:
-            self.y_nuts_config.update(y_nuts_config)
-
-        self.theta_nuts_config = {
-            "max_tree_depth": 4,
-            "target_accept_prob": 0.8,
-            "warmup_steps": 0,
-            "num_samples": 1,
-        }
-        if theta_nuts_config is not None:
-            self.theta_nuts_config.update(theta_nuts_config)
+        self.y_mh_config = self._prepare_mh_config(y_mh_config, "y_mh_config")
+        self.theta_mh_config = self._prepare_mh_config(
+            theta_mh_config, "theta_mh_config"
+        )
+        self._last_y_mh_diagnostics: List[Optional[Dict[str, Any]]] = [
+            None for _ in range(self.S)
+        ]
+        self._last_theta_mh_diagnostics: Optional[Dict[str, Any]] = None
 
         self.sir_config = {
             "num_particles": 64,
+            "use_t_pseudo_in_sir": True,
         }
         if sir_config is not None:
             self.sir_config.update(sir_config)
+        if not isinstance(self.sir_config["use_t_pseudo_in_sir"], bool):
+            raise TypeError("sir_config['use_t_pseudo_in_sir'] must be a bool.")
 
         self.prior_config = {
             "theta_loc": 0.0,
@@ -373,6 +379,52 @@ class ContinuousTimeAR1HMMSampler:
         self.initial_y_times_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.initial_y_values_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.initial_state_probs = torch.full((self.K,), 1.0 / self.K, dtype=self.dtype, device=self.device)
+
+    @staticmethod
+    def _prepare_mh_config(
+        config: Optional[Dict[str, Any]],
+        argument_name: str,
+    ) -> Dict[str, Any]:
+        supplied = dict(config) if config is not None else {}
+        method = supplied.pop("method", "nuts")
+        if method not in {"nuts", "mala"}:
+            raise ValueError(
+                f'{argument_name}["method"] must be either "nuts" or "mala".'
+            )
+        if method == "nuts":
+            prepared = {
+                "method": "nuts",
+                "max_tree_depth": 4,
+                "target_accept_prob": 0.8,
+            }
+            allowed_keys = {"max_tree_depth", "target_accept_prob"}
+        else:
+            prepared = {"method": "mala", "step_size": 0.01}
+            allowed_keys = {"step_size"}
+        unknown_keys = set(supplied) - allowed_keys
+        if unknown_keys:
+            unknown = ", ".join(sorted(unknown_keys))
+            raise ValueError(f"Unknown {argument_name} setting(s): {unknown}.")
+        prepared.update(supplied)
+        if method == "mala":
+            step_size = float(prepared["step_size"])
+            if not torch.isfinite(torch.tensor(step_size)) or step_size <= 0.0:
+                raise ValueError(
+                    f"{argument_name}['step_size'] must be finite and positive."
+                )
+        return prepared
+
+    @staticmethod
+    def _kernel_diagnostics(mcmc: MCMC, method: str) -> Dict[str, Any]:
+        # MCMC stores the kernel diagnostics before terminating and cleaning up
+        # the kernel. Calling kernel.diagnostics() after run() is therefore not
+        # reliable in Pyro 1.9.1.
+        diagnostics = mcmc._diagnostics[0]
+        return {
+            "method": method,
+            "acceptance_rate": float(diagnostics["acceptance rate"]),
+            "divergences": list(diagnostics["divergences"]),
+        }
 
     def initialize(
         self,
@@ -557,7 +609,7 @@ class ContinuousTimeAR1HMMSampler:
             )
 
     def _pack_theta(self, theta: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Pack expanded theta (K, P) into the non-redundant NUTS variables."""
+        """Pack expanded theta (K, P) into non-redundant MCMC variables."""
         packed: Dict[str, torch.Tensor] = {}
         if torch.any(self.shared_parameter_mask):
             packed["theta_shared"] = theta[0, self.shared_parameter_mask].clone()
@@ -568,7 +620,7 @@ class ContinuousTimeAR1HMMSampler:
         return packed
 
     def _expand_theta(self, packed: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Expand non-redundant NUTS variables to theta with shape (K, P)."""
+        """Expand non-redundant MCMC variables to theta with shape (K, P)."""
         columns: List[torch.Tensor] = []
         shared_index = 0
         switching_index = 0
@@ -783,10 +835,12 @@ class ContinuousTimeAR1HMMSampler:
         s: int,
         T_cand: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Four-way merge T_obs, T_true, old T_pseudo, and new T_cand.
+        """Merge retained old boundaries and new candidate times for SIR.
 
-        Returns the temporary union grid, a mask identifying old pseudo points,
-        and a mask identifying new candidate points that require SIR sampling.
+        By default this is the four-way union of T_obs, T_true, old T_pseudo,
+        and new T_cand. If ``use_t_pseudo_in_sir`` is false, old T_pseudo is
+        omitted. The returned masks identify old pseudo points and new candidate
+        points, respectively.
         """
         old_T_all = self.T_all_list[s]
         old_pseudo_idx = self.pseudo_idx_list[s]
@@ -808,12 +862,13 @@ class ContinuousTimeAR1HMMSampler:
         self.T_all_list[s] = old_T_all
         self.T_true_list[s] = T_true
         T_pseudo = old_T_all[old_pseudo_idx]
-        source_times = (
+        source_times = [
             ("T_obs", T_obs),
             ("T_true", T_true),
-            ("T_pseudo", T_pseudo),
-            ("T_cand", T_cand),
-        )
+        ]
+        if self.sir_config["use_t_pseudo_in_sir"]:
+            source_times.append(("T_pseudo", T_pseudo))
+        source_times.append(("T_cand", T_cand))
 
         times_for_sir: List[float] = []
         is_old_pseudo: List[bool] = []
@@ -1219,28 +1274,59 @@ class ContinuousTimeAR1HMMSampler:
         finally:
             temporary_path.unlink(missing_ok=True)
 
-    def sample_y_nuts(
+    def _run_mh_transition(
+        self,
+        *,
+        potential_fn: Any,
+        initial_params: Dict[str, torch.Tensor],
+        config: Dict[str, Any],
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+        """Run one configured Pyro MH transition and return its final position."""
+        pyro.clear_param_store()
+        method = config["method"]
+        if method == "nuts":
+            kernel = NUTS(
+                potential_fn=potential_fn,
+                max_tree_depth=config["max_tree_depth"],
+                target_accept_prob=config["target_accept_prob"],
+            )
+        else:
+            kernel = HMC(
+                potential_fn=potential_fn,
+                step_size=float(config["step_size"]),
+                num_steps=1,
+                adapt_step_size=False,
+                adapt_mass_matrix=False,
+            )
+
+        mcmc = MCMC(
+            kernel,
+            warmup_steps=0,
+            num_samples=1,
+            initial_params=initial_params,
+            disable_progbar=True,
+        )
+        mcmc.run()
+        final_params = {
+            name: values[-1].detach()
+            for name, values in mcmc.get_samples().items()
+        }
+        return final_params, self._kernel_diagnostics(mcmc, method)
+
+    def sample_y_mh(
         self,
         s: int,
         y_init: torch.Tensor,
-        max_tree_depth: Optional[int] = None,
-        target_accept_prob: Optional[float] = None,
     ) -> torch.Tensor:
-        """Sample the full augmented latent path y_aug with one-step Pyro NUTS."""
+        """Apply the selected MH transition to the full augmented latent path."""
         T_all = self.T_all_list[s]
         z_aug = self.z_aug_list[s]
         obs_idx = self.obs_idx_list[s]
         x_obs = self.x_obs_list[s]
         if T_all is None or z_aug is None or obs_idx is None:
-            raise RuntimeError("Sampler must be initialized before sample_y_nuts().")
+            raise RuntimeError("Sampler must be initialized before sample_y_mh().")
         if self.theta is None or self.log_tau is None:
             raise RuntimeError("Sampler parameters have not been initialized.")
-
-        y_nuts_config = dict(self.y_nuts_config)
-        if max_tree_depth is not None:
-            y_nuts_config["max_tree_depth"] = max_tree_depth
-        if target_accept_prob is not None:
-            y_nuts_config["target_accept_prob"] = target_accept_prob
 
         def y_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
             return -self.logprob_y_given_z_theta(
@@ -1253,68 +1339,42 @@ class ContinuousTimeAR1HMMSampler:
                 log_tau=self.log_tau,
             )
 
-        pyro.clear_param_store()
-        kernel = NUTS(
+        samples, diagnostics = self._run_mh_transition(
             potential_fn=y_potential_fn,
-            max_tree_depth=y_nuts_config["max_tree_depth"],
-            target_accept_prob=y_nuts_config["target_accept_prob"],
-        )
-        mcmc = MCMC(
-            kernel,
-            warmup_steps=0,
-            num_samples=1,
             initial_params={"y_aug": y_init},
-            disable_progbar=True,
+            config=self.y_mh_config,
         )
-        mcmc.run()
-        samples = mcmc.get_samples()["y_aug"]
-        return samples[-1].detach()
+        self._last_y_mh_diagnostics[s] = diagnostics
+        return samples["y_aug"]
 
-    def sample_theta_nuts(
-        self,
-        max_tree_depth: Optional[int] = None,
-        target_accept_prob: Optional[float] = None,
-    ) -> torch.Tensor:
-        """Sample theta with one-step Pyro NUTS."""
+    def sample_theta_mh(self) -> torch.Tensor:
+        """Apply the selected MH transition to the non-fixed theta coordinates."""
         for s in range(self.S):
             if self.T_all_list[s] is None or self.z_aug_list[s] is None or self.y_aug_list[s] is None:
-                raise RuntimeError("Sampler must be initialized before sample_theta_nuts().")
+                raise RuntimeError("Sampler must be initialized before sample_theta_mh().")
         if self.theta is None:
             raise RuntimeError("Sampler theta has not been initialized.")
+        method = self.theta_mh_config["method"]
         if not (
             torch.any(self.shared_parameter_mask)
             or torch.any(self.switching_parameter_mask)
         ):
+            self._last_theta_mh_diagnostics = {
+                "method": method,
+                "skipped": True,
+            }
             return self.theta.clone()
-
-        theta_nuts_config = dict(self.theta_nuts_config)
-        if max_tree_depth is not None:
-            theta_nuts_config["max_tree_depth"] = max_tree_depth
-        if target_accept_prob is not None:
-            theta_nuts_config["target_accept_prob"] = target_accept_prob
 
         def theta_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
             theta = self._expand_theta(params)
             return -self._logprob_theta_all_series(theta)
 
-        pyro.clear_param_store()
-        kernel = NUTS(
+        packed_sample, diagnostics = self._run_mh_transition(
             potential_fn=theta_potential_fn,
-            max_tree_depth=theta_nuts_config["max_tree_depth"],
-            target_accept_prob=theta_nuts_config["target_accept_prob"],
-        )
-        mcmc = MCMC(
-            kernel,
-            warmup_steps=theta_nuts_config["warmup_steps"],
-            num_samples=theta_nuts_config["num_samples"],
             initial_params=self._pack_theta(self.theta),
-            disable_progbar=True,
+            config=self.theta_mh_config,
         )
-        mcmc.run()
-        samples = mcmc.get_samples()
-        packed_sample = {
-            name: values[-1] for name, values in samples.items()
-        }
+        self._last_theta_mh_diagnostics = diagnostics
         return self._expand_theta(packed_sample).detach()
 
     def sample_log_tau(self) -> torch.Tensor:
@@ -1696,7 +1756,7 @@ class ContinuousTimeAR1HMMSampler:
         for s in range(self.S):
             T_cand = self.add_candidate_jumps(s)
             T_all, z_aug, is_event_time, obs_idx, cand_idx = self.build_augmented_grid(s, T_cand)
-            y_nuts_init, sir_info = self._sample_inserted_y_by_forward_sir(
+            y_mh_init, sir_info = self._sample_inserted_y_by_forward_sir(
                 new_grid_times=T_all,
                 new_z_aug=z_aug,
                 new_cand_idx=cand_idx,
@@ -1706,7 +1766,7 @@ class ContinuousTimeAR1HMMSampler:
             self.z_aug_list[s] = z_aug
             self.is_event_time_list[s] = is_event_time
             self.obs_idx_list[s] = obs_idx
-            self.y_aug_list[s] = self.sample_y_nuts(s, y_nuts_init)
+            self.y_aug_list[s] = self.sample_y_mh(s, y_mh_init)
             self.z_aug_list[s] = self.sample_z_ffbs(s)
             (
                 self.T_true_list[s],
@@ -1730,7 +1790,7 @@ class ContinuousTimeAR1HMMSampler:
                 }
             )
 
-        self.theta = self.sample_theta_nuts()
+        self.theta = self.sample_theta_mh()
         self.log_tau = self.sample_log_tau()
         self.Q = self.sample_Q()
         self._refresh_uniformization()
@@ -1753,11 +1813,21 @@ class ContinuousTimeAR1HMMSampler:
             "num_true_segments": sum(info["num_true_segments"] for info in per_series_info),
             "per_series": per_series_info,
             "sir_num_particles": self.sir_config["num_particles"],
+            "use_t_pseudo_in_sir": self.sir_config["use_t_pseudo_in_sir"],
             "sir_min_ess": min(finite_min_ess) if finite_min_ess else float("nan"),
             "sir_mean_ess": (
                 sum(finite_mean_ess) / len(finite_mean_ess)
                 if finite_mean_ess
                 else float("nan")
+            ),
+            "y_mh": [
+                dict(diagnostics) if diagnostics is not None else None
+                for diagnostics in self._last_y_mh_diagnostics
+            ],
+            "theta_mh": (
+                dict(self._last_theta_mh_diagnostics)
+                if self._last_theta_mh_diagnostics is not None
+                else None
             ),
             "log_tau_update": "conjugate_inverse_gamma_gibbs",
             "Q_update": "conjugate_gamma_gibbs",
@@ -1879,10 +1949,11 @@ class ContinuousTimeAR1HMMSampler:
         """
         Sample newly inserted y values by forward SIR.
 
-        T_obs, T_true, old T_pseudo, and new T_cand are merged while retaining
-        source indices. Every old-grid point temporarily keeps its previous y
-        value. New candidate times between adjacent old-grid points form inserted
-        blocks. For each such block, use
+        T_obs, T_true, and new T_cand are merged while retaining source indices.
+        If ``use_t_pseudo_in_sir`` is enabled, old T_pseudo is included as a
+        fourth source and its previous y values become additional boundaries.
+        New candidate times between adjacent retained points form inserted blocks.
+        For each such block, use
 
             q(block) = p(block | y_left)
 
@@ -1892,8 +1963,9 @@ class ContinuousTimeAR1HMMSampler:
               = p(block | y_left) p(y_right | block_last),
 
         so SIR weights only require the right-boundary likelihood. After all new
-        values are sampled, only values on `new_grid_times` are returned; old-only
-        candidate points have served as bridge endpoints and are then marginalized.
+        values are sampled, only values on `new_grid_times` are returned. When
+        enabled, old-only pseudo points serve as bridge endpoints and are then
+        marginalized.
         """
         num_particles = int(self.sir_config["num_particles"])
         if num_particles < 1:
@@ -1925,19 +1997,25 @@ class ContinuousTimeAR1HMMSampler:
             times_for_sir.shape[0], self.D, dtype=self.dtype, device=self.device
         )
         has_old_y = ~is_new_candidate
-        y_work[has_old_y] = old_y_aug.to(
-            device=self.device, dtype=self.dtype
-        )
-        if torch.any(~has_old_y & ~is_new_candidate):
-            raise RuntimeError(
-                "A temporary-grid point had neither an old y nor a new candidate source."
+        old_y_for_sir = old_y_aug.to(device=self.device, dtype=self.dtype)
+        if not self.sir_config["use_t_pseudo_in_sir"]:
+            old_pseudo_idx = self.pseudo_idx_list[s]
+            if old_pseudo_idx is None:
+                raise RuntimeError("The previous pseudo-point indices are unavailable.")
+            retain_old_y = torch.ones(
+                old_y_for_sir.shape[0], dtype=torch.bool, device=self.device
             )
+            retain_old_y[old_pseudo_idx.to(device=self.device)] = False
+            old_y_for_sir = old_y_for_sir[retain_old_y]
+        if old_y_for_sir.shape[0] != int(has_old_y.sum().item()):
+            raise RuntimeError("Old y values do not align with the SIR work grid.")
+        y_work[has_old_y] = old_y_for_sir
 
         inserted_idx = torch.nonzero(is_new_candidate, as_tuple=False).squeeze(-1)
         if inserted_idx.numel() == 0:
             y_sample = y_work[~is_old_pseudo]
             if y_sample.shape[0] != new_grid_times.shape[0]:
-                raise RuntimeError("Four-way merge produced the wrong new-grid size.")
+                raise RuntimeError("SIR work-grid produced the wrong new-grid size.")
             return y_sample, {
                 "num_particles": float(num_particles),
                 "min_ess": float("nan"),
@@ -2016,7 +2094,7 @@ class ContinuousTimeAR1HMMSampler:
 
         y_sample = y_work[~is_old_pseudo]
         if y_sample.shape[0] != new_grid_times.shape[0]:
-            raise RuntimeError("Four-way merge produced the wrong new-grid size.")
+            raise RuntimeError("SIR work-grid produced the wrong new-grid size.")
 
         return y_sample, {
             "num_particles": float(num_particles),
