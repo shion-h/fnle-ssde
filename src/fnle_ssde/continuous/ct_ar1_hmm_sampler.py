@@ -1489,42 +1489,25 @@ class ContinuousTimeAR1HMMSampler:
         if y_prev_batch.shape[0] != theta_batch.shape[0] or y_prev_batch.shape[0] != delta.shape[0]:
             raise ValueError("Batch dimensions of y, theta, and delta_batch must match.")
 
-        context = self._build_transition_context(
-            theta_batch=theta_batch,
-            y_prev_batch=y_prev_batch,
-            delta_batch=delta,
-        )
         n_steps = self._delta_to_n_steps(delta)
         return self.nle_estimator.transition_log_prob(
             x_next=y_curr_batch,
-            context=context,
+            theta=theta_batch,
             x_prev=y_prev_batch,
             n_steps=n_steps.to(device=y_prev_batch.device, dtype=y_prev_batch.dtype),
             include_jacobian=True,
         )
 
-    def _build_transition_context(
-        self,
-        theta_batch: torch.Tensor,
-        y_prev_batch: torch.Tensor,
-        delta_batch: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build NLE context [theta, y_prev, delta / dynamics.dt]."""
-        n_steps = self._delta_to_n_steps(delta_batch)
-        context = torch.cat([theta_batch, y_prev_batch], dim=-1)
-        n_step_batch = n_steps.unsqueeze(-1).to(device=context.device, dtype=context.dtype)
-        return torch.cat([context, n_step_batch], dim=-1)
-
     def _sample_transition_one_per_context(
         self,
-        context: torch.Tensor,
+        theta: torch.Tensor,
         y_prev: torch.Tensor,
         delta: torch.Tensor,
     ) -> torch.Tensor:
         """Draw one transition sample per context row in y-space."""
         n_steps = self._delta_to_n_steps(delta)
         samples = self.nle_estimator.sample_transition(
-            context=context,
+            theta=theta,
             x_prev=y_prev,
             n_steps=n_steps.to(device=y_prev.device, dtype=y_prev.dtype),
         )
@@ -1554,14 +1537,9 @@ class ContinuousTimeAR1HMMSampler:
                 theta_batch = self.theta[state].unsqueeze(0).expand(
                     num_particles, self.theta_dim
                 )
-                context = self._build_transition_context(
-                    theta_batch=theta_batch,
-                    y_prev_batch=y_prev,
-                    delta_batch=delta.expand(num_particles),
-                )
                 # batch size is num_particle
                 y_curr = self._sample_transition_one_per_context(
-                    context=context,
+                    theta=theta_batch,
                     y_prev=y_prev,
                     delta=delta.expand(num_particles),
                 )

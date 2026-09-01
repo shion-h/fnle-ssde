@@ -808,13 +808,33 @@ class NLEEstimator:
         scale = self._target_scale(n_steps, dtype=x_next.dtype, device=x_next.device)
         return (x_next - x_prev) / scale
 
+    def _build_transition_context(
+            self,
+            theta: torch.Tensor,
+            x_prev: torch.Tensor,
+            n_steps: int | torch.Tensor) -> torch.Tensor:
+        """Build the estimator condition from transition-level inputs."""
+        context = torch.cat([theta, x_prev], dim=-1)
+        if not self.conditions_on_n_steps:
+            return context
+        n_steps_tensor = torch.as_tensor(
+            n_steps,
+            device=context.device,
+            dtype=context.dtype,
+        )
+        batch_shape = context.shape[:-1]
+        if n_steps_tensor.shape == batch_shape + (1,):
+            n_steps_tensor = n_steps_tensor.squeeze(-1)
+        n_steps_tensor = torch.broadcast_to(n_steps_tensor, batch_shape)
+        return torch.cat([context, n_steps_tensor.unsqueeze(-1)], dim=-1)
+
     def transition_log_prob(
             self,
             x_next: torch.Tensor,
             *,
-            context: torch.Tensor,
+            theta: torch.Tensor,
             x_prev: torch.Tensor,
-            n_steps: torch.Tensor,
+            n_steps: int | torch.Tensor,
             include_jacobian: bool = True) -> torch.Tensor:
         """
         Evaluate log p(x_next | x_prev, theta, n_steps).
@@ -825,6 +845,7 @@ class NLEEstimator:
         """
         if self.estimator is None:
             raise ValueError("No trained estimator is available.")
+        context = self._build_transition_context(theta, x_prev, n_steps)
         target = self._x_next_to_target(x_prev=x_prev, x_next=x_next, n_steps=n_steps)
         log_prob = self.estimator.log_prob(target.unsqueeze(0), condition=context)
         if self.target_type == "scaled_dx" and include_jacobian:
@@ -836,11 +857,12 @@ class NLEEstimator:
     def sample_transition(
             self,
             *,
-            context: torch.Tensor,
+            theta: torch.Tensor,
             x_prev: torch.Tensor,
-            n_steps: torch.Tensor) -> torch.Tensor:
-        """Draw one x_next sample for each context row."""
+            n_steps: int | torch.Tensor) -> torch.Tensor:
+        """Draw one x_next sample for each transition input row."""
         if self.estimator is None:
             raise ValueError("No trained estimator is available.")
+        context = self._build_transition_context(theta, x_prev, n_steps)
         target_sample = self.estimator.sample((1,), condition=context)[0]
         return self._target_to_x_next(x_prev=x_prev, target_sample=target_sample, n_steps=n_steps)
