@@ -90,11 +90,9 @@ class NLEEstimator:
                 generate_training_data.
             unobserved_init_dist: Distribution whose sample fills latent dimensions
                 absent from x_ref.
-            state_clamp_bounds: Optional state-space bounds applied both after
-                constructing noisy x_init and after every simulated step. Use
-                None for an unrestricted state space, (0.0, None) for a
-                nonnegative state space, or (None, 1e4) for upper-only clipping.
-                A RuntimeWarning is emitted when a simulated step is clamped.
+            state_clamp_bounds: Optional bounds applied when constructing the
+                noisy initial state. Simulated states are constrained by the
+                supplied Dynamics instance.
             noisy_init_strategy: How to handle noisy initial states outside
                 state_clamp_bounds. "clamp" preserves the historical behavior;
                 "resample" redraws the complete initial state until it is valid.
@@ -141,43 +139,12 @@ class NLEEstimator:
             x_init = self.dynamics.to_device(x_init)
             
             # Simulate forward
-            x_sim = x_init
             sampled_n_steps = self._sample_n_steps(max_n_steps)
-            for _ in range(sampled_n_steps):
-                x_sim = self.dynamics.simulate_one_step(x_sim, theta)
-                if state_clamp_bounds is not None:
-                    lower, upper = state_clamp_bounds
-                    clamp_mask = torch.zeros_like(x_sim, dtype=torch.bool)
-                    lower_clamped = False
-                    upper_clamped = False
-                    if lower is not None:
-                        lower_clamped = bool(torch.any(x_sim < lower).item())
-                        clamp_mask |= x_sim < lower
-                    if upper is not None:
-                        upper_clamped = bool(torch.any(x_sim > upper).item())
-                        clamp_mask |= x_sim > upper
-                    if torch.any(clamp_mask):
-                        sides = []
-                        if lower_clamped:
-                            sides.append("lower")
-                        if upper_clamped:
-                            sides.append("upper")
-                        warnings.warn(
-                            "Simulated states were clamped while generating "
-                            f"NLE training data: side={'+'.join(sides)}, "
-                            f"bounds={state_clamp_bounds}. "
-                            "For upper clamping, consider reducing dynamics.dt "
-                            "or narrowing the training parameter range. For lower "
-                            "clamping, confirm the dynamics state space is constrained.",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                    if lower is not None and upper is not None:
-                        x_sim = torch.clamp(x_sim, min=lower, max=upper)
-                    elif lower is not None:
-                        x_sim = torch.clamp_min(x_sim, lower)
-                    elif upper is not None:
-                        x_sim = torch.clamp_max(x_sim, upper)
+            x_sim = self.dynamics.simulate_n_steps(
+                x_init,
+                theta,
+                sampled_n_steps,
+            )
             
             # Create context
             if self.conditions_on_n_steps:
@@ -228,9 +195,8 @@ class NLEEstimator:
             observed_dims: Latent-state indices represented by x_ref columns.
             unobserved_init_dist: Distribution used to initialize omitted latent
                 dimensions independently for each generated transition.
-            state_clamp_bounds: Optional bounds applied to noisy initial states
-                and every subsequently simulated state. Use None to disable
-                clamping.
+            state_clamp_bounds: Optional bounds applied to noisy initial states.
+                Subsequent states are constrained by the Dynamics instance.
         """
         all_xt = []
         all_ctx = []
@@ -359,8 +325,8 @@ class NLEEstimator:
             unobserved_init_dist: Distribution used to initialize latent dimensions
                 that are not represented in x_ref.
             state_clamp_bounds: Optional state-space bounds applied to noisy
-                initial states and after each simulated step. Defaults to
-                [0, 1e4]. Use None for unconstrained state spaces.
+                initial states. Subsequent states are constrained by the
+                Dynamics instance.
             noisy_init_strategy: Clamp or redraw noisy initial states that fall
                 outside state_clamp_bounds.
             max_noisy_init_attempts: Maximum redraws under "resample".
