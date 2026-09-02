@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch.distributions import Distribution, Independent, Uniform
 
-from .common.nle import NLEEstimator
+from .nle import NLEEstimator
 from .prior import (
     make_prior_config,
     sample_generator_matrix,
@@ -19,7 +19,7 @@ from .prior import (
 )
 
 if TYPE_CHECKING:
-    from .continuous import ContinuousTimeAR1HMMSampler
+    from .sampler import ContinuousTimeAR1HMMSampler
 
 
 def seed_all(seed: int) -> None:
@@ -105,44 +105,63 @@ def build_spline_nle(
     return nle
 
 
-def initialize_random_ctmc_path(
+def initialize_ctmc_path_from_generator(
     sampler: ContinuousTimeAR1HMMSampler,
+    Q: torch.Tensor,
     *,
-    expected_num_intervals: float = 20.0,
     seed: int | None = None,
 ) -> None:
-    """Initialize random paths using the sampler's continuing CTMC RNG stream."""
-    if expected_num_intervals < 1.0:
-        raise ValueError("expected_num_intervals must be at least one.")
+    """Initialize true paths by simulating the supplied CTMC generator exactly."""
+    Q = torch.as_tensor(Q, dtype=sampler.dtype, device="cpu")
+    if Q.shape != (sampler.K, sampler.K):
+        raise ValueError(f"Q must have shape ({sampler.K}, {sampler.K}).")
+    off_diagonal = Q - torch.diag(torch.diagonal(Q))
+    if torch.any(torch.diagonal(Q) >= 0) or torch.any(off_diagonal < 0):
+        raise ValueError(
+            "Q must have negative diagonal and nonnegative off-diagonal entries."
+        )
+    if not torch.allclose(Q.sum(dim=1), torch.zeros(sampler.K), atol=1e-6):
+        raise ValueError("Rows of Q must sum to zero.")
+
     generator = sampler.rng
     if seed is not None:
         generator.manual_seed(seed)
+    initial_probs = sampler.initial_state_probs.detach().cpu()
+
     for series_index, duration in enumerate(sampler.T_list):
-        num_intervals = 1 + int(
-            torch.poisson(
-                torch.tensor(
-                    expected_num_intervals - 1.0,
-                    dtype=sampler.time_dtype,
-                ),
-                generator=generator,
-            )
+        current_time = 0.0
+        current_state = int(
+            torch.multinomial(initial_probs, 1, generator=generator).item()
         )
-        duration_value = float(duration.item())
-        jump_times = torch.sort(
-            torch.rand(
-                num_intervals - 1,
-                generator=generator,
-                dtype=sampler.time_dtype,
+        jump_times: list[float] = []
+        states = [current_state]
+
+        while True:
+            exit_rate = float(-Q[current_state, current_state].item())
+            uniform = torch.rand(
+                (), generator=generator, dtype=sampler.time_dtype
+            ).clamp_min(torch.finfo(sampler.time_dtype).tiny)
+            next_time = current_time + float(-torch.log(uniform).item() / exit_rate)
+            if next_time >= float(duration.item()):
+                break
+
+            transition_rates = Q[current_state].clone()
+            transition_rates[current_state] = 0.0
+            current_state = int(
+                torch.multinomial(
+                    transition_rates, 1, generator=generator
+                ).item()
             )
-            * duration_value
-        ).values.to(device=sampler.device, dtype=sampler.time_dtype)
-        states = torch.empty(num_intervals, dtype=torch.long)
-        states[0] = torch.randint(sampler.K, (1,), generator=generator)
-        for index in range(1, num_intervals):
-            candidate = torch.randint(sampler.K - 1, (1,), generator=generator)
-            states[index] = candidate + (candidate >= states[index - 1]).long()
-        sampler.T_true_list[series_index] = jump_times
-        sampler.z_true_list[series_index] = states.to(sampler.device)
+            jump_times.append(next_time)
+            states.append(current_state)
+            current_time = next_time
+
+        sampler.T_true_list[series_index] = torch.tensor(
+            jump_times, dtype=sampler.time_dtype, device=sampler.device
+        )
+        sampler.z_true_list[series_index] = torch.tensor(
+            states, dtype=torch.long, device=sampler.device
+        )
 
 
 def initialize_gibbs_sampler(
@@ -155,8 +174,11 @@ def initialize_gibbs_sampler(
     switching_mask: torch.Tensor,
     tau2_beta: float | torch.Tensor,
     tau2_alpha: float = 3.0,
+    q_alpha: float = 2.0,
+    q_beta: float = 20.0,
     seed: int = 0,
     Q: torch.Tensor | None = None,
+    initial_path_Q: torch.Tensor | None = None,
     initial_theta: torch.Tensor | None = None,
     initial_log_tau: torch.Tensor | None = None,
     y0_prior_scale: float | torch.Tensor = 0.5,
@@ -179,15 +201,22 @@ def initialize_gibbs_sampler(
     ``time_dtype`` controls only observation, jump, candidate, and augmented-grid
     times. Model states, parameters, and NLE calls remain float32.
 
+    The initial discrete path is an exact CTMC draw from ``initial_path_Q``
+    when supplied, or from the sampler's initial ``Q`` otherwise.
+
     Set ``use_t_pseudo_in_sir=False`` to marginalize the previous sweep's pseudo
     points rather than retaining their y values as SIR bridge boundaries.
     """
-    from .continuous import ContinuousTimeAR1HMMSampler
+    from .sampler import ContinuousTimeAR1HMMSampler
 
     seed_all(seed)
     num_regimes = 2 if Q is None else Q.shape[0]
     prior_config = make_prior_config(
-        theta_lower.numel(), tau2_beta, tau2_alpha=tau2_alpha
+        theta_lower.numel(),
+        tau2_beta,
+        tau2_alpha=tau2_alpha,
+        q_alpha=q_alpha,
+        q_beta=q_beta,
     )
     if initial_theta is None:
         if theta_prior is None:
@@ -261,7 +290,8 @@ def initialize_gibbs_sampler(
         initial_log_tau=initial_log_tau,
         initial_state_probs=torch.full((num_regimes,), 1.0 / num_regimes),
     )
-    initialize_random_ctmc_path(sampler, seed=seed)
+    path_generator_Q = Q if initial_path_Q is None else initial_path_Q
+    initialize_ctmc_path_from_generator(sampler, path_generator_Q, seed=seed)
     return sampler, {"initial_Q": Q, "initial_theta": initial_theta}
 
 

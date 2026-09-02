@@ -1,9 +1,7 @@
-""" This is a package for SSDE parameter estimation using FNLE."""
+"""SSDE parameter estimation using FNLE."""
 
-from . import common, continuous, discrete
+from .sampler import ContinuousTimeAR1HMMSampler
 
 __all__ = [
-    "common",
-    "continuous",
-    "discrete",
+    "ContinuousTimeAR1HMMSampler",
 ]
