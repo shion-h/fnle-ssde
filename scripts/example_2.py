@@ -26,9 +26,9 @@ NLE_CACHE_PATHS = {
     "cle": ROOT / "results/example2_cle_nle.pt",
     "sir": ROOT / "results/example2_sir_nle.pt",
 }
-LV_HISTORY_PATH = ROOT / "results/example2_lv_gs.pt"
-CLE_HISTORY_PATH =  ROOT / "results/example2_cle_gs.pt"
-SIR_HISTORY_PATH =  ROOT / "results/example2_sir_gs.pt"
+LV_HISTORY_PATH = ROOT / "results/example2_lv_mcmc.pt"
+CLE_HISTORY_PATH = ROOT / "results/example2_cle_mcmc.pt"
+SIR_HISTORY_PATH = ROOT / "results/example2_sir_mcmc.pt"
 
 Q_PRIOR_ALPHA, Q_PRIOR_BETA = 2.0, 20.0
 

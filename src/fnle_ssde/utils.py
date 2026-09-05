@@ -1,4 +1,4 @@
-"""Reusable experiment utilities for NLE training and Gibbs sampling."""
+"""Reusable experiment utilities for NLE training and MCMC inference."""
 
 from __future__ import annotations
 
@@ -173,18 +173,18 @@ def initialize_ctmc_path_from_generator(
     generator = sampler.rng
     if seed is not None:
         generator.manual_seed(seed)
-    initial_probs = sampler.initial_state_probs.detach().cpu()
+    initial_probs = sampler.initial_regime_probs.detach().cpu()
 
     for series_index, duration in enumerate(sampler.T_list):
         current_time = 0.0
-        current_state = int(
+        current_regime = int(
             torch.multinomial(initial_probs, 1, generator=generator).item()
         )
         jump_times: list[float] = []
-        states = [current_state]
+        regimes = [current_regime]
 
         while True:
-            exit_rate = float(-Q[current_state, current_state].item())
+            exit_rate = float(-Q[current_regime, current_regime].item())
             uniform = torch.rand(
                 (), generator=generator, dtype=sampler.time_dtype
             ).clamp_min(torch.finfo(sampler.time_dtype).tiny)
@@ -192,26 +192,26 @@ def initialize_ctmc_path_from_generator(
             if next_time >= float(duration.item()):
                 break
 
-            transition_rates = Q[current_state].clone()
-            transition_rates[current_state] = 0.0
-            current_state = int(
+            transition_rates = Q[current_regime].clone()
+            transition_rates[current_regime] = 0.0
+            current_regime = int(
                 torch.multinomial(
                     transition_rates, 1, generator=generator
                 ).item()
             )
             jump_times.append(next_time)
-            states.append(current_state)
+            regimes.append(current_regime)
             current_time = next_time
 
         sampler.T_true_list[series_index] = torch.tensor(
             jump_times, dtype=sampler.time_dtype, device=sampler.device
         )
         sampler.z_true_list[series_index] = torch.tensor(
-            states, dtype=torch.long, device=sampler.device
+            regimes, dtype=torch.long, device=sampler.device
         )
 
 
-def initialize_gibbs_sampler(
+def initialize_mcmc_sampler(
     *,
     nle: NLEEstimator,
     x_obs: torch.Tensor,
@@ -336,7 +336,7 @@ def initialize_gibbs_sampler(
     sampler.initialize(
         initial_theta=initial_theta,
         initial_log_tau=initial_log_tau,
-        initial_state_probs=torch.full((num_regimes,), 1.0 / num_regimes),
+        initial_regime_probs=torch.full((num_regimes,), 1.0 / num_regimes),
     )
     path_generator_Q = Q if initial_path_Q is None else initial_path_Q
     initialize_ctmc_path_from_generator(sampler, path_generator_Q, seed=seed)
@@ -386,7 +386,7 @@ def _run_and_save_chain(
         switching_mask=switching_mask,
         num_regimes=num_regimes,
     )
-    sampler, initialization = initialize_gibbs_sampler(
+    sampler, initialization = initialize_mcmc_sampler(
         nle=nle,
         x_obs=x_obs,
         obs_times=obs_times,
@@ -467,7 +467,7 @@ def run_experiment(
     chain_config: dict[str, Any],
     output_payload: dict[str, Any] | None = None,
 ) -> tuple[Path, ...]:
-    """Train/load an NLE, run one or more Gibbs chains, and save each history."""
+    """Train/load an NLE, run one or more MCMC chains, and save each history."""
     seeds = tuple(int(seed) for seed in chain_config["seeds"])
     history_paths = tuple(Path(path) for path in chain_config["history_paths"])
     latest_paths_config = chain_config.get("latest_sample_paths")
@@ -497,7 +497,7 @@ def run_experiment(
         **nle_config,
     }
     # Build or load the NLE once before starting any chain processes. Training
-    # tensors remain in the cache file but are not needed during Gibbs sampling.
+    # tensors remain in the cache file but are not needed during MCMC inference.
     nle = build_spline_nle(**nle_build_kwargs)
     nle.xt_data = None
     nle.ctx_data = None

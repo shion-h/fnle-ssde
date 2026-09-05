@@ -61,14 +61,14 @@ THETA_PRIOR_SCALE = torch.ones(6)
 def history_path(chain_id: int) -> Path:
     """Return the complete-history path for one chain."""
     return ROOT / (
-        f"results/{EXPERIMENT_NAME}_gs_chain{chain_id}.pt"
+        f"results/{EXPERIMENT_NAME}_mcmc_chain{chain_id}.pt"
     )
 
 
 def latest_sample_path(chain_id: int) -> Path:
     """Return the rolling-checkpoint path for one chain."""
     return ROOT / (
-        f"results/{EXPERIMENT_NAME}_gs_chain{chain_id}_latest_sample.pt"
+        f"results/{EXPERIMENT_NAME}_mcmc_chain{chain_id}_latest_sample.pt"
     )
 
 

@@ -1,14 +1,14 @@
 """
-Continuous-time AR(1)-HMM Gibbs sampler in a single research-oriented file.
+Continuous-time AR(1)-HMM MCMC sampler in a single research-oriented file.
 
 This implementation combines:
-1. Uniformization / candidate jumps for the continuous-time discrete state path z(t)
+1. Uniformization / candidate jumps for the continuous-time discrete regime path z(t)
 2. Conditional NUTS or MALA updates for the continuous latent trajectory y
    on an augmented grid
-3. FFBS updates for the discrete state skeleton on the same augmented grid
+3. FFBS updates for the discrete regime skeleton on the same augmented grid
 4. Conditional NUTS or MALA updates for the NLE transition parameters
-5. Conjugate Gibbs updates for the diagonal observation noise
-6. Conjugate Gibbs updates for the CTMC generator Q
+5. Conjugate updates for the diagonal observation noise
+6. Conjugate updates for the CTMC generator Q
 
 Model summary
 -------------
@@ -23,7 +23,7 @@ The latent transition density is evaluated by an NLEEstimator:
     p(y_{t+1} | y_t, z=k) = flow.log_prob(y_{t+1}, context=[theta_k, y_t, interval_length / dt])
 
 The code keeps the implementation intentionally explicit and modular inside one class so
-that each Gibbs step remains easy to inspect and modify.
+that each MCMC transition remains easy to inspect and modify.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from torch.distributions import Distribution, constraints
 
 class ContinuousTimeAR1HMMSampler:
     """
-    Gibbs sampler for a continuous-time AR(1)-HMM with NLE transition density.
+    MCMC sampler for a continuous-time AR(1)-HMM with NLE transition density.
 
     Shapes
     ------
@@ -56,10 +56,10 @@ class ContinuousTimeAR1HMMSampler:
 
     Conventions
     -----------
-    - States are indexed from 0 to K-1.
-    - `z_aug[j+1]` denotes the state on the interval [T_all[j], T_all[j+1]].
-    - Therefore the NLE transition from y_aug[j] to y_aug[j+1] uses state z_aug[j+1].
-    - `z_aug[0]` duplicates the first interval state so that `z_aug` has the same
+    - Regimes are indexed from 0 to K-1.
+    - `z_aug[j+1]` denotes the regime on the interval [T_all[j], T_all[j+1]].
+    - Therefore the NLE transition from y_aug[j] to y_aug[j+1] uses regime z_aug[j+1].
+    - `z_aug[0]` duplicates the first interval regime so that `z_aug` has the same
       length as `T_all`.
     """
 
@@ -112,7 +112,7 @@ class ContinuousTimeAR1HMMSampler:
             ``step_size``. MALA uses one-step Pyro HMC; its step size is the
             leapfrog epsilon, so the equivalent Langevin proposal has noise
             variance epsilon squared. Exactly one MH transition is performed per
-            Gibbs sweep.
+            MCMC sweep.
         sir_config:
             Settings for SIR initialization of y at newly inserted candidate
             times. ``num_particles`` controls the number of particles.
@@ -151,7 +151,7 @@ class ContinuousTimeAR1HMMSampler:
             float64; float64 is the default to make exact time collisions negligible.
         latest_sample_path:
             Optional monitoring file overwritten atomically after every completed
-            Gibbs sweep. The complete in-memory history is unchanged.
+            MCMC sweep. The complete in-memory history is unchanged.
         """
         first_x_obs = x_obs[0] if isinstance(x_obs, (list, tuple)) else x_obs
         self.device = device or first_x_obs.device
@@ -288,7 +288,7 @@ class ContinuousTimeAR1HMMSampler:
         if hasattr(self.flow_model, "eval"):
             self.flow_model.eval()
         if hasattr(self.flow_model, "requires_grad_"):
-            # The trained NLE is a fixed density inside Gibbs inference.  Keeping
+            # The trained NLE is a fixed density inside MCMC inference. Keeping
             # its weights differentiable makes PyTorch retain unnecessary
             # autograd tensors across repeated one-step MCMC runs. Freezing the
             # weights still permits gradients with respect to y and theta, which
@@ -378,7 +378,9 @@ class ContinuousTimeAR1HMMSampler:
         self.y_aug_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.initial_y_times_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.initial_y_values_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
-        self.initial_state_probs = torch.full((self.K,), 1.0 / self.K, dtype=self.dtype, device=self.device)
+        self.initial_regime_probs = torch.full(
+            (self.K,), 1.0 / self.K, dtype=self.dtype, device=self.device
+        )
 
     @staticmethod
     def _prepare_mh_config(
@@ -431,7 +433,7 @@ class ContinuousTimeAR1HMMSampler:
         *,
         initial_theta: Optional[torch.Tensor] = None,
         initial_log_tau: Optional[torch.Tensor] = None,
-        initial_state_probs: Optional[torch.Tensor] = None,
+        initial_regime_probs: Optional[torch.Tensor] = None,
         initial_y_times: Optional[torch.Tensor] = None,
         initial_y_values: Optional[torch.Tensor] = None,
     ) -> None:
@@ -441,12 +443,12 @@ class ContinuousTimeAR1HMMSampler:
         `initial_theta` is expressed in the real-valued NLE parameter coordinate.
         Pass observation noise separately as `initial_log_tau`.
 
-        The initial true path has no jumps. Its single state is sampled from
-        `initial_state_probs`, unless that probability vector is overridden here.
+        The initial true path has no jumps. Its single regime is sampled from
+        `initial_regime_probs`, unless that probability vector is overridden here.
         """
-        if initial_state_probs is not None:
-            probs = initial_state_probs.to(device=self.device, dtype=self.dtype)
-            self.initial_state_probs = probs / probs.sum()
+        if initial_regime_probs is not None:
+            probs = initial_regime_probs.to(device=self.device, dtype=self.dtype)
+            self.initial_regime_probs = probs / probs.sum()
 
         if (initial_y_times is None) != (initial_y_values is None):
             raise ValueError(
@@ -510,11 +512,11 @@ class ContinuousTimeAR1HMMSampler:
             )
 
         for s in range(self.S):
-            initial_state = dist.Categorical(probs=self.initial_state_probs).sample()
+            initial_regime = dist.Categorical(probs=self.initial_regime_probs).sample()
             self.T_true_list[s] = torch.empty(
                 0, dtype=self.time_dtype, device=self.device
             )
-            self.z_true_list[s] = initial_state.reshape(1).to(
+            self.z_true_list[s] = initial_regime.reshape(1).to(
                 dtype=torch.long, device=self.device
             )
             self.T_all_list[s] = None
@@ -799,19 +801,19 @@ class ContinuousTimeAR1HMMSampler:
         s: int,
         times: torch.Tensor,
     ) -> torch.Tensor:
-        """Return point states with z[j] assigned to interval [times[j-1], times[j]]."""
+        """Return point regimes with z[j] assigned to interval [times[j-1], times[j]]."""
         T_true = self.T_true_list[s]
         z_true = self.z_true_list[s]
         if T_true is None or z_true is None:
-            raise RuntimeError("Call initialize() before assigning states to a grid.")
+            raise RuntimeError("Call initialize() before assigning regimes to a grid.")
         if times.ndim != 1 or times.shape[0] < 2:
             raise ValueError("times must be one-dimensional and include 0 and T.")
 
-        # Point-state representation on T_all.
+        # Point-regime representation on T_all.
         # z_aug[j+1] is the regime on [T_all[j], T_all[j+1]], and z_aug[0]
-        # duplicates the first interval state. z_true is not padded: z_true[r] is
+        # duplicates the first interval regime. z_true is not padded: z_true[r] is
         # the regime on true-path segment r.
-        interval_states = torch.empty(
+        interval_regimes = torch.empty(
             times.shape[0] - 1, dtype=torch.long, device=self.device
         )
         T_true_idx = 0
@@ -819,15 +821,15 @@ class ContinuousTimeAR1HMMSampler:
             # time at the left of the interval
             left = times[j]
             # T_true_idx is the number of true jumps at or before `left`.
-            # The matching true-path state is z_true[T_true_idx].
+            # The matching true-path regime is z_true[T_true_idx].
             while T_true_idx < T_true.shape[0] and T_true[T_true_idx] <= left:
                 T_true_idx += 1
-            interval_states[j] = z_true[T_true_idx]
+            interval_regimes[j] = z_true[T_true_idx]
 
         z_aug = torch.empty(times.shape[0], dtype=torch.long, device=self.device)
-        # To fit z_aug indices with y_aug indices, duplicate the first interval state
-        z_aug[0] = interval_states[0]
-        z_aug[1:] = interval_states
+        # To fit z_aug indices with y_aug indices, duplicate the first interval regime
+        z_aug[0] = interval_regimes[0]
+        z_aug[1:] = interval_regimes
         return z_aug
 
     def _build_sir_work_grid(
@@ -897,7 +899,7 @@ class ContinuousTimeAR1HMMSampler:
         """
         Add candidate jumps to the current true path using uniformization.
 
-        On an interval with state k and duration dt, candidate jumps are sampled from:
+        On an interval with regime k and duration dt, candidate jumps are sampled from:
             Poisson((Omega - q_k) dt) = Poisson((Omega + Q_kk) dt)
         because q_k = -Q_kk.
         """
@@ -908,15 +910,15 @@ class ContinuousTimeAR1HMMSampler:
             raise RuntimeError("Call initialize() before add_candidate_jumps().")
 
         cand_times: List[torch.Tensor] = []
-        for j, state in enumerate(z_true.tolist()):
-            # state is the regime on the interval between t0 and t1
+        for j, regime in enumerate(z_true.tolist()):
+            # regime is active on the interval between t0 and t1
             t0 = 0.0 if j == 0 else T_true[j - 1].item()
             t1 = T.item() if j == z_true.shape[0] - 1 else T_true[j].item()
             dt = t1 - t0
             if dt <= 0.0:
                 raise RuntimeError("dt <= 0 encountered when adding candidate jumps.")
 
-            rate = self.omega + float(self.Q[state, state].item())
+            rate = self.omega + float(self.Q[regime, regime].item())
             if rate <= 0.0:
                 raise RuntimeError("omega must be greater than max_k(-Q_kk) to ensure a positive candidate jump rate.")
 
@@ -1107,7 +1109,7 @@ class ContinuousTimeAR1HMMSampler:
             self.Q[off_diagonal]
         ).sum()
 
-        initial_state = torch.zeros((), dtype=self.dtype, device=self.device)
+        initial_regime = torch.zeros((), dtype=self.dtype, device=self.device)
         ctmc_path = torch.zeros((), dtype=self.dtype, device=self.device)
         latent_initial = torch.zeros((), dtype=self.dtype, device=self.device)
         nle_transition = torch.zeros((), dtype=self.dtype, device=self.device)
@@ -1138,7 +1140,7 @@ class ContinuousTimeAR1HMMSampler:
                 )
             ):
                 raise RuntimeError(
-                    "Complete a Gibbs sweep before evaluating the complete-data joint."
+                    "Complete an MCMC sweep before evaluating the complete-data joint."
                 )
 
             canonical_idx = torch.unique(
@@ -1151,7 +1153,7 @@ class ContinuousTimeAR1HMMSampler:
             canonical_times = T_all_s[canonical_idx]
             canonical_y = y_aug_s[canonical_idx]
             right_idx = canonical_idx[1:]
-            interval_states = z_aug_s[right_idx]
+            interval_regimes = z_aug_s[right_idx]
             delta = canonical_times[1:] - canonical_times[:-1]
 
             latent_initial = latent_initial + dist.Normal(
@@ -1161,7 +1163,7 @@ class ContinuousTimeAR1HMMSampler:
             nle_transition = nle_transition + self._evaluate_batched_transition_logprobs(
                 y_prev_batch=canonical_y[:-1],
                 y_curr_batch=canonical_y[1:],
-                theta_batch=self.theta[interval_states],
+                theta_batch=self.theta[interval_regimes],
                 delta_batch=delta,
             ).sum()
             observation = observation + self.observation_logprob(
@@ -1170,8 +1172,8 @@ class ContinuousTimeAR1HMMSampler:
                 self.log_tau,
             )
 
-            initial_state = initial_state + torch.log(
-                self.initial_state_probs[z_true_s[0]]
+            initial_regime = initial_regime + torch.log(
+                self.initial_regime_probs[z_true_s[0]]
             )
             path_boundaries = torch.cat(
                 [
@@ -1200,7 +1202,7 @@ class ContinuousTimeAR1HMMSampler:
             "theta_prior": float(theta_prior.item()),
             "tau2_prior": float(tau2_prior.item()),
             "Q_prior": float(Q_prior.item()),
-            "initial_state": float(initial_state.item()),
+            "initial_regime": float(initial_regime.item()),
             "ctmc_path": float(ctmc_path.item()),
             "latent_initial": float(latent_initial.item()),
             "nle_transition": float(nle_transition.item()),
@@ -1379,7 +1381,7 @@ class ContinuousTimeAR1HMMSampler:
 
     def sample_log_tau(self) -> torch.Tensor:
         """
-        Gibbs update for diagonal observation noise.
+        Conjugate update for diagonal observation noise.
 
         With x_i[d] | y_i[d], tau_d^2 ~ Normal(y_i[d], tau_d^2) and
         tau_d^2 ~ InvGamma(alpha0, beta0), the conditional posterior is:
@@ -1420,7 +1422,7 @@ class ContinuousTimeAR1HMMSampler:
             q_ij ~ Gamma(a_ij, b_ij)      # rate parameterization
 
         Given the true path, let n_ij be the number of jumps i -> j and let
-        S_i be total dwell time in state i. The conditional posterior is:
+        S_i be total dwell time in regime i. The conditional posterior is:
 
             q_ij | z(t) ~ Gamma(a_ij + n_ij, b_ij + S_i)
 
@@ -1448,10 +1450,10 @@ class ContinuousTimeAR1HMMSampler:
             if z_true_s.shape[0] != T_true_s.shape[0] + 1:
                 raise RuntimeError("z_true must have len(T_true)+1 entries.")
 
-            for i, state in enumerate(z_true_s.tolist()):
+            for i, regime in enumerate(z_true_s.tolist()):
                 t_left = 0.0 if i == 0 else T_true_s[i - 1]
                 t_right = T_s if i == z_true_s.shape[0] - 1 else T_true_s[i]
-                dwell_time_k[state] = dwell_time_k[state] + (t_right - t_left)
+                dwell_time_k[regime] = dwell_time_k[regime] + (t_right - t_left)
 
             for i in range(T_true_s.shape[0]):
                 src = z_true_s[i].item()
@@ -1518,7 +1520,7 @@ class ContinuousTimeAR1HMMSampler:
         left_y: torch.Tensor,
         left_time: torch.Tensor,
         block_times: torch.Tensor,
-        block_states: torch.Tensor,
+        block_regimes: torch.Tensor,
         num_particles: int,
     ) -> torch.Tensor:
         """
@@ -1532,9 +1534,9 @@ class ContinuousTimeAR1HMMSampler:
         previous_time = left_time
 
         with torch.no_grad():
-            for block_time, state in zip(block_times, block_states):
+            for block_time, regime in zip(block_times, block_regimes):
                 delta = block_time - previous_time
-                theta_batch = self.theta[state].unsqueeze(0).expand(
+                theta_batch = self.theta[regime].unsqueeze(0).expand(
                     num_particles, self.theta_dim
                 )
                 # batch size is num_particle
@@ -1556,7 +1558,7 @@ class ContinuousTimeAR1HMMSampler:
         delta: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute FFBS emission logits for all intervals and states in one NLE call.
+        Compute FFBS emission logits for all intervals and regimes in one NLE call.
 
         `delta[j] = T_all[j+1] - T_all[j]` is converted to the NLE conditioning
         step count by delta[j] / dynamics.dt.
@@ -1603,7 +1605,7 @@ class ContinuousTimeAR1HMMSampler:
     ) -> torch.Tensor:
         """
         Compute the total transition log density along a fixed z path using a
-        single batched NLE evaluation over the selected states only.
+        single batched NLE evaluation over the selected regimes only.
         """
         delta = T_all[1:] - T_all[:-1]
         n_intervals = y_aug.shape[0] - 1
@@ -1638,10 +1640,10 @@ class ContinuousTimeAR1HMMSampler:
             log_alpha_j(h)
                 <- log_alpha_j(h) - logsumexp_h(log_alpha_j(h))
 
-        Hence `log_alpha[j]` in the code is a scaled forward message for the state
+        Hence `log_alpha[j]` in the code is a scaled forward message for the regime
         on interval [T_all[j-1], T_all[j]], defined only up to an additive constant
-        shared across states at time index j. This scaling does not change the FFBS
-        conditional distributions because only within-time differences across states
+        shared across regimes at time index j. This scaling does not change the FFBS
+        conditional distributions because only within-time differences across regimes
         matter.
 
         where:
@@ -1663,7 +1665,7 @@ class ContinuousTimeAR1HMMSampler:
 
         L = T_all.shape[0]
         log_alpha = torch.empty(L, self.K, dtype=self.dtype, device=self.device)
-        log_alpha[0] = torch.log(self.initial_state_probs.clamp_min(1e-32))
+        log_alpha[0] = torch.log(self.initial_regime_probs.clamp_min(1e-32))
 
         log_B = torch.log(self.B.clamp_min(1e-32))
         delta = T_all[1:] - T_all[:-1]
@@ -1674,7 +1676,7 @@ class ContinuousTimeAR1HMMSampler:
                 scores = log_alpha[j].unsqueeze(1) + log_B
                 log_alpha[j + 1] = emission_logits[j] + torch.logsumexp(scores, dim=0)
             else:
-                # At observation-only times the transition kernel is I, so the state
+                # At observation-only times the transition kernel is I, so the regime
                 # does not change. Only the NLE transition likelihood contributes.
                 log_alpha[j + 1] = log_alpha[j] + emission_logits[j]
             log_alpha[j + 1] = log_alpha[j + 1] - torch.logsumexp(log_alpha[j + 1], dim=0)
@@ -1701,18 +1703,18 @@ class ContinuousTimeAR1HMMSampler:
         """
         Partition sampled event points into true and pseudo jumps.
 
-        Event points with a state change form T_true; self-transition event points
+        Event points with a regime change form T_true; self-transition event points
         form T_pseudo and are represented by `pseudo_idx` into T_all. Returned
-        z_true is not padded: z_true[r] is the state on true segment r.
+        z_true is not padded: z_true[r] is the regime on true segment r.
         """
         interior_event_idx = torch.nonzero(
             is_event_time[1:-1], as_tuple=False
         ).squeeze(-1) + 1
-        state_changed = (
+        regime_changed = (
             z_aug[interior_event_idx + 1] != z_aug[interior_event_idx]
         )
-        true_idx = interior_event_idx[state_changed]
-        pseudo_idx = interior_event_idx[~state_changed]
+        true_idx = interior_event_idx[regime_changed]
+        pseudo_idx = interior_event_idx[~regime_changed]
 
         # Index T_all directly so true and pseudo times retain their exact stored
         # floating-point representations for the next source-aware merge.
@@ -1723,7 +1725,7 @@ class ContinuousTimeAR1HMMSampler:
         return T_true, z_true, true_idx, pseudo_idx
 
     def one_sweep(self) -> Dict[str, Any]:
-        """Run one Gibbs sweep: augment grid, sample y, z, theta, tau, and Q."""
+        """Run one MCMC sweep: augment grid, sample y, z, theta, tau, and Q."""
         if self.theta is None or self.log_tau is None:
             raise RuntimeError("Call initialize() before one_sweep().")
         for s in range(self.S):
@@ -1807,8 +1809,8 @@ class ContinuousTimeAR1HMMSampler:
                 if self._last_theta_mh_diagnostics is not None
                 else None
             ),
-            "log_tau_update": "conjugate_inverse_gamma_gibbs",
-            "Q_update": "conjugate_gamma_gibbs",
+            "log_tau_update": "conjugate_inverse_gamma",
+            "Q_update": "conjugate_gamma",
             "omega": float(self.omega),
             "log_joint": log_joint,
         }
@@ -1837,7 +1839,7 @@ class ContinuousTimeAR1HMMSampler:
         return sweep_info
 
     def run(self, num_sweeps: int, verbose: bool = True) -> Dict[str, List[Any]]:
-        """Run multiple Gibbs sweeps and return the stored history."""
+        """Run multiple MCMC sweeps and return the stored history."""
         if self.theta is None or self.log_tau is None or any(
             T_true is None or z_true is None
             for T_true, z_true in zip(self.T_true_list, self.z_true_list)
@@ -1868,7 +1870,7 @@ class ContinuousTimeAR1HMMSampler:
 
         Uniformization requires Omega >= max_i -Q_ii.  We keep a strict margin so
         candidate-jump rates Omega + Q_ii remain positive even for the largest exit
-        rate state.
+        rate regime.
         """
         max_exit = torch.max(-torch.diag(self.Q)).item()
         self.omega = float(max(self.omega_scale * max_exit, max_exit + 1e-6, 1e-6))
@@ -2022,14 +2024,14 @@ class ContinuousTimeAR1HMMSampler:
                 raise RuntimeError("Inserted block endpoints must carry old y values.")
 
             block_times = times_for_sir[block_work_idx]
-            block_states = work_z_aug[block_work_idx]
+            block_regimes = work_z_aug[block_work_idx]
 
             # particles: (num_particles, block_size, D)
             particles = self._sample_forward_block_particles(
                 left_y=y_work[left_idx],
                 left_time=times_for_sir[left_idx],
                 block_times=block_times,
-                block_states=block_states,
+                block_regimes=block_regimes,
                 num_particles=num_particles,
             )
             sir_cand_particles.append(

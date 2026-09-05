@@ -96,24 +96,30 @@ def simulate(config: dict[str, object]) -> dict[str, torch.Tensor]:
 
     if "forced_jump_time" in config:
         jump_times = [float(config["forced_jump_time"])]
-        path_states = [0, 1]
+        path_regimes = [0, 1]
     else:
-        state = dist.Categorical(probs=torch.full((Q.shape[0],), 1.0 / Q.shape[0])).sample()
-        jump_times, path_states = [], [int(state)]
+        regime = dist.Categorical(
+            probs=torch.full((Q.shape[0],), 1.0 / Q.shape[0])
+        ).sample()
+        jump_times, path_regimes = [], [int(regime)]
         current_time = 0.0
         while current_time < T:
-            next_time = current_time + float(dist.Exponential(-Q[state, state]).sample())
+            next_time = current_time + float(
+                dist.Exponential(-Q[regime, regime]).sample()
+            )
             if next_time >= T:
                 break
-            probabilities = Q[state].clone()
-            probabilities[state] = 0.0
-            state = dist.Categorical(probs=probabilities / probabilities.sum()).sample()
+            probabilities = Q[regime].clone()
+            probabilities[regime] = 0.0
+            regime = dist.Categorical(
+                probs=probabilities / probabilities.sum()
+            ).sample()
             jump_times.append(next_time)
-            path_states.append(int(state))
+            path_regimes.append(int(regime))
             current_time = next_time
 
     T_true = torch.tensor(jump_times, dtype=torch.float32)
-    z_true = torch.tensor(path_states, dtype=torch.long)
+    z_true = torch.tensor(path_regimes, dtype=torch.long)
     times = torch.arange(total_steps + 1, dtype=torch.float32) * dynamics.dt
     z_grid = torch.empty(total_steps + 1, dtype=torch.long)
     jump_index = 0

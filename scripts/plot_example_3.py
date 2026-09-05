@@ -1,4 +1,4 @@
-"""Plot Figure 3 from the post-burn-in portion of the full Gibbs history."""
+"""Plot Figure 3 from the post-burn-in portion of the full MCMC history."""
 
 from __future__ import annotations
 
@@ -104,14 +104,14 @@ def plot_traces(
 
     for parameter, ax in enumerate(axes.flat[:6]):
         if parameter < 4:
-            for state, color in enumerate(("#2364aa", "#c44900")):
+            for regime, color in enumerate(("#2364aa", "#c44900")):
                 ax.plot(
                     draws,
-                    theta[:, state, parameter],
+                    theta[:, regime, parameter],
                     color=color,
                     lw=0.55,
                     alpha=0.75,
-                    label=f"regime {state + 1}",
+                    label=f"regime {regime + 1}",
                 )
         else:
             ax.plot(draws, theta[:, 0, parameter], color="#2f4858", lw=0.55)
@@ -144,7 +144,7 @@ def plot_traces(
     axes[0, 0].legend(fontsize=8)
     axes[2, 2].legend(fontsize=8)
     fig.suptitle(
-        "Gibbs parameter traces; dashed line = burn-in cutoff",
+        "MCMC parameter traces; dashed line = burn-in cutoff",
         fontsize=14,
     )
     save_figure(fig, output, additional_paths=additional_outputs)

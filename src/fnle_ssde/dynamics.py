@@ -9,7 +9,7 @@ from torch.distributions.transforms import ExpTransform, Transform, identity_tra
 class Dynamics(ABC):
     """Base dynamics with an explicit NLE-to-physical theta transform.
 
-    The NLE and Gibbs sampler always use an unconstrained, real-valued theta.
+    The NLE and MCMC sampler always use an unconstrained, real-valued theta.
     ``theta_transform`` maps that coordinate to the parameters consumed by
     ``split_theta()``, ``drift()``, and ``diffusion()``. Subclasses that do not
     override it retain the identity mapping.

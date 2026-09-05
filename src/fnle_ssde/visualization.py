@@ -48,7 +48,7 @@ class PosteriorFigureCase:
     trajectory_dimensions: tuple[int, ...]
     trajectory_labels: tuple[str, ...]
     dynamics: Dynamics
-    state: int = 1
+    regime: int = 1
     series_index: int = 0
     show_truth: bool = False
     theta_truth: torch.Tensor | None = None
@@ -79,7 +79,7 @@ def single_series_history(
     series_index: int = 0,
     start: int = 0,
 ) -> dict[str, list[object]]:
-    """Extract one series and optionally discard leading Gibbs draws."""
+    """Extract one series and optionally discard leading MCMC draws."""
     return {
         key: [
             value[series_index] if key in SERIES_HISTORY_KEYS else value
@@ -132,7 +132,7 @@ def interpolated_posterior_y_summary(
     }
 
 
-def state_at_times(
+def regime_at_times(
     T_all: torch.Tensor,
     z_aug: torch.Tensor,
     times: torch.Tensor,
@@ -171,7 +171,7 @@ def _indices_at_grid_times(
 
 
 def match_regime_labels(theta: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
-    """Match state labels by mean squared error in the NLE theta coordinate."""
+    """Match regime labels by mean squared error in the NLE theta coordinate."""
     order = min(
         itertools.permutations(range(truth.shape[0])),
         key=lambda permutation: float(
@@ -208,7 +208,7 @@ def posterior_summary(
     )
     z = torch.stack(
         [
-            state_at_times(T_all, z_aug, z_times)
+            regime_at_times(T_all, z_aug, z_times)
             for T_all, z_aug in zip(selected["T_all"], selected["z_aug"])
         ]
     )
@@ -229,7 +229,7 @@ def posterior_summary(
         "theta_mean": theta.mean(0),
         "theta_low": torch.quantile(theta, theta_interval[0], dim=0),
         "theta_high": torch.quantile(theta, theta_interval[1], dim=0),
-        "state_order": order,
+        "regime_order": order,
     }
 
 
@@ -315,26 +315,32 @@ def plot_parameter_bars(
     if num_regimes is None:
         num_regimes = summary["theta_mean"].shape[0]
     entries = [
-        (index, state)
+        (index, regime)
         for index in indices
-        for state in (range(num_regimes) if switching[index] else (0,))
+        for regime in (range(num_regimes) if switching[index] else (0,))
     ]
     x = np.arange(len(entries))
-    means = np.array([float(summary["theta_mean"][state, index]) for index, state in entries])
-    lower = np.array([float(summary["theta_low"][state, index]) for index, state in entries])
-    upper = np.array([float(summary["theta_high"][state, index]) for index, state in entries])
+    means = np.array(
+        [float(summary["theta_mean"][regime, index]) for index, regime in entries]
+    )
+    lower = np.array(
+        [float(summary["theta_low"][regime, index]) for index, regime in entries]
+    )
+    upper = np.array(
+        [float(summary["theta_high"][regime, index]) for index, regime in entries]
+    )
     labels = []
-    for index, state in entries:
+    for index, regime in entries:
         if latex_labels:
             symbol = names[index]
             labels.append(
-                rf"${symbol}_{{{state + 1}}}$"
+                rf"${symbol}_{{{regime + 1}}}$"
                 if switching[index]
                 else rf"${symbol}$"
             )
         else:
             labels.append(
-                f"{names[index]}\nregime {state + 1}"
+                f"{names[index]}\nregime {regime + 1}"
                 if switching[index]
                 else f"{names[index]}\nshared"
             )
@@ -342,7 +348,7 @@ def plot_parameter_bars(
     posterior_width = 0.60 if truth is None else 0.36
     if truth is not None:
         true_values = np.array(
-            [float(truth[state, index]) for index, state in entries]
+            [float(truth[regime, index]) for index, regime in entries]
         )
         ax.bar(x - 0.18, true_values, 0.36, color="#444444", label="truth")
     ax.bar(
@@ -548,12 +554,12 @@ def plot_posterior_figure(
             truth_regime_ax.grid(False)
         regime_ax.plot(
             case.z_times,
-            summary["z_prob"][:, case.state],
+            summary["z_prob"][:, case.regime],
             color=REGIME_COLOR,
             lw=1.4,
             label=(
                 r"$\Pr(Z_t = "
-                + str(case.state + 1)
+                + str(case.regime + 1)
                 + r" \mid x_{\mathrm{obs}})$"
             ),
         )

@@ -1,4 +1,4 @@
-"""Plot Figure 2 from the synthetic Gibbs histories."""
+"""Plot Figure 2 from the synthetic MCMC histories."""
 
 from __future__ import annotations
 
