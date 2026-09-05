@@ -1,0 +1,118 @@
+"""Plot Figure 1 from the saved simulator/NLE density grids."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+for path in (ROOT / "src", Path(__file__).resolve().parent):
+    sys.path.insert(0, str(path))
+
+from example_1 import NUMERICAL_RESULT_PATH  # noqa: E402
+from fnle_ssde.visualization import relative_density_hpd, save_figure  # noqa: E402
+
+
+FIGURE_PATH = ROOT / "results/figures/example_1.png"
+PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
+DOWNSAMPLE_SIZE = 350
+
+
+def load_numerical_rows() -> list[dict[str, Any]]:
+    """Load the saved simulator and NLE density-grid results."""
+    if not NUMERICAL_RESULT_PATH.exists():
+        raise FileNotFoundError(
+            f"Run scripts/example_1.py first: {NUMERICAL_RESULT_PATH}"
+        )
+    return torch.load(NUMERICAL_RESULT_PATH, map_location="cpu", weights_only=False)[
+        "rows"
+    ]
+
+
+def plot_density_comparison(ax: plt.Axes, row: dict[str, Any]) -> None:
+    """Plot one simulator-versus-NLE density comparison panel."""
+    simulator_density, simulator_levels = relative_density_hpd(row["kde_grid"])
+    nle_density, nle_levels = relative_density_hpd(row["nle_grid"])
+    ax.contour(
+        row["x_mesh"], row["y_mesh"], simulator_density,
+        levels=simulator_levels, colors="#2166ac", linewidths=1.8,
+    )
+    ax.contour(
+        row["x_mesh"], row["y_mesh"], nle_density,
+        levels=nle_levels, colors="#b2182b", linewidths=1.8, linestyles="--",
+    )
+    samples = row["simulator_evaluation"]
+    sample_index = torch.linspace(
+        0,
+        samples.shape[0] - 1,
+        DOWNSAMPLE_SIZE,
+    ).long()
+    ax.scatter(
+        samples[sample_index, 1],
+        samples[sample_index, 0],
+        s=5,
+        alpha=0.11,
+        color="#2166ac",
+    )
+    context = row["context"]
+    ax.scatter(
+        float(context[7]),
+        float(context[6]),
+        marker="x",
+        s=55,
+        linewidths=2,
+        color="black",
+    )
+    gamma = float(context[2].exp())
+    x_prev = context[6:8]
+    correlation = row["metrics"]["spearman_log_density"]
+    ax.set_title(
+        rf"$\gamma={gamma:.1f}$, $n={float(context[8]):.0f}$, "
+        rf"$x_{{\rm prev}}=({float(x_prev[0]):.2f}, {float(x_prev[1]):.2f})$"
+        "\n"
+        rf"$\rho={correlation:.2f}$"
+    )
+    ax.set(xlabel="Paramecium", ylabel="Didinium")
+    ax.grid(alpha=0.15)
+
+
+def add_density_legend(ax: plt.Axes) -> None:
+    """Add the shared density-comparison legend to an axis."""
+    ax.legend(
+        handles=[
+            plt.Line2D([0], [0], color="#2166ac", lw=2, label="Simulator KDE HPD"),
+            plt.Line2D([0], [0], color="#b2182b", lw=2, ls="--", label="NLE HPD"),
+            plt.Line2D([0], [0], marker="x", color="black", ls="none", label="x_prev"),
+        ],
+        fontsize=9,
+    )
+
+
+def create_density_comparison_figure(
+    rows: list[dict[str, Any]],
+) -> plt.Figure:
+    """Create the complete simulator-versus-NLE comparison figure."""
+    fig, axes = plt.subplots(3, 2, figsize=(12.8, 14.7), constrained_layout=True)
+    for ax, row in zip(axes.flat, rows):
+        plot_density_comparison(ax, row)
+    add_density_legend(axes[0, 0])
+    return fig
+
+
+def main() -> None:
+    rows = load_numerical_rows()
+    fig = create_density_comparison_figure(rows)
+    save_figure(
+        fig,
+        FIGURE_PATH,
+        additional_paths=(PDF_PATH,),
+        font_scale=1.8,
+    )
+
+
+if __name__ == "__main__":
+    main()

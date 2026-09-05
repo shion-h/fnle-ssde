@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -105,6 +107,51 @@ def build_spline_nle(
     return nle
 
 
+def sample_initial_theta_from_truncated_physical_prior(
+    *,
+    dynamics: Any,
+    physical_theta_prior: Distribution,
+    theta_lower: torch.Tensor,
+    theta_upper: torch.Tensor,
+    switching_mask: torch.Tensor,
+    num_regimes: int,
+) -> torch.Tensor:
+    """Draw regime parameters from a physical prior truncated to NLE support."""
+    lower_cdf = physical_theta_prior.cdf(theta_lower)
+    upper_cdf = physical_theta_prior.cdf(theta_upper)
+    probabilities = lower_cdf + torch.rand(
+        (num_regimes, theta_lower.numel()),
+        dtype=lower_cdf.dtype,
+        device=lower_cdf.device,
+    ) * (upper_cdf - lower_cdf)
+    physical_theta = physical_theta_prior.icdf(probabilities)
+    physical_theta[:, ~switching_mask] = physical_theta[0, ~switching_mask]
+    return dynamics.to_nle_theta(physical_theta)
+
+
+def make_symmetric_generator(
+    num_regimes: int,
+    jump_rate: float,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Return a symmetric generator with total exit rate ``jump_rate``."""
+    if num_regimes < 2:
+        raise ValueError("num_regimes must be at least two.")
+    if jump_rate <= 0:
+        raise ValueError("jump_rate must be positive.")
+    off_diagonal_rate = jump_rate / (num_regimes - 1)
+    Q = torch.full(
+        (num_regimes, num_regimes),
+        off_diagonal_rate,
+        dtype=dtype,
+        device=device,
+    )
+    Q.fill_diagonal_(-jump_rate)
+    return Q
+
+
 def initialize_ctmc_path_from_generator(
     sampler: ContinuousTimeAR1HMMSampler,
     Q: torch.Tensor,
@@ -177,6 +224,7 @@ def initialize_gibbs_sampler(
     q_alpha: float = 2.0,
     q_beta: float = 20.0,
     seed: int = 0,
+    num_regimes: int = 2,
     Q: torch.Tensor | None = None,
     initial_path_Q: torch.Tensor | None = None,
     initial_theta: torch.Tensor | None = None,
@@ -210,7 +258,7 @@ def initialize_gibbs_sampler(
     from .sampler import ContinuousTimeAR1HMMSampler
 
     seed_all(seed)
-    num_regimes = 2 if Q is None else Q.shape[0]
+    num_regimes = num_regimes if Q is None else Q.shape[0]
     prior_config = make_prior_config(
         theta_lower.numel(),
         tau2_beta,
@@ -295,29 +343,219 @@ def initialize_gibbs_sampler(
     return sampler, {"initial_Q": Q, "initial_theta": initial_theta}
 
 
-def run_after_burn_in(
-    sampler: ContinuousTimeAR1HMMSampler,
+def _run_and_save_chain(
     *,
+    experiment_name: str,
+    nle: NLEEstimator,
+    x_obs: torch.Tensor,
+    obs_times: torch.Tensor,
+    physical_theta_prior: Distribution,
+    nle_config: dict[str, Any],
+    sampler_config: dict[str, Any],
+    seed: int,
+    chain_id: int,
+    num_chains: int,
     num_sweeps: int,
     burn_in: int,
-    progress_every: int = 100,
-) -> dict[str, list[object]]:
-    """Run Gibbs sweeps and retain only draws after burn-in."""
-    if not 0 <= burn_in < num_sweeps:
-        raise ValueError("burn_in must satisfy 0 <= burn_in < num_sweeps.")
-    retained = {key: [] for key in sampler.history}
+    progress_every: int,
+    history_path: Path,
+    latest_sample_path: Path | None,
+    output_payload: dict[str, Any] | None,
+) -> tuple[int, str]:
+    """Initialize, run, and save one chain of a configured experiment."""
+    theta_lower = nle_config["theta_lower"]
+    theta_upper = nle_config["theta_upper"]
+    sampler_kwargs = dict(sampler_config)
+    num_regimes = int(sampler_kwargs.pop("num_regimes", 2))
+    initial_path_jump_rate = float(sampler_kwargs.pop("initial_path_jump_rate"))
+    switching_mask = sampler_kwargs["switching_mask"]
+
+    theta_prior = nle.dynamics.pullback_theta_prior(physical_theta_prior)
+    initial_path_Q = make_symmetric_generator(
+        num_regimes,
+        initial_path_jump_rate,
+        dtype=theta_lower.dtype,
+        device=theta_lower.device,
+    )
+    seed_all(seed)
+    initial_theta = sample_initial_theta_from_truncated_physical_prior(
+        dynamics=nle.dynamics,
+        physical_theta_prior=physical_theta_prior,
+        theta_lower=theta_lower,
+        theta_upper=theta_upper,
+        switching_mask=switching_mask,
+        num_regimes=num_regimes,
+    )
+    sampler, initialization = initialize_gibbs_sampler(
+        nle=nle,
+        x_obs=x_obs,
+        obs_times=obs_times,
+        theta_lower=theta_lower,
+        theta_upper=theta_upper,
+        num_regimes=num_regimes,
+        initial_path_Q=initial_path_Q,
+        initial_theta=initial_theta,
+        seed=seed,
+        latest_sample_path=latest_sample_path,
+        theta_prior=theta_prior,
+        **sampler_kwargs,
+    )
+
+    if num_chains == 1:
+        progress_label = experiment_name
+    else:
+        progress_label = f"chain {chain_id}, seed {seed}"
     for sweep in range(num_sweeps):
         info = sampler.one_sweep()
-        if sweep >= burn_in:
-            for key in retained:
-                retained[key].append(sampler.history[key][-1])
-        sampler.history = {key: [] for key in sampler.history}
         if progress_every and (sweep + 1) % progress_every == 0:
             print(
-                f"[sweep {sweep + 1:05d}] grid={info['grid_size']}, "
-                f"true_segments={info['num_true_segments']}"
+                f"[{progress_label}, sweep {sweep + 1:05d}] "
+                f"grid={info['grid_size']}, "
+                f"true_segments={info['num_true_segments']}",
+                flush=True,
             )
-    return retained
+
+    history = sampler.history
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_payload is None:
+        saved_payload: Any = history
+    else:
+        saved_payload = {
+            "history": history,
+            **output_payload,
+            **initialization,
+        }
+    torch.save(saved_payload, history_path)
+
+    outside = posterior_outside_support(
+        {"theta": history["theta"][burn_in:]},
+        theta_lower,
+        theta_upper,
+        dynamics=nle.dynamics,
+    )
+    print(f"[{progress_label}] initial Q:\n{initialization['initial_Q']}", flush=True)
+    print(
+        f"[{progress_label}] initial theta:\n"
+        f"{nle.dynamics.to_physical_theta(initialization['initial_theta'])}",
+        flush=True,
+    )
+    print(
+        f"[{progress_label}] post-burn samples outside NLE support: "
+        f"{100 * outside:.2f}%",
+        flush=True,
+    )
+    print(f"[{progress_label}] saved: {history_path}", flush=True)
+    return chain_id, str(history_path)
+
+
+def _configure_chain_worker() -> None:
+    """Use deterministic single-threaded tensor operations in each chain worker."""
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
+
+def run_experiment(
+    *,
+    experiment_name: str,
+    dynamics: Any,
+    x_obs: torch.Tensor,
+    obs_times: torch.Tensor,
+    reference_times: torch.Tensor,
+    physical_theta_prior: Distribution,
+    nle_config: dict[str, Any],
+    sampler_config: dict[str, Any],
+    chain_config: dict[str, Any],
+    output_payload: dict[str, Any] | None = None,
+) -> tuple[Path, ...]:
+    """Train/load an NLE, run one or more Gibbs chains, and save each history."""
+    seeds = tuple(int(seed) for seed in chain_config["seeds"])
+    history_paths = tuple(Path(path) for path in chain_config["history_paths"])
+    latest_paths_config = chain_config.get("latest_sample_paths")
+    latest_sample_paths = (
+        tuple(Path(path) for path in latest_paths_config)
+        if latest_paths_config is not None
+        else (None,) * len(seeds)
+    )
+    if not seeds:
+        raise ValueError("chain_config['seeds'] must not be empty.")
+    if len(history_paths) != len(seeds):
+        raise ValueError("history_paths and seeds must have the same length.")
+    if len(latest_sample_paths) != len(seeds):
+        raise ValueError("latest_sample_paths and seeds must have the same length.")
+
+    num_sweeps = int(chain_config["num_sweeps"])
+    burn_in = int(chain_config["burn_in"])
+    progress_every = int(chain_config.get("progress_every", 100))
+    if not 0 <= burn_in < num_sweeps:
+        raise ValueError("burn_in must satisfy 0 <= burn_in < num_sweeps.")
+
+    nle_build_kwargs = {
+        "dynamics": dynamics,
+        "obs_times": obs_times,
+        "x_obs": x_obs,
+        "reference_times": reference_times,
+        **nle_config,
+    }
+    # Build or load the NLE once before starting any chain processes. Training
+    # tensors remain in the cache file but are not needed during Gibbs sampling.
+    nle = build_spline_nle(**nle_build_kwargs)
+    nle.xt_data = None
+    nle.ctx_data = None
+    common_chain_kwargs = {
+        "experiment_name": experiment_name,
+        "nle": nle,
+        "x_obs": x_obs,
+        "obs_times": obs_times,
+        "physical_theta_prior": physical_theta_prior,
+        "nle_config": nle_config,
+        "sampler_config": sampler_config,
+        "num_chains": len(seeds),
+        "num_sweeps": num_sweeps,
+        "burn_in": burn_in,
+        "progress_every": progress_every,
+        "output_payload": output_payload,
+    }
+
+    if len(seeds) == 1:
+        _, output = _run_and_save_chain(
+            seed=seeds[0],
+            chain_id=0,
+            history_path=history_paths[0],
+            latest_sample_path=latest_sample_paths[0],
+            **common_chain_kwargs,
+        )
+        return (Path(output),)
+
+    tasks = []
+    for chain_id, (seed, history_path, latest_sample_path) in enumerate(
+        zip(seeds, history_paths, latest_sample_paths, strict=True)
+    ):
+        tasks.append(
+            {
+                **common_chain_kwargs,
+                "seed": seed,
+                "chain_id": chain_id,
+                "history_path": history_path,
+                "latest_sample_path": latest_sample_path,
+            }
+        )
+
+    outputs: list[Path | None] = [None] * len(tasks)
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=len(tasks),
+        mp_context=context,
+        initializer=_configure_chain_worker,
+    ) as executor:
+        futures = [
+            executor.submit(_run_and_save_chain, **task)
+            for task in tasks
+        ]
+        for future in as_completed(futures):
+            chain_id, output = future.result()
+            outputs[chain_id] = Path(output)
+
+    return tuple(output for output in outputs if output is not None)
 
 
 def posterior_outside_support(
