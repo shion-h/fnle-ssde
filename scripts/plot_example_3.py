@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+import pandas as pd
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,23 +17,29 @@ for path in (ROOT / "src", SCRIPTS):
 from example_3 import (  # noqa: E402
     BURN_IN,
     DYNAMICS_DT,
-    HISTORY_PATH,
+    HISTORY_PATHS,
+    NUM_CHAINS,
     NUM_SWEEPS,
     read_observations,
 )
 from fnle_ssde.dynamics import LotkaVolterraDynamics  # noqa: E402
 from fnle_ssde.visualization import (  # noqa: E402
+    combine_chain_histories,
+    match_chain_regime_labels,
     ParameterPlotGroup,
     PosteriorFigureCase,
+    plot_multichain_traces,
     plot_posterior_figure,
-    save_figure,
+    rank_normalized_rhat,
 )
 
 
 FIGURE_PATH = ROOT / "results/figures/example_3.png"
 FIGURE_PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
-TRACE_PATH = ROOT / "results/figures/example_3_trace.png"
+TRACE_PATH = ROOT / "results/figures/example_3_multichain_trace.png"
 TRACE_PDF_PATH = TRACE_PATH.with_suffix(".pdf")
+RHAT_PATH = ROOT / "results/diagnostics/example_3_rhat.csv"
+REGIME_ALIGNMENT_PATH = ROOT / "results/diagnostics/example_3_regime_alignment.csv"
 PARAMETER_NAMES = (
     r"\alpha",
     r"\beta",
@@ -41,6 +47,20 @@ PARAMETER_NAMES = (
     r"\delta",
     r"\sigma_D",
     r"\sigma_P",
+)
+PARAMETER_KEYS = ("alpha", "beta", "gamma", "delta", "sigma_D", "sigma_P")
+PARAMETER_SWITCHING = (True, True, True, True, False, False)
+DENSITY_GROUPS = (
+    (r"$\alpha$", ("alpha[1]", "alpha[2]")),
+    (r"$\beta$", ("beta[1]", "beta[2]")),
+    (r"$\gamma$", ("gamma[1]", "gamma[2]")),
+    (r"$\delta$", ("delta[1]", "delta[2]")),
+    (r"$\sigma_D$", ("sigma_D",)),
+    (r"$\sigma_P$", ("sigma_P",)),
+    (r"$q_{12}$", ("q12",)),
+    (r"$q_{21}$", ("q21",)),
+    (r"$\tau_D$", ("tau_D",)),
+    (r"$\tau_P$", ("tau_P",)),
 )
 
 
@@ -53,11 +73,7 @@ def plot_result(
     additional_outputs: tuple[Path, ...] = (),
     font_scale: float = 1.0,
 ) -> None:
-    """Configure and create the real-data posterior figure."""
-    if len(history["T_all"]) != NUM_SWEEPS:
-        raise ValueError(
-            f"Expected {NUM_SWEEPS} stored sweeps, got {len(history['T_all'])}."
-        )
+    """Create the real-data posterior figure from combined post-burn-in draws."""
     dense_times = torch.linspace(float(T_obs[0]), float(T_obs[-1]), 1_000)
     case = PosteriorFigureCase(
         title=r"$\mathit{Didinium}$–$\mathit{Paramecium}$",
@@ -67,9 +83,9 @@ def plot_result(
         y_times=dense_times,
         z_times=dense_times,
         num_regimes=2,
-        start=BURN_IN,
+        start=0,
         parameter_names=PARAMETER_NAMES,
-        parameter_switching=(True, True, True, True, False, False),
+        parameter_switching=PARAMETER_SWITCHING,
         parameter_groups=(
             ParameterPlotGroup("Switching drift parameters", (0, 1, 2, 3), 4),
             ParameterPlotGroup("Shared diffusion", (4, 5), 1),
@@ -89,94 +105,141 @@ def plot_result(
     )
 
 
-def plot_traces(
-    output: Path,
-    history: dict[str, list[object]],
+def extract_aligned_scalar_chains(
+    histories: tuple[dict[str, list[object]], ...],
+    regime_orders: tuple[tuple[int, ...], ...],
     dynamics: LotkaVolterraDynamics,
-    additional_outputs: tuple[Path, ...] = (),
-) -> None:
-    """Plot natural-scale parameter traces, retaining the burn-in portion."""
-    theta = dynamics.to_physical_theta(torch.stack(history["theta"]))
-    Q = torch.stack(history["Q"])
-    tau = torch.stack(history["log_tau"]).exp()
-    draws = torch.arange(theta.shape[0]) + 1
-    fig, axes = plt.subplots(3, 3, figsize=(15, 10), constrained_layout=True)
+) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
+    """Return aligned natural-scale scalar traces and their display labels."""
+    theta = torch.stack(
+        [
+            dynamics.to_physical_theta(torch.stack(history["theta"]))[:, list(order)]
+            for history, order in zip(histories, regime_orders, strict=True)
+        ]
+    )
+    Q = torch.stack(
+        [
+            torch.stack(history["Q"])[:, list(order)][:, :, list(order)]
+            for history, order in zip(histories, regime_orders, strict=True)
+        ]
+    )
+    tau = torch.stack(
+        [torch.stack(history["log_tau"]).exp() for history in histories]
+    )
 
-    for parameter, ax in enumerate(axes.flat[:6]):
-        if parameter < 4:
-            for regime, color in enumerate(("#2364aa", "#c44900")):
-                ax.plot(
-                    draws,
-                    theta[:, regime, parameter],
-                    color=color,
-                    lw=0.55,
-                    alpha=0.75,
-                    label=f"regime {regime + 1}",
-                )
+    chains: dict[str, torch.Tensor] = {}
+    display_names: dict[str, str] = {}
+    for parameter, (key, symbol, switching) in enumerate(
+        zip(PARAMETER_KEYS, PARAMETER_NAMES, PARAMETER_SWITCHING, strict=True)
+    ):
+        if switching:
+            for regime in range(theta.shape[2]):
+                name = f"{key}[{regime + 1}]"
+                chains[name] = theta[:, :, regime, parameter]
+                display_names[name] = rf"${symbol}_{{{regime + 1}}}$"
         else:
-            ax.plot(draws, theta[:, 0, parameter], color="#2f4858", lw=0.55)
-        ax.set_title(rf"${PARAMETER_NAMES[parameter]}$")
+            chains[key] = theta[:, :, 0, parameter]
+            display_names[key] = rf"${symbol}$"
 
-    axes[2, 0].plot(draws, Q[:, 0, 1], color="#2364aa", lw=0.55)
-    axes[2, 0].set_title("q12")
-    axes[2, 1].plot(draws, Q[:, 1, 0], color="#c44900", lw=0.55)
-    axes[2, 1].set_title("q21")
-    axes[2, 2].plot(
-        draws,
-        tau[:, 0],
-        color="#c44900",
-        lw=0.55,
-        label=r"$\mathit{Didinium}$",
+    chains["q12"] = Q[:, :, 0, 1]
+    chains["q21"] = Q[:, :, 1, 0]
+    chains["tau_D"] = tau[:, :, 0]
+    chains["tau_P"] = tau[:, :, 1]
+    display_names.update(
+        {
+            "q12": r"$q_{12}$",
+            "q21": r"$q_{21}$",
+            "tau_D": r"$\tau_D$",
+            "tau_P": r"$\tau_P$",
+        }
     )
-    axes[2, 2].plot(
-        draws,
-        tau[:, 1],
-        color="#2364aa",
-        lw=0.55,
-        label=r"$\mathit{Paramecium}$",
-    )
-    axes[2, 2].set_title("observation noise tau")
+    return chains, display_names
 
-    for ax in axes.flat:
-        ax.axvline(BURN_IN, color="black", lw=1, ls="--", alpha=0.7)
-        ax.grid(alpha=0.12)
-        ax.set_xlabel("sweep")
-    axes[0, 0].legend(fontsize=8)
-    axes[2, 2].legend(fontsize=8)
-    fig.suptitle(
-        "MCMC parameter traces; dashed line = burn-in cutoff",
-        fontsize=14,
-    )
-    save_figure(fig, output, additional_paths=additional_outputs)
+
+def save_rhat(rhat: dict[str, float]) -> None:
+    """Save publication-ready rank-normalized split-R-hat values."""
+    RHAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pd.Series(rhat, name="r_hat").round(3).rename_axis("parameter").to_csv(RHAT_PATH)
+    print(f"saved: {RHAT_PATH}")
+
+
+def save_regime_alignment(
+    regime_orders: tuple[tuple[int, ...], ...],
+) -> None:
+    """Record the fixed chain-level regime permutations used in all outputs."""
+    REGIME_ALIGNMENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "chain": range(len(regime_orders)),
+            "reference_chain": 0,
+            "regime_order": [
+                "-".join(str(regime + 1) for regime in order)
+                for order in regime_orders
+            ],
+        }
+    ).to_csv(REGIME_ALIGNMENT_PATH, index=False)
+    print(f"saved: {REGIME_ALIGNMENT_PATH}")
 
 
 def main() -> None:
-    if not HISTORY_PATH.exists():
+    missing = [path for path in HISTORY_PATHS if not path.exists()]
+    if missing:
+        missing_text = "\n".join(str(path) for path in missing)
         raise FileNotFoundError(
-            f"Numerical result not found: {HISTORY_PATH}\n"
+            f"Numerical results not found:\n{missing_text}\n"
             "Run scripts/example_3.py first."
         )
-    history = torch.load(HISTORY_PATH, map_location="cpu", weights_only=False)
+    histories = tuple(
+        torch.load(path, map_location="cpu", weights_only=False)
+        for path in HISTORY_PATHS
+    )
+    if len(histories) != NUM_CHAINS:
+        raise ValueError(f"Expected {NUM_CHAINS} chains, got {len(histories)}.")
+    if any(len(history["theta"]) != NUM_SWEEPS for history in histories):
+        raise ValueError(f"Every chain must contain {NUM_SWEEPS} stored sweeps.")
     T_obs, x_obs = read_observations()
     dynamics = LotkaVolterraDynamics(
         dt=DYNAMICS_DT,
         device="cpu",
         state_upper_bound=1e4,
     )
+    regime_orders = match_chain_regime_labels(
+        histories,
+        switching_parameter_mask=PARAMETER_SWITCHING,
+        start=BURN_IN,
+        reference_chain=0,
+    )
+    chains, display_names = extract_aligned_scalar_chains(
+        histories, regime_orders, dynamics
+    )
+    combined_history = combine_chain_histories(
+        histories,
+        start=BURN_IN,
+        regime_orders=regime_orders,
+    )
+    del histories
     plot_result(
         FIGURE_PATH,
         T_obs,
         x_obs,
-        history,
+        combined_history,
         dynamics,
         additional_outputs=(FIGURE_PDF_PATH,),
     )
-    plot_traces(
+    plot_multichain_traces(
+        chains,
         TRACE_PATH,
-        history,
-        dynamics,
+        burn_in=BURN_IN,
+        display_names=display_names,
+        density_groups=DENSITY_GROUPS,
         additional_outputs=(TRACE_PDF_PATH,),
     )
+    save_rhat(
+        rank_normalized_rhat(
+            {name: values[:, BURN_IN:] for name, values in chains.items()}
+        )
+    )
+    save_regime_alignment(regime_orders)
 
 
 if __name__ == "__main__":

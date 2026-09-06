@@ -44,8 +44,10 @@
 !results/figures/example_2.pdf
 !results/figures/example_3.png
 !results/figures/example_3.pdf
-!results/figures/example_3_trace.png
-!results/figures/example_3_trace.pdf
+!results/figures/example_3_multichain_trace.png
+!results/figures/example_3_multichain_trace.pdf
+!results/diagnostics/example_3_rhat.csv
+!results/diagnostics/example_3_regime_alignment.csv
 
 # Explicitly ignore common generated artifacts inside kept directories
 scripts/archive/

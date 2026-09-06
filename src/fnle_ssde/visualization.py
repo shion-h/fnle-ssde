@@ -7,9 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.text import Text
 import numpy as np
 import torch
+import xarray as xr
+
+import arviz as az
+from scipy.stats import gaussian_kde
 
 from .dynamics import Dynamics
 
@@ -87,6 +92,262 @@ def single_series_history(
         ]
         for key, values in history.items()
     }
+
+
+def match_chain_regime_labels(
+    histories: tuple[dict[str, list[object]], ...],
+    *,
+    switching_parameter_mask: tuple[bool, ...],
+    start: int = 0,
+    reference_chain: int = 0,
+) -> tuple[tuple[int, ...], ...]:
+    """Find one fixed regime permutation per chain relative to a reference chain.
+
+    Matching uses the post-``start`` mean of every switching parameter in the
+    real-valued NLE coordinate. Parameters are standardized across chains and
+    regimes before calculating mean squared distances, so no one parameter
+    determines the result merely because of its scale. Regime labels are never
+    changed from draw to draw within a chain.
+    """
+    if not histories:
+        raise ValueError("At least one chain history is required.")
+    if not 0 <= reference_chain < len(histories):
+        raise ValueError("reference_chain is outside the available chain range.")
+
+    theta_chains = []
+    for history in histories:
+        if not 0 <= start < len(history["theta"]):
+            raise ValueError("start must select at least one theta draw per chain.")
+        theta_chains.append(torch.stack(history["theta"][start:]))
+    num_regimes = theta_chains[0].shape[1]
+    theta_dim = theta_chains[0].shape[2]
+    if len(switching_parameter_mask) != theta_dim:
+        raise ValueError(
+            "switching_parameter_mask must have one value per theta dimension."
+        )
+    switching_indices = [
+        index for index, switching in enumerate(switching_parameter_mask) if switching
+    ]
+    if not switching_indices:
+        return tuple(tuple(range(num_regimes)) for _ in histories)
+    if any(theta.shape[1:] != (num_regimes, theta_dim) for theta in theta_chains):
+        raise ValueError("All chains must have the same theta shape per draw.")
+
+    centers = torch.stack(
+        [theta[:, :, switching_indices].mean(dim=0) for theta in theta_chains]
+    )
+    scale = centers.reshape(-1, len(switching_indices)).std(dim=0).clamp_min(
+        torch.finfo(centers.dtype).eps
+    )
+    reference = centers[reference_chain]
+    permutations = tuple(itertools.permutations(range(num_regimes)))
+    return tuple(
+        min(
+            permutations,
+            key=lambda permutation: float(
+                (
+                    (reference - center[list(permutation)])
+                    / scale
+                )
+                .square()
+                .mean()
+            ),
+        )
+        for center in centers
+    )
+
+
+def combine_chain_histories(
+    histories: tuple[dict[str, list[object]], ...],
+    *,
+    start: int = 0,
+    regime_orders: tuple[tuple[int, ...], ...] | None = None,
+) -> dict[str, list[object]]:
+    """Concatenate MCMC chains after applying fixed chain-level regime orders."""
+    if not histories:
+        raise ValueError("At least one chain history is required.")
+    keys = tuple(histories[0])
+    if any(tuple(history) != keys for history in histories[1:]):
+        raise ValueError("All chain histories must contain the same ordered keys.")
+
+    first_theta = histories[0]["theta"]
+    if not first_theta:
+        raise ValueError("Chain histories must contain theta draws.")
+    num_regimes = first_theta[0].shape[0]
+    if regime_orders is None:
+        regime_orders = tuple(tuple(range(num_regimes)) for _ in histories)
+    if len(regime_orders) != len(histories):
+        raise ValueError("regime_orders must contain one permutation per chain.")
+
+    combined = {key: [] for key in keys}
+    expected_order = tuple(range(num_regimes))
+    for history, order in zip(histories, regime_orders, strict=True):
+        if tuple(sorted(order)) != expected_order:
+            raise ValueError("Each regime order must be a complete permutation.")
+        if not 0 <= start < len(history["theta"]):
+            raise ValueError("start must select at least one draw per chain.")
+        order_index = torch.tensor(order, dtype=torch.long)
+        inverse_order = torch.empty(num_regimes, dtype=torch.long)
+        inverse_order[order_index] = torch.arange(num_regimes)
+
+        for key, values in history.items():
+            for value in values[start:]:
+                if key == "theta":
+                    combined[key].append(value[order_index])
+                elif key == "Q":
+                    combined[key].append(value[order_index][:, order_index])
+                elif key in {"z_aug", "z_true"}:
+                    combined[key].append(
+                        [inverse_order[z] for z in value]
+                    )
+                else:
+                    combined[key].append(value)
+    return combined
+
+
+def rank_normalized_rhat(
+    chains: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    """Compute rank-normalized split-R-hat for named scalar MCMC traces."""
+    if not chains:
+        raise ValueError("At least one named trace is required.")
+    names = tuple(chains)
+    values = torch.stack([chains[name] for name in names], dim=-1)
+    if values.ndim != 3:
+        raise ValueError("Each trace must have shape (num_chains, num_draws).")
+    dataset = xr.Dataset(
+        {"value": (("chain", "draw", "component"), values.detach().cpu().numpy())}
+    )
+    rhat = az.rhat(dataset, method="rank")["value"].values
+    return {name: float(rhat[index]) for index, name in enumerate(names)}
+
+
+def plot_multichain_traces(
+    chains: dict[str, torch.Tensor],
+    output: Path,
+    *,
+    burn_in: int,
+    display_names: dict[str, str] | None = None,
+    density_groups: tuple[tuple[str, tuple[str, ...]], ...] | None = None,
+    additional_outputs: tuple[Path, ...] = (),
+    colors: tuple[str, ...] = ("#2364aa", "#c44900", "#2a9d8f", "#6f4e7c"),
+) -> None:
+    """Plot named scalar traces from several MCMC chains in a compact grid."""
+    if not chains:
+        raise ValueError("At least one named trace is required.")
+    names = tuple(chains)
+    first = chains[names[0]]
+    if first.ndim != 2:
+        raise ValueError("Each trace must have shape (num_chains, num_draws).")
+    if any(value.shape != first.shape for value in chains.values()):
+        raise ValueError("All traces must have the same chain and draw dimensions.")
+    if not 0 <= burn_in < first.shape[1]:
+        raise ValueError("burn_in must be inside the stored draw range.")
+    if density_groups is None:
+        density_groups = tuple(
+            ((display_names or {}).get(name, name), (name,)) for name in names
+        )
+    grouped_names = tuple(
+        name for _, group_names in density_groups for name in group_names
+    )
+    if grouped_names != names:
+        raise ValueError(
+            "density_groups must contain every trace exactly once in trace order."
+        )
+
+    set_paper_figure_style()
+    fig = plt.figure(
+        figsize=(14, 2.05 * len(names)),
+        constrained_layout=True,
+    )
+    grid = fig.add_gridspec(len(names), 2, width_ratios=(1.0, 2.6))
+    draws = np.arange(1, first.shape[1] + 1)
+    trace_axes = [fig.add_subplot(grid[row, 1]) for row in range(len(names))]
+    density_axes = []
+    row = 0
+    regime_linestyles = ("-", ":", "-.", "--")
+    for density_title, group_names in density_groups:
+        density_ax = fig.add_subplot(grid[row : row + len(group_names), 0])
+        density_axes.append(density_ax)
+        for regime_index, name in enumerate(group_names):
+            values = chains[name].detach().cpu().numpy()
+            linestyle = regime_linestyles[regime_index % len(regime_linestyles)]
+            for chain_index in range(first.shape[0]):
+                posterior = values[chain_index, burn_in:]
+                if np.ptp(posterior) <= np.finfo(posterior.dtype).eps:
+                    density_ax.axvline(
+                        posterior[0],
+                        color=colors[chain_index % len(colors)],
+                        lw=1.0,
+                        ls=linestyle,
+                    )
+                else:
+                    evaluation_grid = np.linspace(
+                        posterior.min(), posterior.max(), 256
+                    )
+                    density = gaussian_kde(posterior)(evaluation_grid)
+                    density_ax.plot(
+                        evaluation_grid,
+                        density,
+                        color=colors[chain_index % len(colors)],
+                        lw=1.0,
+                        ls=linestyle,
+                    )
+        density_ax.set_title(density_title, loc="left", pad=4)
+        density_ax.set_yticks([])
+        row += len(group_names)
+
+    for row, (name, trace_ax) in enumerate(zip(names, trace_axes, strict=True)):
+        values = chains[name].detach().cpu().numpy()
+        for chain_index in range(first.shape[0]):
+            trace_ax.plot(
+                draws,
+                values[chain_index],
+                color=colors[chain_index % len(colors)],
+                lw=0.55,
+                alpha=0.72,
+                label=f"chain {chain_index}",
+            )
+        trace_ax.axvline(
+            burn_in,
+            color=TRUTH_COLOR,
+            lw=1.0,
+            ls="--",
+            label="burn-in cutoff",
+        )
+        trace_ax.set_title(
+            (display_names or {}).get(name, name), loc="left", pad=4
+        )
+    density_axes[-1].set_xlabel("parameter value")
+    trace_axes[-1].set_xlabel("sweep")
+    handles, labels = trace_axes[0].get_legend_handles_labels()
+    burn_in_handle = handles.pop()
+    burn_in_label = labels.pop()
+    max_group_size = max(len(group_names) for _, group_names in density_groups)
+    if max_group_size > 1:
+        handles.extend(
+            Line2D(
+                [],
+                [],
+                color="#555555",
+                ls=regime_linestyles[regime_index],
+                label=f"regime {regime_index + 1}",
+            )
+            for regime_index in range(max_group_size)
+        )
+        labels.extend(
+            f"regime {regime_index + 1}"
+            for regime_index in range(max_group_size)
+        )
+    handles.append(burn_in_handle)
+    labels.append(burn_in_label)
+    fig.legend(
+        handles,
+        labels,
+        loc="outside upper center",
+        ncol=min(len(handles), 5),
+    )
+    save_figure(fig, output, additional_paths=additional_outputs)
 
 
 def interpolated_posterior_y_summary(
