@@ -68,15 +68,44 @@ def plot_density_comparison(ax: plt.Axes, row: dict[str, Any]) -> None:
         color="black",
     )
     gamma = float(context[2].exp())
-    x_prev = context[6:8]
+    y_prev = context[6:8]
     correlation = row["metrics"]["spearman_log_density"]
     ax.set_title(
         rf"$\gamma={gamma:.1f}$, $n={float(context[8]):.0f}$, "
-        rf"$x_{{\rm prev}}=({float(x_prev[0]):.2f}, {float(x_prev[1]):.2f})$"
+        rf"$y^{{\mathrm{{prev}}}}=({float(y_prev[0]):.2f}, {float(y_prev[1]):.2f})$"
         "\n"
         rf"$\rho={correlation:.2f}$"
     )
-    ax.set(xlabel="Paramecium", ylabel="Didinium")
+    lower = torch.quantile(samples, 0.001, dim=0)
+    upper = torch.quantile(samples, 0.999, dim=0)
+    outer_nle_region = nle_density >= min(nle_levels)
+    nle_lower = torch.tensor(
+        [
+            row["y_mesh"][outer_nle_region].min(),
+            row["x_mesh"][outer_nle_region].min(),
+        ]
+    )
+    nle_upper = torch.tensor(
+        [
+            row["y_mesh"][outer_nle_region].max(),
+            row["x_mesh"][outer_nle_region].max(),
+        ]
+    )
+    display_lower = torch.minimum(torch.minimum(lower, y_prev), nle_lower)
+    display_upper = torch.maximum(torch.maximum(upper, y_prev), nle_upper)
+    margin = 0.08 * (display_upper - display_lower).clamp_min(1e-6)
+    ax.set(
+        xlim=(
+            float(display_lower[1] - margin[1]),
+            float(display_upper[1] + margin[1]),
+        ),
+        ylim=(
+            float(display_lower[0] - margin[0]),
+            float(display_upper[0] + margin[0]),
+        ),
+        xlabel=r"$Y_{t,2}$",
+        ylabel=r"$Y_{t,1}$",
+    )
     ax.grid(alpha=0.15)
 
 
@@ -86,7 +115,14 @@ def add_density_legend(ax: plt.Axes) -> None:
         handles=[
             plt.Line2D([0], [0], color="#2166ac", lw=2, label="Simulator KDE HPD"),
             plt.Line2D([0], [0], color="#b2182b", lw=2, ls="--", label="NLE HPD"),
-            plt.Line2D([0], [0], marker="x", color="black", ls="none", label="x_prev"),
+            plt.Line2D(
+                [0],
+                [0],
+                marker="x",
+                color="black",
+                ls="none",
+                label=r"$y^{\mathrm{prev}}$",
+            ),
         ],
         fontsize=9,
     )
