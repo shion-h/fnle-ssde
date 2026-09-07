@@ -78,9 +78,8 @@ def evaluate(
 
     samples_log_prob_nle = nle_log_prob(nle, simulator_test, context)
     samples_log_prob_kde = kde_log_prob(kde, location, scale, simulator_test)
-    combined = torch.cat([simulator_test, nle_samples])
-    lower = torch.quantile(combined, 0.001, dim=0)
-    upper = torch.quantile(combined, 0.999, dim=0)
+    lower = torch.quantile(simulator_test, 0.001, dim=0)
+    upper = torch.quantile(simulator_test, 0.999, dim=0)
     margin = 0.08 * (upper - lower).clamp_min(1e-6)
     y_axis = np.linspace(float(lower[0] - margin[0]), float(upper[0] + margin[0]), 150)
     x_axis = np.linspace(float(lower[1] - margin[1]), float(upper[1] + margin[1]), 150)
