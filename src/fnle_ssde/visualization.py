@@ -805,13 +805,14 @@ def plot_posterior_figure(
                 where="post",
                 color=TRUTH_COLOR,
                 lw=1.4,
-                label=r"true regime $z_t$",
+                label="true regime",
             )
             truth_regime_ax.set(
                 ylim=(0.95, case.num_regimes + 0.05),
                 yticks=range(1, case.num_regimes + 1),
                 ylabel="Regime",
             )
+            truth_regime_ax.tick_params(axis="y", length=0, pad=5)
             truth_regime_ax.grid(False)
         regime_ax.plot(
             case.z_times,
@@ -821,7 +822,7 @@ def plot_posterior_figure(
             label=(
                 r"$\Pr(Z_t = "
                 + str(case.regime + 1)
-                + r" \mid x_{\mathrm{obs}})$"
+                + r" \mid x)$"
             ),
         )
         regime_ax.set(
@@ -830,6 +831,7 @@ def plot_posterior_figure(
             xlabel="time",
             ylabel="Posterior probability",
         )
+        regime_ax.yaxis.grid(False)
         if truth_regime_ax is not None:
             posterior_handles, posterior_labels = (
                 regime_ax.get_legend_handles_labels()

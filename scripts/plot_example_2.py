@@ -82,11 +82,7 @@ def main() -> None:
             names = (r"\beta", r"\gamma")
             switching = (True, True)
         dimensions = (0, 1)
-        trajectory_labels = (
-            ("susceptible", "recovered")
-            if model == "sir"
-            else tuple(f"y[{dimension}]" for dimension in dimensions)
-        )
+        trajectory_labels = (r"$Y_{t,1}$", r"$Y_{t,2}$")
         cases.append(
             PosteriorFigureCase(
                 title=title,
