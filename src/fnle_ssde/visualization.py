@@ -64,11 +64,41 @@ class PosteriorFigureCase:
     parameter_ylabel: str = ""
 
 
-def set_paper_figure_style() -> None:
-    """Apply the shared Matplotlib style used by the paper figures."""
+def set_figure_font_style(
+    *,
+    font_scale: float = 1.0,
+    text_font_coefficient: float = 9.0,
+    panel_title_font_coefficient: float = 12.0,
+) -> None:
+    """Set the two Matplotlib font tiers shared by all figure elements."""
+    text_size = text_font_coefficient * font_scale
+    panel_title_size = panel_title_font_coefficient * font_scale
     plt.rcParams.update(
         {
-            "font.size": 9,
+            "font.size": text_size,
+            "axes.labelsize": text_size,
+            "axes.titlesize": panel_title_size,
+            "xtick.labelsize": text_size,
+            "ytick.labelsize": text_size,
+            "legend.fontsize": text_size,
+        }
+    )
+
+
+def set_paper_figure_style(
+    *,
+    font_scale: float = 1.0,
+    text_font_coefficient: float = 9.0,
+    panel_title_font_coefficient: float = 12.0,
+) -> None:
+    """Apply the shared Matplotlib style used by the paper figures."""
+    set_figure_font_style(
+        font_scale=font_scale,
+        text_font_coefficient=text_font_coefficient,
+        panel_title_font_coefficient=panel_title_font_coefficient,
+    )
+    plt.rcParams.update(
+        {
             "axes.spines.top": False,
             "axes.spines.right": False,
             "axes.grid": True,
@@ -231,6 +261,9 @@ def plot_multichain_traces(
     density_groups: tuple[tuple[str, tuple[str, ...]], ...] | None = None,
     additional_outputs: tuple[Path, ...] = (),
     colors: tuple[str, ...] = ("#2364aa", "#c44900", "#2a9d8f", "#6f4e7c"),
+    font_scale: float = 1.0,
+    text_font_coefficient: float = 9.0,
+    panel_title_font_coefficient: float = 12.0,
 ) -> None:
     """Plot named scalar traces from several MCMC chains in a compact grid."""
     if not chains:
@@ -255,7 +288,11 @@ def plot_multichain_traces(
             "density_groups must contain every trace exactly once in trace order."
         )
 
-    set_paper_figure_style()
+    set_paper_figure_style(
+        font_scale=font_scale,
+        text_font_coefficient=text_font_coefficient,
+        panel_title_font_coefficient=panel_title_font_coefficient,
+    )
     fig = plt.figure(
         figsize=(14, 2.05 * len(names)),
         constrained_layout=True,
@@ -632,7 +669,6 @@ def plot_parameter_bars(
     ax.set_xticks(x, labels)
     ax.set_title(title)
     ax.set_ylabel("natural scale")
-    ax.tick_params(axis="x", labelsize=7)
 
 
 def plot_posterior_figure(
@@ -644,8 +680,10 @@ def plot_posterior_figure(
     y_interval: tuple[float, float] = (0.025, 0.975),
     theta_interval: tuple[float, float] = (0.025, 0.975),
     height_ratios: tuple[float, ...] | None = None,
-    title_scale: float = 1.0,
     font_scale: float = 1.0,
+    text_font_coefficient: float = 9.0,
+    panel_title_font_coefficient: float = 12.0,
+    overall_title_font_coefficient: float = 14.0,
 ) -> None:
     """Create a complete posterior figure from numerical case settings."""
     if not cases:
@@ -667,13 +705,24 @@ def plot_posterior_figure(
             f"got {len(height_ratios)}."
         )
 
-    set_paper_figure_style()
+    set_paper_figure_style(
+        font_scale=font_scale,
+        text_font_coefficient=text_font_coefficient,
+        panel_title_font_coefficient=panel_title_font_coefficient,
+    )
     fig = plt.figure(figsize=figsize, constrained_layout=True)
     grid = fig.add_gridspec(
         expected_rows,
         len(cases),
         height_ratios=height_ratios,
+        wspace=0.08,
     )
+    parameter_legend = fig.add_subplot(grid[2, :])
+    parameter_legend.axis("off")
+    trajectory_legend = fig.add_subplot(grid[3, :])
+    trajectory_legend.axis("off")
+    parameter_legend_content = None
+    trajectory_legend_content = None
 
     for column, case in enumerate(cases):
         if len(case.trajectory_dimensions) != len(case.trajectory_labels):
@@ -700,7 +749,7 @@ def plot_posterior_figure(
             case.title,
             ha="center",
             va="center",
-            fontsize=12 * title_scale,
+            fontsize=overall_title_font_coefficient * font_scale,
         )
         parameter_grid = grid[1, column].subgridspec(
             1,
@@ -749,24 +798,23 @@ def plot_posterior_figure(
             )
             ax.set_ylabel(case.parameter_ylabel)
 
-        parameter_legend = fig.add_subplot(grid[2, column])
-        parameter_legend.axis("off")
-        handles, labels = parameter_axes[0].get_legend_handles_labels()
-        parameter_legend.legend(
-            handles,
-            labels,
-            loc="center",
-            ncol=len(handles),
-            fontsize=7 * 1.5,
-        )
+        if parameter_legend_content is None:
+            parameter_legend_content = parameter_axes[0].get_legend_handles_labels()
 
-        trajectory_legend = fig.add_subplot(grid[3, column])
-        trajectory_legend.axis("off")
+        time_grid = grid[4:, column].subgridspec(
+            max_trajectories + 1,
+            1,
+            height_ratios=height_ratios[4:],
+            hspace=0.05,
+        )
         trajectory_axes = []
         for row, (dimension, label) in enumerate(
             zip(case.trajectory_dimensions, case.trajectory_labels, strict=True)
         ):
-            ax = fig.add_subplot(grid[4 + row, column])
+            ax = fig.add_subplot(
+                time_grid[row, 0],
+                sharex=trajectory_axes[0] if trajectory_axes else None,
+            )
             plot_posterior_y_trajectory(
                 ax,
                 times=case.y_times,
@@ -784,18 +832,14 @@ def plot_posterior_figure(
             ax.set_ylabel(label)
             ax.tick_params(axis="x", labelbottom=False)
             trajectory_axes.append(ax)
-        handles, labels = trajectory_axes[0].get_legend_handles_labels()
-        trajectory_legend.legend(
-            handles,
-            labels,
-            loc="center",
-            ncol=min(len(handles), 2),
-            fontsize=6.5 * 1.5,
-        )
+        if trajectory_legend_content is None:
+            trajectory_legend_content = trajectory_axes[0].get_legend_handles_labels()
         for row in range(len(trajectory_axes), max_trajectories):
-            fig.add_subplot(grid[4 + row, column]).axis("off")
+            fig.add_subplot(time_grid[row, 0]).axis("off")
 
-        regime_ax = fig.add_subplot(grid[4 + max_trajectories, column])
+        regime_ax = fig.add_subplot(
+            time_grid[max_trajectories, 0], sharex=trajectory_axes[0]
+        )
         truth_regime_ax = None
         if case.show_truth:
             truth_regime_ax = regime_ax.twinx()
@@ -840,19 +884,25 @@ def plot_posterior_figure(
             regime_ax.legend(
                 truth_handles + posterior_handles,
                 truth_labels + posterior_labels,
-                fontsize=8 * 1.5,
             )
-
-    if title_scale != 1.0:
-        for ax in fig.axes:
-            for title in (ax.title, ax._left_title, ax._right_title):
-                if title.get_text():
-                    title.set_fontsize(title.get_fontsize() * title_scale)
+    parameter_handles, parameter_labels = parameter_legend_content
+    parameter_legend.legend(
+        parameter_handles,
+        parameter_labels,
+        loc="center",
+        ncol=len(parameter_handles),
+    )
+    trajectory_handles, trajectory_labels = trajectory_legend_content
+    trajectory_legend.legend(
+        trajectory_handles,
+        trajectory_labels,
+        loc="center",
+        ncol=len(trajectory_handles),
+    )
     save_figure(
         fig,
         output,
         additional_paths=additional_outputs,
-        font_scale=font_scale,
     )
 
 

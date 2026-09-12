@@ -40,6 +40,10 @@ TRACE_PATH = ROOT / "results/figures/example_3_multichain_trace.png"
 TRACE_PDF_PATH = TRACE_PATH.with_suffix(".pdf")
 RHAT_PATH = ROOT / "results/diagnostics/example_3_rhat.csv"
 REGIME_ALIGNMENT_PATH = ROOT / "results/diagnostics/example_3_regime_alignment.csv"
+FONT_SCALE = 2.0
+TEXT_FONT_COEFFICIENT = 9.0
+PANEL_TITLE_FONT_COEFFICIENT = 12.0
+OVERALL_TITLE_FONT_COEFFICIENT = 14.0
 PARAMETER_NAMES = (
     r"\alpha",
     r"\beta",
@@ -71,7 +75,6 @@ def plot_result(
     history: dict[str, list[object]],
     dynamics: LotkaVolterraDynamics,
     additional_outputs: tuple[Path, ...] = (),
-    font_scale: float = 1.0,
 ) -> None:
     """Create the real-data posterior figure from combined post-burn-in draws."""
     dense_times = torch.linspace(float(T_obs[0]), float(T_obs[-1]), 1_000)
@@ -101,7 +104,10 @@ def plot_result(
         figsize=(13, 13),
         additional_outputs=additional_outputs,
         height_ratios=(0.12, 0.90, 0.15, 0.22, 1, 1, 1),
-        font_scale=font_scale,
+        font_scale=FONT_SCALE,
+        text_font_coefficient=TEXT_FONT_COEFFICIENT,
+        panel_title_font_coefficient=PANEL_TITLE_FONT_COEFFICIENT,
+        overall_title_font_coefficient=OVERALL_TITLE_FONT_COEFFICIENT,
     )
 
 
@@ -233,6 +239,9 @@ def main() -> None:
         display_names=display_names,
         density_groups=DENSITY_GROUPS,
         additional_outputs=(TRACE_PDF_PATH,),
+        font_scale=FONT_SCALE,
+        text_font_coefficient=TEXT_FONT_COEFFICIENT,
+        panel_title_font_coefficient=PANEL_TITLE_FONT_COEFFICIENT,
     )
     save_rhat(
         rank_normalized_rhat(

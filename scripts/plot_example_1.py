@@ -14,12 +14,21 @@ for path in (ROOT / "src", Path(__file__).resolve().parent):
     sys.path.insert(0, str(path))
 
 from example_1 import NUMERICAL_RESULT_PATH  # noqa: E402
-from fnle_ssde.visualization import relative_density_hpd, save_figure  # noqa: E402
+from generate_data_1 import CONTEXT_REGIMES, DT  # noqa: E402
+from fnle_ssde.visualization import (  # noqa: E402
+    relative_density_hpd,
+    save_figure,
+    set_figure_font_style,
+)
 
 
 FIGURE_PATH = ROOT / "results/figures/example_1.png"
 PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
 DOWNSAMPLE_SIZE = 350
+FONT_SCALE = 1
+TEXT_FONT_COEFFICIENT = 18.0
+PANEL_TITLE_FONT_COEFFICIENT = 24.0
+OVERALL_TITLE_FONT_COEFFICIENT = 28.0  # Reserved if an overall title is added.
 
 
 def load_numerical_rows() -> list[dict[str, Any]]:
@@ -33,7 +42,11 @@ def load_numerical_rows() -> list[dict[str, Any]]:
     ]
 
 
-def plot_density_comparison(ax: plt.Axes, row: dict[str, Any]) -> None:
+def plot_density_comparison(
+    ax: plt.Axes,
+    row: dict[str, Any],
+    regime: int,
+) -> None:
     """Plot one simulator-versus-NLE density comparison panel."""
     simulator_density, simulator_levels = relative_density_hpd(row["kde_grid"])
     nle_density, nle_levels = relative_density_hpd(row["nle_grid"])
@@ -67,12 +80,11 @@ def plot_density_comparison(ax: plt.Axes, row: dict[str, Any]) -> None:
         linewidths=2,
         color="black",
     )
-    gamma = float(context[2].exp())
     y_prev = context[6:8]
     correlation = row["metrics"]["spearman_log_density"]
     ax.set_title(
-        rf"$\gamma={gamma:.1f}$, $n={float(context[8]):.0f}$, "
-        rf"$y^{{\mathrm{{prev}}}}=({float(y_prev[0]):.2f}, {float(y_prev[1]):.2f})$"
+        rf"$\theta=\theta_{{{regime + 1}}}$, "
+        rf"$\Delta t={float(context[8]) * DT:.2f}$"
         "\n"
         rf"$\rho={correlation:.2f}$"
     )
@@ -124,7 +136,9 @@ def add_density_legend(ax: plt.Axes) -> None:
                 label=r"$y^{\mathrm{prev}}$",
             ),
         ],
-        fontsize=9,
+        loc="center",
+        ncol=3,
+        frameon=False,
     )
 
 
@@ -132,10 +146,19 @@ def create_density_comparison_figure(
     rows: list[dict[str, Any]],
 ) -> plt.Figure:
     """Create the complete simulator-versus-NLE comparison figure."""
-    fig, axes = plt.subplots(3, 2, figsize=(12.8, 14.7), constrained_layout=True)
-    for ax, row in zip(axes.flat, rows):
-        plot_density_comparison(ax, row)
-    add_density_legend(axes[0, 0])
+    set_figure_font_style(
+        font_scale=FONT_SCALE,
+        text_font_coefficient=TEXT_FONT_COEFFICIENT,
+        panel_title_font_coefficient=PANEL_TITLE_FONT_COEFFICIENT,
+    )
+    fig = plt.figure(figsize=(12.8, 15.3), constrained_layout=True)
+    grid = fig.add_gridspec(4, 2, height_ratios=(0.16, 1, 1, 1))
+    legend_ax = fig.add_subplot(grid[0, :])
+    legend_ax.axis("off")
+    add_density_legend(legend_ax)
+    axes = [fig.add_subplot(grid[row, column]) for row in range(1, 4) for column in range(2)]
+    for ax, row, regime in zip(axes, rows, CONTEXT_REGIMES, strict=True):
+        plot_density_comparison(ax, row, regime)
     return fig
 
 
@@ -146,7 +169,6 @@ def main() -> None:
         fig,
         FIGURE_PATH,
         additional_paths=(PDF_PATH,),
-        font_scale=1.8,
     )
 
 

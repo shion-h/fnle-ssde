@@ -26,7 +26,10 @@ from fnle_ssde.visualization import (  # noqa: E402
 
 FIGURE_PATH = ROOT / "results/figures/example_2.png"
 PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
-TITLE_SCALE = 1.8 * (1.8 / 2.0)
+FONT_SCALE = 1.1
+TEXT_FONT_COEFFICIENT = 13.0
+PANEL_TITLE_FONT_COEFFICIENT = 13.0
+OVERALL_TITLE_FONT_COEFFICIENT = 14.0
 
 
 def load(path: Path) -> tuple[dict[str, list[object]], dict[str, object]]:
@@ -114,7 +117,10 @@ def main() -> None:
         figsize=(18.5, 11.5),
         additional_outputs=(PDF_PATH,),
         height_ratios=(0.12, 1.10, 0.15, 0.22, 1, 1, 0.70),
-        title_scale=TITLE_SCALE,
+        font_scale=FONT_SCALE,
+        text_font_coefficient=TEXT_FONT_COEFFICIENT,
+        panel_title_font_coefficient=PANEL_TITLE_FONT_COEFFICIENT,
+        overall_title_font_coefficient=OVERALL_TITLE_FONT_COEFFICIENT,
     )
 
 

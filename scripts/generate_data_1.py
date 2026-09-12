@@ -18,6 +18,14 @@ from fnle_ssde.dynamics import LotkaVolterraDynamics  # noqa: E402
 
 DATA_PATH = ROOT / "results/data/example_1_simulator.pt"
 EXAMPLE_2_LV_DATA_PATH = EXAMPLE_2_DATA_PATHS["lv"]
+DT = 0.01
+CONTEXT_LOCATIONS = ((1, 0), (1, 3_000), (0, 6_000))
+CONTEXT_N_STEPS = (25.0, 75.0)
+CONTEXT_REGIMES = tuple(
+    regime
+    for regime, _ in CONTEXT_LOCATIONS
+    for _ in CONTEXT_N_STEPS
+)
 
 
 def contexts() -> torch.Tensor:
@@ -27,10 +35,10 @@ def contexts() -> torch.Tensor:
         weights_only=False,
     )
     result = []
-    for regime, time_index in ((1, 0), (1, 3_000), (0, 6_000)):
+    for regime, time_index in CONTEXT_LOCATIONS:
         theta = data["theta_true"][regime]
         x_prev = data["y_true"][time_index]
-        for n_steps in (25.0, 75.0):
+        for n_steps in CONTEXT_N_STEPS:
             result.append(torch.cat([theta, x_prev, torch.tensor([n_steps])]))
     return torch.stack(result)
 
@@ -38,7 +46,7 @@ def contexts() -> torch.Tensor:
 @torch.no_grad()
 def main() -> None:
     grid = contexts()
-    dynamics = LotkaVolterraDynamics(dt=0.01, state_upper_bound=1e4)
+    dynamics = LotkaVolterraDynamics(dt=DT, state_upper_bound=1e4)
     samples = []
     for index, context in enumerate(grid):
         count = 8_000
