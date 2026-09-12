@@ -220,7 +220,7 @@ def initialize_mcmc_sampler(
     theta_upper: torch.Tensor,
     switching_mask: torch.Tensor,
     tau2_beta: float | torch.Tensor,
-    tau2_alpha: float = 3.0,
+    tau2_alpha: float | torch.Tensor = 3.0,
     q_alpha: float = 2.0,
     q_beta: float = 20.0,
     seed: int = 0,

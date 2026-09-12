@@ -14,7 +14,7 @@ def make_prior_config(
     *,
     theta_loc: float = 0.0,
     theta_scale: float = 10.0,
-    tau2_alpha: float = 3.0,
+    tau2_alpha: float | torch.Tensor = 3.0,
     q_alpha: float = 2.0,
     q_beta: float = 20.0,
     dtype: torch.dtype = torch.float32,
