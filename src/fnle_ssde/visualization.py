@@ -871,9 +871,9 @@ def plot_posterior_figure(
         )
         regime_ax.set(
             ylim=(-0.05, 1.05),
-            title="Regime posterior",
+            title="Posterior probability of regime " + str(case.regime + 1),
             xlabel="time",
-            ylabel="Posterior probability",
+            ylabel="Probability",
         )
         regime_ax.yaxis.grid(False)
         if truth_regime_ax is not None:
