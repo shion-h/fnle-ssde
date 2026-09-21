@@ -30,7 +30,6 @@ from fnle_ssde.visualization import (  # noqa: E402
     PosteriorFigureCase,
     plot_multichain_traces,
     plot_posterior_figure,
-    rank_normalized_rhat,
 )
 
 
@@ -38,8 +37,7 @@ FIGURE_PATH = ROOT / "results/figures/example_3.png"
 FIGURE_PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
 TRACE_PATH = ROOT / "results/figures/example_3_multichain_trace.png"
 TRACE_PDF_PATH = TRACE_PATH.with_suffix(".pdf")
-RHAT_PATH = ROOT / "results/diagnostics/example_3_rhat.csv"
-REGIME_ALIGNMENT_PATH = ROOT / "results/diagnostics/example_3_regime_alignment.csv"
+REGIME_ALIGNMENT_PATH = ROOT / "results/example_3_regime_alignment.csv"
 FONT_SCALE = 2.0
 TEXT_FONT_COEFFICIENT = 9.0
 PANEL_TITLE_FONT_COEFFICIENT = 12.0
@@ -162,13 +160,6 @@ def extract_aligned_scalar_chains(
     return chains, display_names
 
 
-def save_rhat(rhat: dict[str, float]) -> None:
-    """Save publication-ready rank-normalized split-R-hat values."""
-    RHAT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    pd.Series(rhat, name="r_hat").round(3).rename_axis("parameter").to_csv(RHAT_PATH)
-    print(f"saved: {RHAT_PATH}")
-
-
 def save_regime_alignment(
     regime_orders: tuple[tuple[int, ...], ...],
 ) -> None:
@@ -242,11 +233,6 @@ def main() -> None:
         font_scale=FONT_SCALE,
         text_font_coefficient=TEXT_FONT_COEFFICIENT,
         panel_title_font_coefficient=PANEL_TITLE_FONT_COEFFICIENT,
-    )
-    save_rhat(
-        rank_normalized_rhat(
-            {name: values[:, BURN_IN:] for name, values in chains.items()}
-        )
     )
     save_regime_alignment(regime_orders)
 

@@ -11,9 +11,7 @@ from matplotlib.lines import Line2D
 from matplotlib.text import Text
 import numpy as np
 import torch
-import xarray as xr
 
-import arviz as az
 from scipy.stats import gaussian_kde
 
 from .dynamics import Dynamics
@@ -233,23 +231,6 @@ def combine_chain_histories(
                 else:
                     combined[key].append(value)
     return combined
-
-
-def rank_normalized_rhat(
-    chains: dict[str, torch.Tensor],
-) -> dict[str, float]:
-    """Compute rank-normalized split-R-hat for named scalar MCMC traces."""
-    if not chains:
-        raise ValueError("At least one named trace is required.")
-    names = tuple(chains)
-    values = torch.stack([chains[name] for name in names], dim=-1)
-    if values.ndim != 3:
-        raise ValueError("Each trace must have shape (num_chains, num_draws).")
-    dataset = xr.Dataset(
-        {"value": (("chain", "draw", "component"), values.detach().cpu().numpy())}
-    )
-    rhat = az.rhat(dataset, method="rank")["value"].values
-    return {name: float(rhat[index]) for index, name in enumerate(names)}
 
 
 def plot_multichain_traces(
