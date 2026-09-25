@@ -188,7 +188,7 @@ def make_figure(output_path: Path) -> None:
     trajectory_ax.text(
         0.99,
         0.96,
-        "background color = active regime",
+        "Background color = active regime",
         transform=trajectory_ax.transAxes,
         ha="right",
         va="top",
@@ -196,10 +196,10 @@ def make_figure(output_path: Path) -> None:
     )
 
     regime_ax.step(times, z, where="post", color="#222222", lw=2.0, zorder=3)
-    regime_ax.set_yticks([0, 1], ["regime 1", "regime 2"])
+    regime_ax.set_yticks([0, 1], ["Regime 1", "Regime 2"])
     regime_ax.set_ylim(-0.35, 1.35)
     regime_ax.set_ylabel(r"Regime $Z_t$")
-    regime_ax.set_xlabel("time")
+    regime_ax.set_xlabel("Time")
     regime_ax.grid(False)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,7 +211,6 @@ def make_figure(output_path: Path) -> None:
     print(f"saved figure: {output_path}")
     if pdf_path != output_path:
         print(f"saved figure: {pdf_path}")
-    print(f"jump times: {[round(value, 2) for value in jump_times]}")
 
 
 def main() -> None:

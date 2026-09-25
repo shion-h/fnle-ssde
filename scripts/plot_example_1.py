@@ -1,4 +1,4 @@
-"""Plot Figure 1 from the saved simulator/NLE density grids."""
+"""Plot Figure 1 from the saved simulator/FNLE density grids."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ OVERALL_TITLE_FONT_COEFFICIENT = 28.0  # Reserved if an overall title is added.
 
 
 def load_numerical_rows() -> list[dict[str, Any]]:
-    """Load the saved simulator and NLE density-grid results."""
+    """Load the saved simulator and FNLE density-grid results."""
     if not NUMERICAL_RESULT_PATH.exists():
         raise FileNotFoundError(
             f"Run scripts/example_1.py first: {NUMERICAL_RESULT_PATH}"
@@ -47,7 +47,7 @@ def plot_density_comparison(
     row: dict[str, Any],
     regime: int,
 ) -> None:
-    """Plot one simulator-versus-NLE density comparison panel."""
+    """Plot one simulator-versus-FNLE density comparison panel."""
     simulator_density, simulator_levels = relative_density_hpd(row["kde_grid"])
     nle_density, nle_levels = relative_density_hpd(row["nle_grid"])
     ax.contour(
@@ -84,7 +84,7 @@ def plot_density_comparison(
     correlation = row["metrics"]["spearman_log_density"]
     ax.set_title(
         rf"$\theta=\theta_{{{regime + 1}}}$, "
-        rf"$\Delta t={float(context[8]) * DT:.2f}$"
+        rf"$\Delta={float(context[8]) * DT:.2f}$"
         "\n"
         rf"$\rho={correlation:.2f}$"
     )
@@ -126,7 +126,7 @@ def add_density_legend(ax: plt.Axes) -> None:
     ax.legend(
         handles=[
             plt.Line2D([0], [0], color="#2166ac", lw=2, label="Simulator KDE HPD"),
-            plt.Line2D([0], [0], color="#b2182b", lw=2, ls="--", label="NLE HPD"),
+            plt.Line2D([0], [0], color="#b2182b", lw=2, ls="--", label="FNLE HPD"),
             plt.Line2D(
                 [0],
                 [0],
@@ -145,7 +145,7 @@ def add_density_legend(ax: plt.Axes) -> None:
 def create_density_comparison_figure(
     rows: list[dict[str, Any]],
 ) -> plt.Figure:
-    """Create the complete simulator-versus-NLE comparison figure."""
+    """Create the complete simulator-versus-FNLE comparison figure."""
     set_figure_font_style(
         font_scale=FONT_SCALE,
         text_font_coefficient=TEXT_FONT_COEFFICIENT,

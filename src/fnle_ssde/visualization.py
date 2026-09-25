@@ -535,7 +535,7 @@ def plot_posterior_y_trajectory(
             truth[:, dimension],
             color=TRUTH_COLOR,
             lw=1.5,
-            label="latent truth",
+            label="Latent truth",
         )
     ax.fill_between(
         times,
@@ -544,14 +544,14 @@ def plot_posterior_y_trajectory(
         color=POSTERIOR_COLOR,
         alpha=0.25,
         lw=0,
-        label="posterior 95% interval (linear interp.)",
+        label="95% credible interval",
     )
     ax.plot(
         times,
         mean[:, dimension],
         color=POSTERIOR_COLOR,
         lw=1.7,
-        label="posterior mean",
+        label="Posterior mean",
     )
     ax.scatter(
         observation_times,
@@ -559,7 +559,7 @@ def plot_posterior_y_trajectory(
         s=12,
         color=OBSERVATION_COLOR,
         alpha=0.6,
-        label="observed",
+        label="Observed",
     )
 
 
@@ -629,14 +629,14 @@ def plot_parameter_bars(
         true_values = np.array(
             [float(truth[regime, index]) for index, regime in entries]
         )
-        ax.bar(x - 0.18, true_values, 0.36, color="#444444", label="truth")
+        ax.bar(x - 0.18, true_values, 0.36, color="#444444", label="Truth")
     ax.bar(
         posterior_x,
         means,
         posterior_width,
         color=POSTERIOR_COLOR,
         alpha=0.82,
-        label="posterior",
+        label="Posterior mean",
     )
     ax.errorbar(
         posterior_x,
@@ -830,7 +830,7 @@ def plot_posterior_figure(
                 where="post",
                 color=TRUTH_COLOR,
                 lw=1.4,
-                label="true regime",
+                label="True regime",
             )
             truth_regime_ax.set(
                 ylim=(0.95, case.num_regimes + 0.05),
@@ -853,7 +853,7 @@ def plot_posterior_figure(
         regime_ax.set(
             ylim=(-0.05, 1.05),
             title="Posterior probability of regime " + str(case.regime + 1),
-            xlabel="time",
+            xlabel="Time",
             ylabel="Probability",
         )
         regime_ax.yaxis.grid(False)

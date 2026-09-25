@@ -47,22 +47,22 @@ PARAMETER_NAMES = (
     r"\beta",
     r"\gamma",
     r"\delta",
-    r"\sigma_D",
-    r"\sigma_P",
+    r"\sigma_1",
+    r"\sigma_2",
 )
-PARAMETER_KEYS = ("alpha", "beta", "gamma", "delta", "sigma_D", "sigma_P")
+PARAMETER_KEYS = ("alpha", "beta", "gamma", "delta", "sigma_1", "sigma_2")
 PARAMETER_SWITCHING = (True, True, True, True, False, False)
 DENSITY_GROUPS = (
     (r"$\alpha$", ("alpha[1]", "alpha[2]")),
     (r"$\beta$", ("beta[1]", "beta[2]")),
     (r"$\gamma$", ("gamma[1]", "gamma[2]")),
     (r"$\delta$", ("delta[1]", "delta[2]")),
-    (r"$\sigma_D$", ("sigma_D",)),
-    (r"$\sigma_P$", ("sigma_P",)),
+    (r"$\sigma_1$", ("sigma_1",)),
+    (r"$\sigma_2$", ("sigma_2",)),
     (r"$q_{12}$", ("q12",)),
     (r"$q_{21}$", ("q21",)),
-    (r"$\tau_D$", ("tau_D",)),
-    (r"$\tau_P$", ("tau_P",)),
+    (r"$\tau_1$", ("tau_1",)),
+    (r"$\tau_2$", ("tau_2",)),
 )
 
 
@@ -94,7 +94,6 @@ def plot_result(
         trajectory_dimensions=(0, 1),
         trajectory_labels=(r"$\mathit{Didinium}$", r"$\mathit{Paramecium}$"),
         dynamics=dynamics,
-        parameter_ylabel="physical scale",
     )
     plot_posterior_figure(
         (case,),
@@ -147,14 +146,14 @@ def extract_aligned_scalar_chains(
 
     chains["q12"] = Q[:, :, 0, 1]
     chains["q21"] = Q[:, :, 1, 0]
-    chains["tau_D"] = tau[:, :, 0]
-    chains["tau_P"] = tau[:, :, 1]
+    chains["tau_1"] = tau[:, :, 0]
+    chains["tau_2"] = tau[:, :, 1]
     display_names.update(
         {
             "q12": r"$q_{12}$",
             "q21": r"$q_{21}$",
-            "tau_D": r"$\tau_D$",
-            "tau_P": r"$\tau_P$",
+            "tau_1": r"$\tau_1$",
+            "tau_2": r"$\tau_2$",
         }
     )
     return chains, display_names

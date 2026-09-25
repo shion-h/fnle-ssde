@@ -80,7 +80,7 @@ def main() -> None:
             names = (r"\alpha", r"\beta", r"\gamma", r"\delta", "c")
             switching = (True, False, False, False, False)
         else:
-            title = "SIR epidemic model"
+            title = "Susceptible–Infected–Recovered epidemic model"
             groups = (ParameterPlotGroup("Switching", (0, 1), 1),)
             names = (r"\beta", r"\gamma")
             switching = (True, True)
