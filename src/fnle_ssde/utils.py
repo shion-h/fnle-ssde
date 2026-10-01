@@ -6,7 +6,7 @@ import multiprocessing
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -18,6 +18,7 @@ from .prior import (
     sample_generator_matrix,
     sample_initial_theta_from_normal_prior,
     sample_initial_theta_from_prior,
+    sample_initial_theta_from_truncated_physical_prior,
 )
 
 if TYPE_CHECKING:
@@ -51,16 +52,17 @@ def build_spline_nle(
     num_transforms: int = 5,
     num_bins: int = 10,
     training_data_cache_path: Path | None = None,
+    state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
+    spline_clamp_bounds: tuple[float | None, float | None] | None = (0.0, None),
 ) -> NLEEstimator:
     """Load an NLE cache or train an NSF from a spline through observations."""
     if theta_lower.shape != theta_upper.shape:
         raise ValueError("theta_lower and theta_upper must have the same shape.")
     if torch.any(theta_lower >= theta_upper):
         raise ValueError("theta_lower must be strictly less than theta_upper.")
-    theta_nle_a = dynamics.to_nle_theta(theta_lower)
-    theta_nle_b = dynamics.to_nle_theta(theta_upper)
-    theta_nle_lower = torch.minimum(theta_nle_a, theta_nle_b)
-    theta_nle_upper = torch.maximum(theta_nle_a, theta_nle_b)
+    theta_nle_lower, theta_nle_upper = dynamics.physical_bounds_to_nle_bounds(
+        theta_lower, theta_upper
+    )
     if not torch.all(torch.isfinite(theta_nle_lower)) or not torch.all(
         torch.isfinite(theta_nle_upper)
     ):
@@ -99,34 +101,13 @@ def build_spline_nle(
         epochs=epochs,
         stop_after_epochs=stop_after_epochs,
         samples_per_theta=1,
-        state_clamp_bounds=(0.0, 1e4),
+        state_clamp_bounds=state_clamp_bounds,
+        spline_clamp_bounds=spline_clamp_bounds,
         noisy_init_strategy=noisy_init_strategy,
         max_noisy_init_attempts=1_000,
         training_data_cache_path=training_data_cache_path,
     )
     return nle
-
-
-def sample_initial_theta_from_truncated_physical_prior(
-    *,
-    dynamics: Any,
-    physical_theta_prior: Distribution,
-    theta_lower: torch.Tensor,
-    theta_upper: torch.Tensor,
-    switching_mask: torch.Tensor,
-    num_regimes: int,
-) -> torch.Tensor:
-    """Draw regime parameters from a physical prior truncated to NLE support."""
-    lower_cdf = physical_theta_prior.cdf(theta_lower)
-    upper_cdf = physical_theta_prior.cdf(theta_upper)
-    probabilities = lower_cdf + torch.rand(
-        (num_regimes, theta_lower.numel()),
-        dtype=lower_cdf.dtype,
-        device=lower_cdf.device,
-    ) * (upper_cdf - lower_cdf)
-    physical_theta = physical_theta_prior.icdf(probabilities)
-    physical_theta[:, ~switching_mask] = physical_theta[0, ~switching_mask]
-    return dynamics.to_nle_theta(physical_theta)
 
 
 def make_symmetric_generator(
@@ -209,6 +190,14 @@ def initialize_ctmc_path_from_generator(
         sampler.z_true_list[series_index] = torch.tensor(
             regimes, dtype=torch.long, device=sampler.device
         )
+        # A replacement true path invalidates any grid built during NUTS
+        # initialization. Retain the tuned step sizes, not the stale grid.
+        for grids in (
+            sampler.T_all_list, sampler.z_aug_list, sampler.is_event_time_list,
+            sampler.obs_idx_list, sampler.true_idx_list, sampler.pseudo_idx_list,
+            sampler.y_aug_list,
+        ):
+            grids[series_index] = None
 
 
 def initialize_mcmc_sampler(
@@ -229,7 +218,6 @@ def initialize_mcmc_sampler(
     initial_path_Q: torch.Tensor | None = None,
     initial_theta: torch.Tensor | None = None,
     initial_log_tau: torch.Tensor | None = None,
-    y0_prior_scale: float | torch.Tensor = 0.5,
     y_mh_config: dict[str, Any] | None = None,
     theta_mh_config: dict[str, Any] | None = None,
     y_tree_depth: int = 3,
@@ -324,10 +312,6 @@ def initialize_mcmc_sampler(
         },
         prior_config=prior_config,
         theta_prior=theta_prior,
-        y0_prior_loc=x_obs[0],
-        y0_prior_scale=torch.as_tensor(
-            y0_prior_scale, dtype=x_obs.dtype, device=x_obs.device
-        ).broadcast_to((x_obs.shape[1],)),
         dtype=torch.float32,
         time_dtype=time_dtype,
         seed=seed,
@@ -454,6 +438,31 @@ def _configure_chain_worker() -> None:
     torch.set_num_interop_threads(1)
 
 
+def run_parallel_chains(
+    worker: Callable[..., tuple[int, str | Path]],
+    tasks: Sequence[dict[str, Any]],
+    *,
+    initializer: Callable[[], None] | None = None,
+) -> tuple[Path, ...]:
+    """Run numbered chain tasks in parallel and return paths in chain order."""
+    if not tasks:
+        raise ValueError("At least one chain task is required.")
+    outputs: list[Path | None] = [None] * len(tasks)
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=len(tasks), mp_context=context, initializer=initializer,
+    ) as executor:
+        futures = [executor.submit(worker, **task) for task in tasks]
+        for future in as_completed(futures):
+            chain_id, output = future.result()
+            if not 0 <= chain_id < len(tasks) or outputs[chain_id] is not None:
+                raise ValueError(f"Invalid or repeated chain_id: {chain_id}")
+            outputs[chain_id] = Path(output)
+    if any(output is None for output in outputs):
+        raise RuntimeError("A chain task did not return a result.")
+    return tuple(output for output in outputs if output is not None)
+
+
 def run_experiment(
     *,
     experiment_name: str,
@@ -467,7 +476,7 @@ def run_experiment(
     chain_config: dict[str, Any],
     output_payload: dict[str, Any] | None = None,
 ) -> tuple[Path, ...]:
-    """Train/load an NLE, run one or more MCMC chains, and save each history."""
+    """Train/load an NLE, run chains, and save histories."""
     seeds = tuple(int(seed) for seed in chain_config["seeds"])
     history_paths = tuple(Path(path) for path in chain_config["history_paths"])
     latest_paths_config = chain_config.get("latest_sample_paths")
@@ -540,22 +549,9 @@ def run_experiment(
             }
         )
 
-    outputs: list[Path | None] = [None] * len(tasks)
-    context = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(
-        max_workers=len(tasks),
-        mp_context=context,
-        initializer=_configure_chain_worker,
-    ) as executor:
-        futures = [
-            executor.submit(_run_and_save_chain, **task)
-            for task in tasks
-        ]
-        for future in as_completed(futures):
-            chain_id, output = future.result()
-            outputs[chain_id] = Path(output)
-
-    return tuple(output for output in outputs if output is not None)
+    return run_parallel_chains(
+        _run_and_save_chain, tasks, initializer=_configure_chain_worker,
+    )
 
 
 def posterior_outside_support(
