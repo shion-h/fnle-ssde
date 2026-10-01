@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from torch.distributions import Distribution, Gamma, Normal
@@ -194,6 +194,55 @@ def sample_initial_theta_from_prior(
         "Could not draw initial theta inside the physical NLE support after "
         f"{max_attempts} attempts."
     )
+
+
+def sample_initial_theta_from_truncated_physical_prior(
+    *,
+    dynamics: Any,
+    physical_theta_prior: Distribution | Sequence[Distribution],
+    theta_lower: torch.Tensor,
+    theta_upper: torch.Tensor,
+    switching_mask: torch.Tensor,
+    num_regimes: int,
+) -> torch.Tensor:
+    """Draw from a physical prior truncated to NLE support, then transform.
+
+    A sequence of scalar distributions permits different prior families for
+    different physical parameters. A single batched distribution retains the
+    existing sampling path, including its random-number and dtype behavior.
+    """
+    if isinstance(physical_theta_prior, Distribution):
+        lower_cdf = physical_theta_prior.cdf(theta_lower)
+        upper_cdf = physical_theta_prior.cdf(theta_upper)
+        probabilities = lower_cdf + torch.rand(
+            (num_regimes, theta_lower.numel()),
+            dtype=lower_cdf.dtype,
+            device=lower_cdf.device,
+        ) * (upper_cdf - lower_cdf)
+        physical_theta = physical_theta_prior.icdf(probabilities)
+    else:
+        if len(physical_theta_prior) != theta_lower.numel():
+            raise ValueError("One physical prior is required per theta component.")
+        lower_cdf = torch.stack([
+            prior.cdf(bound.to(torch.float64))
+            for prior, bound in zip(physical_theta_prior, theta_lower)
+        ])
+        upper_cdf = torch.stack([
+            prior.cdf(bound.to(torch.float64))
+            for prior, bound in zip(physical_theta_prior, theta_upper)
+        ])
+        probabilities = lower_cdf + torch.rand(
+            (num_regimes, theta_lower.numel()),
+            dtype=lower_cdf.dtype,
+            device=lower_cdf.device,
+        ) * (upper_cdf - lower_cdf)
+        physical_theta = torch.stack([
+            prior.icdf(probabilities[:, index])
+            for index, prior in enumerate(physical_theta_prior)
+        ], dim=-1)
+        physical_theta = physical_theta.to(theta_lower.dtype)
+    physical_theta[:, ~switching_mask] = physical_theta[0, ~switching_mask]
+    return dynamics.to_nle_theta(physical_theta)
 
 
 def sample_generator_matrix(
