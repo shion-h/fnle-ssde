@@ -544,7 +544,7 @@ def plot_posterior_y_trajectory(
         color=POSTERIOR_COLOR,
         alpha=0.25,
         lw=0,
-        label="95% credible interval",
+        label="95% predictive interval",
     )
     ax.plot(
         times,
@@ -560,6 +560,7 @@ def plot_posterior_y_trajectory(
         color=OBSERVATION_COLOR,
         alpha=0.6,
         label="Observed",
+        zorder=3,
     )
 
 
