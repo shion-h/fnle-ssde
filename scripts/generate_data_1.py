@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from fnle_ssde.dynamics import OUDynamics
+from fnle_ssde.dynamics import ExactTransitionOUDynamics
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +23,7 @@ PHYSICAL_TRUTH = torch.tensor(
 
 
 def simulate_path(
-    dynamics: OUDynamics,
+    dynamics: ExactTransitionOUDynamics,
     physical_theta: torch.Tensor,
     grid: torch.Tensor,
     generator: torch.Generator,
@@ -40,7 +40,7 @@ def simulate_path(
 
 
 def generate_data() -> dict:
-    dynamics = OUDynamics(dt=DT, device="cpu")
+    dynamics = ExactTransitionOUDynamics(dt=DT, device="cpu")
     times = torch.arange(round(END_TIME / OBS_DELTA) + 1, dtype=torch.float64) * OBS_DELTA
     simulation_times = (
         torch.arange(round(END_TIME / SIMULATION_DELTA) + 1, dtype=torch.float64)

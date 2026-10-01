@@ -13,7 +13,7 @@ from pathlib import Path
 import time
 
 import torch
-from torch.distributions import Normal
+from torch.distributions import LogNormal, Normal
 
 from fnle_ssde.dynamics import ExactTransitionOUDynamics, OUDynamics
 from fnle_ssde.nle import NLEEstimator
@@ -21,7 +21,7 @@ from fnle_ssde.ou_sampler import ContinuousTimeOUHMMSampler
 from fnle_ssde.prior import (
     make_prior_config,
     sample_generator_matrix,
-    sample_initial_theta_from_truncated_coordinate_prior,
+    sample_initial_theta_from_truncated_physical_prior,
 )
 from fnle_ssde.sampler import ContinuousTimeAR1HMMSampler
 from fnle_ssde.utils import (
@@ -41,8 +41,8 @@ BURN_IN = 5_000
 TRAINING_SIZE = 100_000
 MAX_EPOCHS = 200
 REF_NOISE = 0.32
-Y_STEP_SIZE = 0.00390625
-THETA_STEP_SIZE = 0.03125
+Y_STEP_SIZE = 2.0 ** -8
+THETA_STEP_SIZE = 2.0 ** -5
 INITIAL_PATH_JUMP_RATE = 0.2
 THETA_PHYSICAL_LOW = torch.tensor([0.05, -2.0, 0.01])
 THETA_PHYSICAL_HIGH = torch.tensor([0.2, 2.0, 0.1])
@@ -126,8 +126,7 @@ def prepare_paired_training_data(data: dict) -> None:
 def train_fnle(method: str, data: dict) -> None:
     method_dir = NLE_CACHE_DIR / method
     model_path = method_dir / "nle.pt"
-    dynamics_class = ExactTransitionOUDynamics if method == "fnle_exact" else OUDynamics
-    dynamics = dynamics_class(dt=DT, device="cpu")
+    dynamics = OUDynamics(dt=DT, device="cpu")
     lower, upper = dynamics.physical_bounds_to_nle_bounds(
         THETA_PHYSICAL_LOW, THETA_PHYSICAL_HIGH,
     )
@@ -141,6 +140,11 @@ def train_fnle(method: str, data: dict) -> None:
     if estimator.estimator is not None:
         print(f"Reusing {method} model: {model_path}", flush=True)
         return
+    training_data_path = method_dir / "training.pt"
+    if not training_data_path.exists():
+        raise FileNotFoundError(
+            f"Generate paired OU training data first: {training_data_path}"
+        )
     reference_times = torch.arange(round(float(data["times"][-1]) / DT) + 1) * DT
     estimator.train(
         obs_times=data["times"], x_obs=data["x"],
@@ -150,7 +154,7 @@ def train_fnle(method: str, data: dict) -> None:
         samples_per_theta=1, epochs=MAX_EPOCHS, stop_after_epochs=20,
         batch_size=256, lr=5e-4, state_clamp_bounds=None,
         spline_clamp_bounds=None, noisy_init_strategy="resample",
-        training_data_cache_path=method_dir / "training.pt",
+        training_data_cache_path=training_data_path,
     )
 
 
@@ -165,7 +169,8 @@ def sample_chain(method: str, chain_id: int) -> tuple[int, Path]:
         return chain_id, path
 
     data = torch.load(DATA_PATH, map_location="cpu", weights_only=False)
-    dynamics = OUDynamics(dt=DT, device="cpu")
+    dynamics_class = ExactTransitionOUDynamics if method == "exact" else OUDynamics
+    dynamics = dynamics_class(dt=DT, device="cpu")
     if method == "exact":
         sampler_class = ContinuousTimeOUHMMSampler
         estimator = None
@@ -182,10 +187,15 @@ def sample_chain(method: str, chain_id: int) -> tuple[int, Path]:
         tau2_alpha=1e-3, q_alpha=2.0, q_beta=20.0,
     )
     switching_mask = torch.tensor([False, True, False])
-    initial_theta = sample_initial_theta_from_truncated_coordinate_prior(
-        Normal(prior["theta_loc"], prior["theta_scale"]),
-        THETA_PHYSICAL_LOW, THETA_PHYSICAL_HIGH, switching_mask,
-        dynamics=dynamics, num_regimes=2,
+    physical_theta_priors = (
+        LogNormal(prior["theta_loc"][0], prior["theta_scale"][0]),
+        Normal(prior["theta_loc"][1], prior["theta_scale"][1]),
+        LogNormal(prior["theta_loc"][2], prior["theta_scale"][2]),
+    )
+    initial_theta = sample_initial_theta_from_truncated_physical_prior(
+        dynamics=dynamics, physical_theta_prior=physical_theta_priors,
+        theta_lower=THETA_PHYSICAL_LOW, theta_upper=THETA_PHYSICAL_HIGH,
+        switching_mask=switching_mask, num_regimes=2,
     )
     initial_q = sample_generator_matrix(2, q_alpha=2.0, q_beta=20.0)
     q_for_initial_path = make_symmetric_generator(2, INITIAL_PATH_JUMP_RATE)

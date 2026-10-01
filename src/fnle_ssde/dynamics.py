@@ -3,7 +3,7 @@ from typing import Tuple
 
 import torch
 from torch.distributions import Distribution, TransformedDistribution
-from torch.distributions.transforms import ExpTransform, Transform, identity_transform
+from torch.distributions.transforms import CatTransform, ExpTransform, Transform, identity_transform
 
 
 class Dynamics(ABC):
@@ -39,6 +39,13 @@ class Dynamics(ABC):
     def to_nle_theta(self, physical_theta: torch.Tensor) -> torch.Tensor:
         """Map physical parameters to the real-valued NLE theta coordinate."""
         return self.theta_transform.inv(physical_theta)
+
+    def physical_bounds_to_nle_bounds(
+        self, lower: torch.Tensor, upper: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Enclose a physical parameter box in NLE coordinates."""
+        a, b = self.to_nle_theta(lower), self.to_nle_theta(upper)
+        return torch.minimum(a, b), torch.maximum(a, b)
 
     def pullback_theta_prior(
         self,
@@ -159,6 +166,133 @@ class Dynamics(ABC):
     def diffusion(self, x: torch.Tensor,
                   theta_diffusion: torch.Tensor) -> torch.Tensor:
         pass
+
+
+class OUDynamics(Dynamics):
+    r"""Scalar OU with Euler-Maruyama simulation.
+
+    Internal theta is (log kappa, mu, log sigma); physical theta is
+    (kappa, mu, sigma). There is no state clamp. Like other Dynamics subclasses,
+    simulate_one_step and simulate_n_steps use the base Euler-Maruyama methods.
+    """
+
+    theta_transform = CatTransform(
+        [ExpTransform(), identity_transform, ExpTransform()], dim=-1
+    )
+
+    def __init__(self, dt: float = 0.01, device: str = "cpu"):
+        super().__init__(dt, device)
+        self.x_dim = 1
+        self.theta_dim = 3
+
+    def split_theta(self, theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return theta[..., :2], theta[..., 2:]
+
+    def drift(self, x: torch.Tensor, theta_drift: torch.Tensor) -> torch.Tensor:
+        return theta_drift[..., :1] * (theta_drift[..., 1:2] - x)
+
+    def diffusion(self, x: torch.Tensor, theta_diffusion: torch.Tensor) -> torch.Tensor:
+        return torch.diag_embed(theta_diffusion.expand(
+            torch.broadcast_shapes(x.shape, theta_diffusion.shape)
+        ))
+
+
+class ExactTransitionOUDynamics(OUDynamics):
+    """OU dynamics with exact transitions over arbitrary elapsed times.
+
+    ``sample_transition``, ``transition_log_prob``, and ``sample_bridge`` use
+    analytic Gaussian laws. ``simulate_n_steps`` draws one exact transition of
+    duration ``n_steps * dt`` for the NLE training interface. The inherited
+    Inherited ``simulate_one_step`` and ``simulate`` remain Euler-Maruyama;
+    neither is used by exact OU training, data generation, or inference.
+    """
+
+    def transition_coefficients(
+        self, theta: torch.Tensor, delta: float | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return a, b, v in Y_next = a Y_prev + b + Normal(0, v)."""
+        delta = torch.as_tensor(delta, dtype=theta.dtype, device=theta.device)
+        if torch.any(~torch.isfinite(delta)) or torch.any(delta <= 0):
+            raise ValueError("OU transition delta must be finite and positive.")
+        kappa, mu, sigma = self.to_physical_theta(theta).unbind(-1)
+        kd = kappa * delta
+        a = torch.exp(-kd)
+        b = -torch.expm1(-kd) * mu
+        v = sigma.square() * (-torch.expm1(-2 * kd)) / (2 * kappa)
+        return a.unsqueeze(-1), b.unsqueeze(-1), v.unsqueeze(-1)
+
+    def transition_moments(
+        self, y_prev: torch.Tensor, theta: torch.Tensor, delta: float | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        a, b, v = self.transition_coefficients(theta, delta)
+        return a * y_prev + b, v
+
+    def transition_log_prob(
+        self, y_prev: torch.Tensor, y_next: torch.Tensor,
+        theta: torch.Tensor, delta: float | torch.Tensor,
+    ) -> torch.Tensor:
+        mean, variance = self.transition_moments(y_prev, theta, delta)
+        return torch.distributions.Normal(mean, variance.sqrt()).log_prob(y_next).sum(-1)
+
+    def sample_transition(
+        self, theta: torch.Tensor, y_prev: torch.Tensor, delta: float | torch.Tensor,
+        *, generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        mean, variance = self.transition_moments(y_prev, theta, delta)
+        noise = torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator)
+        return mean + variance.sqrt() * noise
+
+    def sample_bridge(
+        self, left_y: torch.Tensor, right_y: torch.Tensor,
+        times: torch.Tensor, interval_theta: torch.Tensor,
+        *, generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Sample interior states conditional on both endpoints and interval regimes.
+
+        times includes both endpoints; interval_theta has len(times)-1 rows.
+        Leading dimensions of the endpoints may be used to draw multiple bridges.
+        """
+        if times.ndim != 1 or times.numel() < 2:
+            raise ValueError("Bridge times must include two endpoints.")
+        if interval_theta.shape != (times.numel() - 1, self.theta_dim):
+            raise ValueError("One theta row is required per bridge interval.")
+        a, b, v = self.transition_coefficients(interval_theta, times.diff())
+        # Conditional right-endpoint distribution given each intermediate state.
+        A, B, V = [a[-1]], [b[-1]], [v[-1]]
+        for i in range(len(a) - 2, -1, -1):
+            next_a = A[-1]
+            A.append(next_a * a[i])
+            B.append(next_a * b[i] + B[-1])
+            V.append(next_a.square() * v[i] + V[-1])
+        A, B, V = A[::-1], B[::-1], V[::-1]
+        current = left_y
+        samples = []
+        for i in range(len(a) - 1):
+            mean = a[i] * current + b[i]
+            denominator = A[i + 1].square() * v[i] + V[i + 1]
+            gain = v[i] * A[i + 1] / denominator
+            mean = mean + gain * (right_y - A[i + 1] * mean - B[i + 1])
+            variance = v[i] * V[i + 1] / denominator
+            current = mean + variance.sqrt() * torch.randn(
+                mean.shape, dtype=mean.dtype, device=mean.device, generator=generator
+            )
+            samples.append(current)
+        if not samples:
+            return left_y.new_empty((*left_y.shape[:-1], 0, self.x_dim))
+        return torch.stack(samples, dim=-2)
+
+    def simulate_n_steps(
+        self, x: torch.Tensor, theta: torch.Tensor, n_steps: int,
+        *, generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Draw the exact final state after ``n_steps * dt`` elapsed time."""
+        if not isinstance(n_steps, int) or isinstance(n_steps, bool):
+            raise TypeError("n_steps must be an integer.")
+        if n_steps < 0:
+            raise ValueError("n_steps must be nonnegative.")
+        if n_steps == 0:
+            return x
+        return self.sample_transition(theta, x, n_steps * self.dt, generator=generator)
 
 
 class LotkaVolterraDynamics(Dynamics):
@@ -420,6 +554,30 @@ class GeneExpressionCLEDynamics(Dynamics):
             dim=-1,
         )
         return torch.diag_embed(diagonal)
+
+
+class ReparametrizedGeneExpressionCLEDynamics(GeneExpressionCLEDynamics):
+    r"""CLE whose first physical parameter is rho = alpha/beta.
+
+    Physical theta is (rho, beta, gamma, delta, c) and the real-valued NLE
+    coordinate is its component-wise logarithm. The reaction rate alpha is
+    recovered as rho * beta before evaluating the original CLE dynamics.
+    A physical-scale prior on rho is therefore specified directly through
+    the inherited ``pullback_theta_prior`` method.
+    """
+
+    def split_theta(
+        self, theta: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if theta.shape[-1] != self.theta_dim:
+            raise ValueError(
+                f"Expected {self.theta_dim} parameters, got {theta.shape[-1]}."
+            )
+        original_theta = torch.cat(
+            ((theta[..., 0] * theta[..., 1]).unsqueeze(-1), theta[..., 1:]),
+            dim=-1,
+        )
+        return super().split_theta(original_theta)
 
 
 class LatentMGeneExpressionCLEDynamics(Dynamics):
