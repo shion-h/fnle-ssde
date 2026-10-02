@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from fnle_ssde.dynamics import (  # noqa: E402
-    GeneExpressionCLEDynamics,
     LotkaVolterraDynamics,
+    ReparametrizedGeneExpressionCLEDynamics,
     SIRDynamics,
 )
 
@@ -50,11 +50,12 @@ def settings() -> dict[str, dict[str, object]]:
             "obs_interval": 100,
         },
         "cle": {
-            "dynamics": GeneExpressionCLEDynamics(
+            "dynamics": ReparametrizedGeneExpressionCLEDynamics(
                 dt=0.01,
                 device="cpu",
                 state_upper_bound=1e4,
             ),
+            # Physical coordinates are (alpha/beta, beta, gamma, delta, c).
             "theta_true": torch.log(
                 torch.tensor(
                     [
@@ -72,7 +73,7 @@ def settings() -> dict[str, dict[str, object]]:
         "sir": {
             "dynamics": SIRDynamics(dt=0.01),
             "theta_true": torch.log(
-                torch.tensor([[0.40, 0.10], [0.80, 0.20]])
+                torch.tensor([[0.30, 0.10], [0.20, 0.30]])
             ),
             "Q_true": torch.tensor([[-0.025, 0.025], [0.025, -0.025]]),
             # Reduced SIR state: susceptible and recovered. Infected is
