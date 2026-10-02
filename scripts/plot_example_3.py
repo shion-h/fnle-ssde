@@ -20,6 +20,7 @@ from example_3 import (  # noqa: E402
     HISTORY_PATHS,
     NUM_CHAINS,
     NUM_SWEEPS,
+    RESULT_PATH,
     read_observations,
 )
 from fnle_ssde.dynamics import LotkaVolterraDynamics  # noqa: E402
@@ -33,11 +34,11 @@ from fnle_ssde.visualization import (  # noqa: E402
 )
 
 
-FIGURE_PATH = ROOT / "results/figures/example_3.png"
+FIGURE_PATH = RESULT_PATH / "posterior.png"
 FIGURE_PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
-TRACE_PATH = ROOT / "results/figures/example_3_multichain_trace.png"
+TRACE_PATH = RESULT_PATH / "multichain_trace.png"
 TRACE_PDF_PATH = TRACE_PATH.with_suffix(".pdf")
-REGIME_ALIGNMENT_PATH = ROOT / "results/example_3_regime_alignment.csv"
+REGIME_ALIGNMENT_PATH = RESULT_PATH / "regime_alignment.csv"
 FONT_SCALE = 2.0
 TEXT_FONT_COEFFICIENT = 9.0
 PANEL_TITLE_FONT_COEFFICIENT = 12.0
