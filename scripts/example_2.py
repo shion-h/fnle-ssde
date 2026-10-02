@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -13,24 +13,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from fnle_ssde.dynamics import (  # noqa: E402
-    GeneExpressionCLEDynamics,
     LotkaVolterraDynamics,
+    ReparametrizedGeneExpressionCLEDynamics,
     SIRDynamics,
 )
 from fnle_ssde.utils import run_experiment  # noqa: E402
 from generate_data_2 import DATA_PATHS  # noqa: E402
 
 
+RESULT_PATH = ROOT / "results/example_2"
 NLE_CACHE_PATHS = {
-    "lv": ROOT / "results/example2_lv_nle.pt",
-    "cle": ROOT / "results/example2_cle_nle.pt",
-    "sir": ROOT / "results/example2_sir_nle.pt",
+    name: RESULT_PATH / name / "nle.pt" for name in ("lv", "cle", "sir")
 }
-LV_HISTORY_PATH = ROOT / "results/example2_lv_mcmc.pt"
-CLE_HISTORY_PATH = ROOT / "results/example2_cle_mcmc.pt"
-SIR_HISTORY_PATH = ROOT / "results/example2_sir_mcmc.pt"
+LV_HISTORY_PATH = RESULT_PATH / "lv/example2_lv_mcmc_chain.pt"
+CLE_HISTORY_PATH = RESULT_PATH / "cle/chain.pt"
+SIR_HISTORY_PATH = RESULT_PATH / "sir/example2_sir_mcmc_chain.pt"
 
 Q_PRIOR_ALPHA, Q_PRIOR_BETA = 2.0, 20.0
+# Settings shared by LV, CLE and SIR. Existing histories are not overwritten.
+SEEDS = (0, 1, 2, 3)
+NUM_SWEEPS = 10_000
+BURN_IN = 5_000
+PROGRESS_EVERY = 100
+NLE_TRAINING_SAMPLES = 100_000
+NLE_SEED = 0
 
 
 @dataclass(frozen=True)
@@ -44,70 +50,80 @@ class Experiment:
     theta_low: torch.Tensor
     theta_high: torch.Tensor
     switching_mask: torch.Tensor
-    tau2_beta: torch.Tensor
     ref_noise: float
     theta_prior_loc: torch.Tensor
     theta_prior_scale: torch.Tensor
     initial_path_jump_rate: float
+    tau2_alpha: float = 1e-3
+    tau2_beta: torch.Tensor = field(kw_only=True)
+    y_step_size: float | None = 2.0 ** -9
+    theta_step_size: float | None = 2.0 ** -8
+    y_max_tree_depth: int = 5
+    theta_max_tree_depth: int = 3
+    # False + step_size=None searches once initially, then fixes the step.
+    adapt_step_size: bool = False
+    seeds: tuple[int, ...] = SEEDS
+    num_sweeps: int = NUM_SWEEPS
+    burn_in: int = BURN_IN
 
 
 def experiments() -> tuple[Experiment, ...]:
     return (
         Experiment(
-            "lv",
-            LotkaVolterraDynamics(
+            name="lv",
+            dynamics=LotkaVolterraDynamics(
                 dt=0.01,
                 device="cpu",
                 state_upper_bound=1e4,
             ),
-            DATA_PATHS["lv"],
-            LV_HISTORY_PATH,
-            NLE_CACHE_PATHS["lv"],
-            100,
-            torch.tensor([0.01, 0.1, 0.01, 0.1, 0.01, 0.01]),
-            torch.tensor([2.0, 3.0, 2.0, 3.0, 0.30, 0.20]),
-            torch.tensor([True, True, True, True, False, False]),
-            torch.full((2,), 2e-4),
-            0.32,
-            torch.tensor([0.0, 0.0, 0.0, 0.0, -1.0, -1.0]),
-            torch.ones(6),
-            0.2,
+            data_path=DATA_PATHS["lv"],
+            history_path=LV_HISTORY_PATH,
+            nle_cache_path=NLE_CACHE_PATHS["lv"],
+            nle_epochs=100,
+            theta_low=torch.tensor([0.01, 0.1, 0.01, 0.1, 0.01, 0.01]),
+            theta_high=torch.tensor([2.0, 3.0, 2.0, 3.0, 0.30, 0.20]),
+            switching_mask=torch.tensor([True, True, True, True, False, False]),
+            ref_noise=0.32,
+            theta_prior_loc=torch.tensor([0.0, 0.0, 0.0, 0.0, -1.0, -1.0]),
+            theta_prior_scale=torch.ones(6),
+            initial_path_jump_rate=0.2,
+            tau2_beta=torch.full((2,), 1e-3),
         ),
         Experiment(
-            "cle",
-            GeneExpressionCLEDynamics(
+            name="cle",
+            dynamics=ReparametrizedGeneExpressionCLEDynamics(
                 dt=0.01,
                 device="cpu",
                 state_upper_bound=1e4,
             ),
-            DATA_PATHS["cle"],
-            CLE_HISTORY_PATH,
-            NLE_CACHE_PATHS["cle"],
-            100,
-            torch.tensor([50.0, 0.5, 0.001, 0.5, 0.01]),
-            torch.tensor([400.0, 1.5, 0.010, 1.5, 0.10]),
-            torch.tensor([True, False, False, False, False]),
-            torch.tensor([2.0, 2e-4]),
-            0.32,
-            torch.tensor([4.0, 0.0, 0.0, 0.0, 0.0]),
-            torch.ones(5),
-            0.4,
+            data_path=DATA_PATHS["cle"],
+            history_path=CLE_HISTORY_PATH,
+            nle_cache_path=NLE_CACHE_PATHS["cle"],
+            nle_epochs=100,
+            theta_low=torch.tensor([50.0 / 1.5, 0.5, 0.001, 0.5, 0.01]),
+            theta_high=torch.tensor([400.0 / 0.5, 1.5, 0.010, 1.5, 0.10]),
+            switching_mask=torch.tensor([True, False, False, False, False]),
+            ref_noise=0.32,
+            theta_prior_loc=torch.tensor([4.0, 0.0, 0.0, 0.0, 0.0]),
+            theta_prior_scale=torch.ones(5),
+            initial_path_jump_rate=0.4,
+            tau2_beta=torch.full((2,), 1e-3),
         ),
         Experiment(
-            "sir",
-            SIRDynamics(dt=0.01, device="cpu"),
-            DATA_PATHS["sir"],
-            SIR_HISTORY_PATH,
-            NLE_CACHE_PATHS["sir"],
-            100,
-            torch.tensor([0.05, 0.02]),
-            torch.tensor([2.0, 2.0]),
-            torch.tensor([True, True]),
-            torch.full((2,), 0.5),
-            0.32,
-            torch.zeros(2),
-            torch.ones(2),
-            0.5,
+            name="sir",
+            dynamics=SIRDynamics(dt=0.01, device="cpu"),
+            data_path=DATA_PATHS["sir"],
+            history_path=SIR_HISTORY_PATH,
+            nle_cache_path=NLE_CACHE_PATHS["sir"],
+            nle_epochs=100,
+            theta_low=torch.tensor([0.05, 0.02]),
+            theta_high=torch.tensor([2.0, 2.0]),
+            switching_mask=torch.tensor([True, True]),
+            ref_noise=0.32,
+            theta_prior_loc=torch.zeros(2),
+            theta_prior_scale=torch.ones(2),
+            initial_path_jump_rate=0.5,
+            tau2_beta=torch.full((2,), 1e-3),
         ),
     )
 
@@ -123,9 +139,33 @@ def run(experiment: Experiment) -> None:
         experiment.theta_prior_loc,
         experiment.theta_prior_scale,
     )
-    latest_sample_path = ROOT / (
-        f"results/checkpoints/{experiment.history_path.stem}_latest_sample.pt"
+    history_paths = tuple(
+        experiment.history_path if len(experiment.seeds) == 1 else
+        experiment.history_path.with_stem(f"{experiment.history_path.stem}{i}")
+        for i in range(len(experiment.seeds))
     )
+    latest_sample_paths = tuple(
+        path.with_stem(f"{path.stem}_latest") for path in history_paths
+    )
+    if all(path.exists() for path in history_paths):
+        print(f"[{experiment.name}] existing histories; skipping sampling.", flush=True)
+        return
+    if any(path.exists() for path in history_paths):
+        raise FileExistsError(
+            f"Partial {experiment.name} histories exist; refusing to overwrite them."
+        )
+    y_mh_config = {
+        "method": "nuts", "max_tree_depth": experiment.y_max_tree_depth,
+        "adapt_step_size": experiment.adapt_step_size,
+    }
+    theta_mh_config = {
+        "method": "nuts", "max_tree_depth": experiment.theta_max_tree_depth,
+        "adapt_step_size": experiment.adapt_step_size,
+    }
+    if experiment.y_step_size is not None:
+        y_mh_config["step_size"] = experiment.y_step_size
+    if experiment.theta_step_size is not None:
+        theta_mh_config["step_size"] = experiment.theta_step_size
     run_experiment(
         experiment_name=experiment.name,
         dynamics=experiment.dynamics,
@@ -137,7 +177,8 @@ def run(experiment: Experiment) -> None:
             "cache_path": experiment.nle_cache_path,
             "theta_lower": experiment.theta_low,
             "theta_upper": experiment.theta_high,
-            "n_params": 100_000,
+            "n_params": NLE_TRAINING_SAMPLES,
+            "seed": NLE_SEED,
             "ref_noise": experiment.ref_noise,
             "max_n_steps": max_n_steps,
             "epochs": experiment.nle_epochs,
@@ -147,22 +188,23 @@ def run(experiment: Experiment) -> None:
         sampler_config={
             "num_regimes": num_regimes,
             "switching_mask": experiment.switching_mask,
-            "tau2_alpha": 2.0,
+            "tau2_alpha": experiment.tau2_alpha,
             "tau2_beta": experiment.tau2_beta,
             "q_alpha": Q_PRIOR_ALPHA,
             "q_beta": Q_PRIOR_BETA,
             "initial_path_jump_rate": experiment.initial_path_jump_rate,
-            "y0_prior_scale": 1.0,
+            "y_mh_config": y_mh_config,
+            "theta_mh_config": theta_mh_config,
             "time_dtype": torch.float64,
             "use_t_pseudo_in_sir": False,
         },
         chain_config={
-            "seeds": (0,),
-            "history_paths": (experiment.history_path,),
-            "latest_sample_paths": (latest_sample_path,),
-            "num_sweeps": 1_000,
-            "burn_in": 500,
-            "progress_every": 100,
+            "seeds": experiment.seeds,
+            "history_paths": history_paths,
+            "latest_sample_paths": latest_sample_paths,
+            "num_sweeps": experiment.num_sweeps,
+            "burn_in": experiment.burn_in,
+            "progress_every": PROGRESS_EVERY,
         },
         output_payload={"data": data},
     )
