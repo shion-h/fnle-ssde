@@ -203,7 +203,7 @@ def sample_chain(method: str, chain_id: int) -> tuple[int, Path]:
         Q=initial_q, x_obs=data["x"], obs_times=data["times"],
         T=float(data["times"][-1]), omega_scale=3.0,
         switching_parameter_mask=switching_mask,
-        prior_config=prior, y0_prior="flat",
+        prior_config=prior,
         y_mh_config=dict(
             method="nuts", max_tree_depth=5, adapt_step_size=False,
             step_size=Y_STEP_SIZE,
