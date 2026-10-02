@@ -58,8 +58,9 @@ def generate_data() -> dict:
 
     return dict(
         times=times, y=y, x=x, jump_times=JUMP_TIMES.clone(), regimes=REGIMES.clone(),
+        theta_true=dynamics.to_nle_theta(PHYSICAL_TRUTH),
         metadata=dict(
-            data_seed=DATA_SEED, physical_truth=PHYSICAL_TRUTH.clone(),
+            data_seed=DATA_SEED,
             tau_truth=TAU_TRUTH, regime_path="fixed_two_switches", dt=DT,
             obs_delta=OBS_DELTA, simulation_delta=SIMULATION_DELTA,
             observation_noise_stream="same generator, after latent transitions",
@@ -80,7 +81,7 @@ def main() -> None:
             print(f"Reusing bitwise-identical data: {DATA_PATH}", flush=True)
             return
         torch.save(data, DATA_PATH)
-        print(f"Saved data without unused plot fields: {DATA_PATH}", flush=True)
+        print(f"Saved updated data: {DATA_PATH}", flush=True)
     else:
         torch.save(data, DATA_PATH)
         print(f"Saved {DATA_PATH}", flush=True)
