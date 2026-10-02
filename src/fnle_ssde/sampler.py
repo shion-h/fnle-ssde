@@ -34,6 +34,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pyro
 import pyro.distributions as dist
 from pyro.infer import HMC, MCMC, NUTS
@@ -71,7 +72,10 @@ class ContinuousTimeAR1HMMSampler:
         T: float | Sequence[float],
         *,
         omega_scale: float = 1.5,
-        nle_estimator: Any,
+        nle_estimator: Any = None,
+        dynamics: Any = None,
+        transition_log_prob_fn: Any = None,
+        transition_sample_fn: Any = None,
         y_mh_config: Optional[Dict[str, Any]] = None,
         theta_mh_config: Optional[Dict[str, Any]] = None,
         sir_config: Optional[Dict[str, Any]] = None,
@@ -79,9 +83,6 @@ class ContinuousTimeAR1HMMSampler:
         theta_prior: Optional[Distribution] = None,
         switching_parameter_mask: Optional[torch.Tensor] = None,
         fixed_parameter_mask: Optional[torch.Tensor] = None,
-        observed_dims: Optional[torch.Tensor] = None,
-        y0_prior_loc: float | torch.Tensor = 0.0,
-        y0_prior_scale: float | torch.Tensor = 5.0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float64,
         time_dtype: torch.dtype = torch.float64,
@@ -105,14 +106,27 @@ class ContinuousTimeAR1HMMSampler:
         nle_estimator:
             Trained/loaded NLEEstimator. Transition log densities are evaluated by
             `nle_estimator.transition_log_prob`.
+        dynamics / transition_log_prob_fn / transition_sample_fn:
+            Alternative to nle_estimator. Supply all three. The density callable
+            takes (y_prev, y_next, theta, delta) and returns one log density per
+            batch row; the sampling callable takes (theta, y_prev, delta) and
+            returns one state per row. Delta is elapsed time, not a step count.
+            Callables must preserve device/dtype and density gradients in y/theta.
         y_mh_config / theta_mh_config:
             MH settings for the corresponding conditional update. Set ``method``
-            to ``"nuts"`` and provide ``max_tree_depth`` and
-            ``target_accept_prob``, or set it to ``"mala"`` and provide
+            to ``"nuts"`` and provide ``max_tree_depth``, or set it to
+            ``"mala"`` and provide
             ``step_size``. MALA uses one-step Pyro HMC; its step size is the
             leapfrog epsilon, so the equivalent Langevin proposal has noise
             variance epsilon squared. Exactly one MH transition is performed per
-            MCMC sweep.
+            MCMC sweep. An explicit NUTS ``step_size`` skips initial tuning and
+            stays fixed. Otherwise NUTS step sizes are selected during initialize()
+            (one per y series and one for theta) and then held fixed; no mass
+            matrix adaptation or dual-averaging warmup is performed.
+            Setting NUTS ``adapt_step_size=True`` instead searches for a step
+            size at every update, using ``step_size`` (default 1) as the search
+            starting value. This state-dependent heuristic is intended for
+            calibration experiments, not fixed-kernel posterior sampling.
         sir_config:
             Settings for SIR initialization of y at newly inserted candidate
             times. ``num_particles`` controls the number of particles.
@@ -137,13 +151,6 @@ class ContinuousTimeAR1HMMSampler:
             their `initial_theta` values and excluded from both NUTS and the
             theta prior. Fixed dimensions take precedence over switching/shared
             classification.
-        observed_dims:
-            Latent-state dimension indices represented by the columns of x_obs.
-            Must have shape (obs_dim,). If omitted, all latent dimensions must be
-            observed and x_obs must have D columns.
-        y0_prior_loc / y0_prior_scale:
-            Gaussian prior location and scale for y at the initial time. Scalars
-            are broadcast across latent dimensions; vectors must have shape (D,).
         time_dtype:
             Floating-point dtype used for observation, jump, candidate, and
             augmented-grid times. Time differences are computed in this dtype and
@@ -152,6 +159,9 @@ class ContinuousTimeAR1HMMSampler:
         latest_sample_path:
             Optional monitoring file overwritten atomically after every completed
             MCMC sweep. The complete in-memory history is unchanged.
+
+        The initial latent state has an improper flat prior on all of real space.
+        Every latent-state dimension must be observed with Gaussian noise.
         """
         first_x_obs = x_obs[0] if isinstance(x_obs, (list, tuple)) else x_obs
         self.device = device or first_x_obs.device
@@ -204,49 +214,34 @@ class ContinuousTimeAR1HMMSampler:
         self.obs_dim = int(self.x_obs_list[0].shape[1])
         self.N_list = [int(x.shape[0]) for x in self.x_obs_list]
         self.nle_estimator = nle_estimator
-        self.flow_model = nle_estimator.estimator
-        if self.flow_model is None:
-            raise ValueError("nle_estimator.estimator must be trained/loaded before sampling.")
-        self.theta_dim = int(nle_estimator.dynamics.theta_dim)
-        self.D = int(nle_estimator.dynamics.x_dim)
-        self.y0_prior_loc = torch.as_tensor(
-            y0_prior_loc, dtype=self.dtype, device=self.device
-        ).broadcast_to((self.D,))
-        self.y0_prior_scale = torch.as_tensor(
-            y0_prior_scale, dtype=self.dtype, device=self.device
-        ).broadcast_to((self.D,))
-        if torch.any(self.y0_prior_scale <= 0):
-            raise ValueError("y0_prior_scale entries must be positive.")
-        if observed_dims is None:
-            if self.obs_dim != self.D:
-                raise ValueError(
-                    "observed_dims is required when x_obs does not contain every "
-                    f"latent dimension: obs_dim={self.obs_dim}, latent_dim={self.D}."
-                )
-            observed_dims = torch.arange(
-                self.D, dtype=torch.long, device=self.device
-            )
+        self.transition_log_prob_fn = transition_log_prob_fn
+        self.transition_sample_fn = transition_sample_fn
+        if nle_estimator is not None:
+            if any(value is not None for value in (
+                dynamics, transition_log_prob_fn, transition_sample_fn
+            )):
+                raise ValueError("Supply either nle_estimator or dynamics and transition callables.")
+            dynamics = nle_estimator.dynamics
+            self.flow_model = nle_estimator.estimator
+            if self.flow_model is None:
+                raise ValueError("nle_estimator.estimator must be trained/loaded before sampling.")
         else:
-            observed_dims = torch.as_tensor(
-                observed_dims, dtype=torch.long, device=self.device
+            if dynamics is None or not callable(transition_log_prob_fn) or not callable(transition_sample_fn):
+                raise ValueError("Without nle_estimator, dynamics and both transition callables are required.")
+            self.flow_model = None
+        self.dynamics = dynamics
+        self.theta_dim = int(dynamics.theta_dim)
+        self.D = int(dynamics.x_dim)
+        if self.obs_dim != self.D:
+            raise ValueError(
+                "x_obs must contain every latent dimension: "
+                f"obs_dim={self.obs_dim}, latent_dim={self.D}."
             )
         for series_idx, x_s in enumerate(self.x_obs_list):
             if x_s.ndim != 2:
                 raise ValueError(f"x_obs for series {series_idx} must be two-dimensional.")
             if x_s.shape[1] != self.obs_dim:
                 raise ValueError("All series must have the same observed dimension.")
-        if observed_dims.shape != (self.obs_dim,):
-            raise ValueError(
-                f"observed_dims must have shape ({self.obs_dim},), "
-                f"got {tuple(observed_dims.shape)}."
-            )
-        if torch.any(observed_dims < 0) or torch.any(observed_dims >= self.D):
-            raise ValueError(
-                f"observed_dims entries must be in [0, {self.D - 1}]."
-            )
-        if torch.unique(observed_dims).numel() != observed_dims.numel():
-            raise ValueError("observed_dims entries must be unique.")
-        self.observed_dims = observed_dims
         if switching_parameter_mask is None:
             switching_parameter_mask = torch.ones(
                 self.theta_dim, dtype=torch.bool, device=self.device
@@ -280,7 +275,7 @@ class ContinuousTimeAR1HMMSampler:
         self.shared_parameter_mask = (
             ~switching_parameter_mask & ~fixed_parameter_mask
         )
-        self.dynamics_dt = float(nle_estimator.dynamics.dt)
+        self.dynamics_dt = float(dynamics.dt)
         if self.dynamics_dt <= 0.0:
             raise ValueError("nle_estimator.dynamics.dt must be positive.")
         if hasattr(self.flow_model, "to"):
@@ -376,8 +371,6 @@ class ContinuousTimeAR1HMMSampler:
         self.true_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.pseudo_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.y_aug_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
-        self.initial_y_times_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
-        self.initial_y_values_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
         self.initial_regime_probs = torch.full(
             (self.K,), 1.0 / self.K, dtype=self.dtype, device=self.device
         )
@@ -397,9 +390,8 @@ class ContinuousTimeAR1HMMSampler:
             prepared = {
                 "method": "nuts",
                 "max_tree_depth": 4,
-                "target_accept_prob": 0.8,
             }
-            allowed_keys = {"max_tree_depth", "target_accept_prob"}
+            allowed_keys = {"max_tree_depth", "step_size", "adapt_step_size"}
         else:
             prepared = {"method": "mala", "step_size": 0.01}
             allowed_keys = {"step_size"}
@@ -408,7 +400,9 @@ class ContinuousTimeAR1HMMSampler:
             unknown = ", ".join(sorted(unknown_keys))
             raise ValueError(f"Unknown {argument_name} setting(s): {unknown}.")
         prepared.update(supplied)
-        if method == "mala":
+        if "adapt_step_size" in prepared and not isinstance(prepared["adapt_step_size"], bool):
+            raise ValueError(f"{argument_name}['adapt_step_size'] must be a bool.")
+        if "step_size" in prepared:
             step_size = float(prepared["step_size"])
             if not torch.isfinite(torch.tensor(step_size)) or step_size <= 0.0:
                 raise ValueError(
@@ -434,8 +428,6 @@ class ContinuousTimeAR1HMMSampler:
         initial_theta: Optional[torch.Tensor] = None,
         initial_log_tau: Optional[torch.Tensor] = None,
         initial_regime_probs: Optional[torch.Tensor] = None,
-        initial_y_times: Optional[torch.Tensor] = None,
-        initial_y_values: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Initialize theta, observation noise, and the true discrete path.
@@ -445,37 +437,15 @@ class ContinuousTimeAR1HMMSampler:
 
         The initial true path has no jumps. Its single regime is sampled from
         `initial_regime_probs`, unless that probability vector is overridden here.
+
+        For NUTS without an explicit step_size, perform one initial transition with step-size search
+        enabled, then freeze its step size for all subsequent sweeps. This is
+        initialization only (not stored in history), not dual-averaging warmup.
         """
         if initial_regime_probs is not None:
             probs = initial_regime_probs.to(device=self.device, dtype=self.dtype)
             self.initial_regime_probs = probs / probs.sum()
 
-        if (initial_y_times is None) != (initial_y_values is None):
-            raise ValueError(
-                "initial_y_times and initial_y_values must be provided together."
-            )
-        if initial_y_times is not None and initial_y_values is not None:
-            initial_y_times = initial_y_times.to(
-                device=self.device, dtype=self.time_dtype
-            )
-            initial_y_values = initial_y_values.to(
-                device=self.device, dtype=self.dtype
-            )
-            if initial_y_times.ndim != 1:
-                raise ValueError("initial_y_times must be one-dimensional.")
-            if initial_y_values.shape != (initial_y_times.shape[0], self.D):
-                raise ValueError(
-                    "initial_y_values must have shape "
-                    f"({initial_y_times.shape[0]}, {self.D})."
-                )
-            if not torch.all(initial_y_times[1:] > initial_y_times[:-1]):
-                raise ValueError("initial_y_times must be strictly increasing.")
-            for series_idx, (T_obs_s, T_s) in enumerate(zip(self.T_obs_list, self.T_list)):
-                if initial_y_times[0] > T_obs_s[0] or initial_y_times[-1] < T_s:
-                    raise ValueError(
-                        "initial_y_times must cover the complete inference interval "
-                        f"for series {series_idx}."
-                    )
         prior_config = self.prior_config
         if initial_theta is None:
             if self.theta_prior is None:
@@ -526,11 +496,46 @@ class ContinuousTimeAR1HMMSampler:
             self.true_idx_list[s] = None
             self.pseudo_idx_list[s] = None
             self.y_aug_list[s] = None
-            # A tensor-valued initial path is shared across series by default.
-            # Multi-series callers that need different initial paths can assign
-            # initial_y_times_list / initial_y_values_list before run().
-            self.initial_y_times_list[s] = initial_y_times
-            self.initial_y_values_list[s] = initial_y_values
+
+        self.y_nuts_step_sizes = [
+            float(self.y_mh_config["step_size"])
+            if self.y_mh_config["method"] == "nuts" and "step_size" in self.y_mh_config
+            else None
+        ] * self.S
+        self.theta_nuts_step_size = (
+            float(self.theta_mh_config["step_size"])
+            if self.theta_mh_config["method"] == "nuts" and "step_size" in self.theta_mh_config
+            else None
+        )
+        self._initializing_nuts = False
+        if any(config["method"] == "nuts" and "step_size" not in config
+               and not config.get("adapt_step_size", False)
+               for config in (self.y_mh_config, self.theta_mh_config)):
+            self._initialize_nuts_step_sizes()
+
+    def _initialize_nuts_step_sizes(self) -> None:
+        """Tune once on the initial observation grid, retaining the sampled state."""
+        for s in range(self.S):
+            empty = torch.empty(0, dtype=self.time_dtype, device=self.device)
+            times, regimes, events, obs_idx, _ = self.build_augmented_grid(s, empty)
+            self.T_all_list[s] = times
+            self.z_aug_list[s] = regimes
+            self.is_event_time_list[s] = events
+            self.obs_idx_list[s] = obs_idx
+            self.y_aug_list[s] = self._initialize_y_on_grid(s, times)
+            self.true_idx_list[s] = torch.empty(0, dtype=torch.long, device=self.device)
+            self.pseudo_idx_list[s] = torch.empty(0, dtype=torch.long, device=self.device)
+        self._initializing_nuts = True
+        try:
+            if (self.y_mh_config["method"] == "nuts" and "step_size" not in self.y_mh_config
+                    and not self.y_mh_config.get("adapt_step_size", False)):
+                for s in range(self.S):
+                    self.y_aug_list[s] = self.sample_y_mh(s, self.y_aug_list[s])
+            if (self.theta_mh_config["method"] == "nuts" and "step_size" not in self.theta_mh_config
+                    and not self.theta_mh_config.get("adapt_step_size", False)):
+                self.theta = self.sample_theta_mh()
+        finally:
+            self._initializing_nuts = False
 
     def _theta_prior_parameters(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return legacy NLE-coordinate Normal parameters of shape (theta_dim,)."""
@@ -970,11 +975,11 @@ class ContinuousTimeAR1HMMSampler:
         y: torch.Tensor,
         log_tau: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Diagonal Gaussian log density on the selected observed dimensions."""
+        """Diagonal Gaussian log density on all latent-state dimensions."""
         if log_tau is None:
             log_tau = self.log_tau
         tau = torch.exp(log_tau)
-        return dist.Normal(y[..., self.observed_dims], tau).log_prob(x).sum()
+        return dist.Normal(y, tau).log_prob(x).sum()
 
     def logprob_y_given_z_theta(
         self,
@@ -990,9 +995,10 @@ class ContinuousTimeAR1HMMSampler:
         Conditional log density:
 
             log p(y_aug | z_aug, theta, log_tau, x)
-              = log p(y_0 | z_0, theta)
-              + sum_l log p(y_l | y_{l-1}, z_l, Delta_l, theta)
+              = sum_l log p(y_l | y_{l-1}, z_l, Delta_l, theta)
               + sum_i log p(x_i | y_{m(i)}, log_tau)
+
+        The improper flat prior on y_0 contributes a constant zero.
         """
         theta = self.theta if theta is None else theta
         if theta is None:
@@ -1001,13 +1007,9 @@ class ContinuousTimeAR1HMMSampler:
             log_tau = self.log_tau
         if x_obs is None:
             x_obs = self.x_obs_list[0]
-        logp = dist.Normal(
-            self.y0_prior_loc,
-            self.y0_prior_scale,
-        ).log_prob(y_aug[0]).sum()
-        logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
+        logp = self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
 
-        y_at_obs = y_aug[obs_idx][:, self.observed_dims]  # (N, obs_dim)
+        y_at_obs = y_aug[obs_idx]  # (N, D)
         tau = torch.exp(log_tau)
         logp = logp + dist.Normal(y_at_obs, tau).log_prob(x_obs).sum()
         return logp
@@ -1156,10 +1158,6 @@ class ContinuousTimeAR1HMMSampler:
             interval_regimes = z_aug_s[right_idx]
             delta = canonical_times[1:] - canonical_times[:-1]
 
-            latent_initial = latent_initial + dist.Normal(
-                self.y0_prior_loc,
-                self.y0_prior_scale,
-            ).log_prob(canonical_y[0]).sum()
             nle_transition = nle_transition + self._evaluate_batched_transition_logprobs(
                 y_prev_batch=canonical_y[:-1],
                 y_curr_batch=canonical_y[1:],
@@ -1282,6 +1280,7 @@ class ContinuousTimeAR1HMMSampler:
         potential_fn: Any,
         initial_params: Dict[str, torch.Tensor],
         config: Dict[str, Any],
+        adapt_step_size: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
         """Run one configured Pyro MH transition and return its final position."""
         pyro.clear_param_store()
@@ -1290,7 +1289,9 @@ class ContinuousTimeAR1HMMSampler:
             kernel = NUTS(
                 potential_fn=potential_fn,
                 max_tree_depth=config["max_tree_depth"],
-                target_accept_prob=config["target_accept_prob"],
+                step_size=float(config.get("step_size", 1.0)),
+                adapt_step_size=adapt_step_size,
+                adapt_mass_matrix=False,
             )
         else:
             kernel = HMC(
@@ -1301,19 +1302,30 @@ class ContinuousTimeAR1HMMSampler:
                 adapt_mass_matrix=False,
             )
 
+        transition_stats = {}
+
+        def record_kernel_stats(kernel, samples, stage, iteration):
+            # Capture before Pyro cleans up counters at the end of run().
+            transition_stats["mean_accept_prob"] = float(kernel._mean_accept_prob)
+
         mcmc = MCMC(
             kernel,
             warmup_steps=0,
             num_samples=1,
             initial_params=initial_params,
             disable_progbar=True,
+            hook_fn=record_kernel_stats,
         )
         mcmc.run()
         final_params = {
             name: values[-1].detach()
             for name, values in mcmc.get_samples().items()
         }
-        return final_params, self._kernel_diagnostics(mcmc, method)
+        diagnostics = self._kernel_diagnostics(mcmc, method)
+        diagnostics["step_size"] = float(kernel.step_size)
+        diagnostics["adapt_step_size"] = bool(adapt_step_size) if method == "nuts" else False
+        diagnostics.update(transition_stats)
+        return final_params, diagnostics
 
     def sample_y_mh(
         self,
@@ -1344,8 +1356,13 @@ class ContinuousTimeAR1HMMSampler:
         samples, diagnostics = self._run_mh_transition(
             potential_fn=y_potential_fn,
             initial_params={"y_aug": y_init},
-            config=self.y_mh_config,
+            config=(dict(self.y_mh_config, step_size=self.y_nuts_step_sizes[s])
+                    if self.y_nuts_step_sizes[s] is not None and not self.y_mh_config.get("adapt_step_size", False)
+                    else self.y_mh_config),
+            adapt_step_size=self._initializing_nuts or self.y_mh_config.get("adapt_step_size", False),
         )
+        if self._initializing_nuts:
+            self.y_nuts_step_sizes[s] = diagnostics["step_size"]
         self._last_y_mh_diagnostics[s] = diagnostics
         return samples["y_aug"]
 
@@ -1374,8 +1391,13 @@ class ContinuousTimeAR1HMMSampler:
         packed_sample, diagnostics = self._run_mh_transition(
             potential_fn=theta_potential_fn,
             initial_params=self._pack_theta(self.theta),
-            config=self.theta_mh_config,
+            config=(dict(self.theta_mh_config, step_size=self.theta_nuts_step_size)
+                    if self.theta_nuts_step_size is not None and not self.theta_mh_config.get("adapt_step_size", False)
+                    else self.theta_mh_config),
+            adapt_step_size=self._initializing_nuts or self.theta_mh_config.get("adapt_step_size", False),
         )
+        if self._initializing_nuts:
+            self.theta_nuts_step_size = diagnostics["step_size"]
         self._last_theta_mh_diagnostics = diagnostics
         return self._expand_theta(packed_sample).detach()
 
@@ -1400,7 +1422,7 @@ class ContinuousTimeAR1HMMSampler:
             x_obs_s = self.x_obs_list[s]
             if y_aug_s is None or obs_idx_s is None:
                 raise RuntimeError("Sampler must be initialized before sample_log_tau().")
-            y_at_obs = y_aug_s[obs_idx_s][:, self.observed_dims]
+            y_at_obs = y_aug_s[obs_idx_s]
             residual = x_obs_s - y_at_obs
             ssr = ssr + (residual**2).sum(dim=0)
             total_N += int(x_obs_s.shape[0])
@@ -1491,6 +1513,10 @@ class ContinuousTimeAR1HMMSampler:
         if y_prev_batch.shape[0] != theta_batch.shape[0] or y_prev_batch.shape[0] != delta.shape[0]:
             raise ValueError("Batch dimensions of y, theta, and delta_batch must match.")
 
+        if self.transition_log_prob_fn is not None:
+            return self.transition_log_prob_fn(
+                y_prev_batch, y_curr_batch, theta_batch, delta
+            )
         n_steps = self._delta_to_n_steps(delta)
         return self.nle_estimator.transition_log_prob(
             x_next=y_curr_batch,
@@ -1507,6 +1533,10 @@ class ContinuousTimeAR1HMMSampler:
         delta: torch.Tensor,
     ) -> torch.Tensor:
         """Draw one transition sample per context row in y-space."""
+        if self.transition_sample_fn is not None:
+            return self.transition_sample_fn(theta, y_prev, delta).to(
+                device=self.device, dtype=self.dtype
+            )
         n_steps = self._delta_to_n_steps(delta)
         samples = self.nle_estimator.sample_transition(
             theta=theta,
@@ -1878,37 +1908,19 @@ class ContinuousTimeAR1HMMSampler:
 
     def _initialize_y_on_grid(self, s: int, T_all: torch.Tensor) -> torch.Tensor:
         """
-        Initialize observed dimensions by interpolation and unobserved dimensions
-        at their initial-prior locations.
+        Initialize every latent dimension by interpolating its observations.
 
         This is only used for the first sweep or when the user does not provide y.
         """
         T_obs = self.T_obs_list[s]
         x_obs = self.x_obs_list[s]
-        initial_y_times = self.initial_y_times_list[s]
-        initial_y_values = self.initial_y_values_list[s]
         obs_t = T_obs.detach().cpu()
         grid_t = T_all.detach().cpu()
-        y_np = self.y0_prior_loc.detach().cpu().broadcast_to(
-            (T_all.shape[0], self.D)
-        ).clone()
-        if initial_y_times is not None and initial_y_values is not None:
-            reference_times = initial_y_times.detach().cpu().numpy()
-            reference_values = initial_y_values.detach().cpu()
-            for d in range(self.D):
-                y_np[:, d] = torch.from_numpy(
-                    __import__("numpy").interp(
-                        grid_t.numpy(),
-                        reference_times,
-                        reference_values[:, d].numpy(),
-                    )
-                ).to(dtype=self.dtype)
-        for idx_in_x, d in enumerate(
-            self.observed_dims.detach().cpu().tolist()
-        ):
-            x_j = x_obs[:, idx_in_x].detach().cpu()
+        y_np = torch.empty((T_all.shape[0], self.D), dtype=self.dtype)
+        for d in range(self.D):
+            x_j = x_obs[:, d].detach().cpu()
             interp = torch.from_numpy(
-                __import__("numpy").interp(
+                np.interp(
                     grid_t.numpy(),
                     obs_t.numpy(),
                     x_j.numpy(),
