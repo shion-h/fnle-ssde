@@ -18,7 +18,8 @@ from fnle_ssde.utils import run_experiment  # noqa: E402
 from generate_data_3 import DATA_PATH  # noqa: E402
 
 
-NLE_CACHE_PATH = ROOT / "results/example3_nle.pt"
+RESULT_PATH = ROOT / "results" / "example_3"
+NLE_CACHE_PATH = RESULT_PATH / "nle.pt"
 
 EXPERIMENT_NAME = "example3"
 NUM_SWEEPS, BURN_IN = 10_000, 5_000
@@ -37,14 +38,17 @@ NLE_NUM_BINS = 10
 Y_TREE_DEPTH = 5
 THETA_TREE_DEPTH = 3
 TARGET_ACCEPT_PROB = 0.8
+# Fixed NUTS step sizes from the selected real-data experiment.
+Y_NUTS_STEP_SIZE = 2.0 ** -9
+THETA_NUTS_STEP_SIZE = 2.0 ** -5
 SIR_PARTICLES = 100
 USE_T_PSEUDO_IN_SIR = False
 Q_PRIOR_ALPHA, Q_PRIOR_BETA = 2.0, 20.0
 # This auxiliary generator initializes z only. The sampler's Q itself is drawn
 # independently from Gamma(Q_PRIOR_ALPHA, Q_PRIOR_BETA).
 INITIAL_Z_Q_RATE = 0.5
-TAU2_PRIOR_ALPHA = 2.0
-TAU2_PRIOR_BETA = torch.full((2,), 2e-4)
+TAU2_PRIOR_ALPHA = 1e-3
+TAU2_PRIOR_BETA = torch.full((2,), 1e-3)
 
 # Physical-scale NLE support. The training distribution is uniform after
 # taking logarithms of these bounds.
@@ -60,16 +64,12 @@ THETA_PRIOR_SCALE = torch.ones(6)
 
 def history_path(chain_id: int) -> Path:
     """Return the complete-history path for one chain."""
-    return ROOT / (
-        f"results/{EXPERIMENT_NAME}_mcmc_chain{chain_id}.pt"
-    )
+    return RESULT_PATH / f"{EXPERIMENT_NAME}_mcmc_chain{chain_id}.pt"
 
 
 def latest_sample_path(chain_id: int) -> Path:
     """Return the rolling-checkpoint path for one chain."""
-    return ROOT / (
-        f"results/{EXPERIMENT_NAME}_mcmc_chain{chain_id}_latest_sample.pt"
-    )
+    return RESULT_PATH / f"{EXPERIMENT_NAME}_mcmc_chain{chain_id}_latest_sample.pt"
 
 
 HISTORY_PATHS = tuple(
@@ -97,6 +97,12 @@ def read_observations() -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def main() -> None:
+    existing = [path for path in HISTORY_PATHS if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "Refusing to overwrite saved MCMC histories: "
+            + ", ".join(str(path) for path in existing)
+        )
     T_obs, x_obs = read_observations()
     dynamics = LotkaVolterraDynamics(
         dt=DYNAMICS_DT,
@@ -138,16 +144,17 @@ def main() -> None:
         "q_alpha": Q_PRIOR_ALPHA,
         "q_beta": Q_PRIOR_BETA,
         "initial_path_jump_rate": INITIAL_Z_Q_RATE,
-        "y0_prior_scale": 1.0,
         "y_mh_config": {
             "method": "nuts",
             "max_tree_depth": Y_TREE_DEPTH,
             "target_accept_prob": TARGET_ACCEPT_PROB,
+            **({"step_size": Y_NUTS_STEP_SIZE} if Y_NUTS_STEP_SIZE is not None else {}),
         },
         "theta_mh_config": {
             "method": "nuts",
             "max_tree_depth": THETA_TREE_DEPTH,
             "target_accept_prob": TARGET_ACCEPT_PROB,
+            **({"step_size": THETA_NUTS_STEP_SIZE} if THETA_NUTS_STEP_SIZE is not None else {}),
         },
         "sir_particles": SIR_PARTICLES,
         "use_t_pseudo_in_sir": USE_T_PSEUDO_IN_SIR,
