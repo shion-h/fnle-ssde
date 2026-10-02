@@ -30,14 +30,13 @@ DYNAMICS_DT = 0.01
 NLE_NUM_PARAMETERS = 800_000
 NLE_SEED = 0
 NLE_REFERENCE_NOISE = 0.32
-NLE_MAX_EPOCHS = 5_000
+NLE_MAX_EPOCHS = 500
 NLE_STOP_AFTER_EPOCHS = 20
 NLE_HIDDEN_FEATURES = 50
 NLE_NUM_TRANSFORMS = 5
 NLE_NUM_BINS = 10
 Y_TREE_DEPTH = 5
 THETA_TREE_DEPTH = 3
-TARGET_ACCEPT_PROB = 0.8
 # Fixed NUTS step sizes from the selected real-data experiment.
 Y_NUTS_STEP_SIZE = 2.0 ** -9
 THETA_NUTS_STEP_SIZE = 2.0 ** -5
@@ -147,13 +146,11 @@ def main() -> None:
         "y_mh_config": {
             "method": "nuts",
             "max_tree_depth": Y_TREE_DEPTH,
-            "target_accept_prob": TARGET_ACCEPT_PROB,
             **({"step_size": Y_NUTS_STEP_SIZE} if Y_NUTS_STEP_SIZE is not None else {}),
         },
         "theta_mh_config": {
             "method": "nuts",
             "max_tree_depth": THETA_TREE_DEPTH,
-            "target_accept_prob": TARGET_ACCEPT_PROB,
             **({"step_size": THETA_NUTS_STEP_SIZE} if THETA_NUTS_STEP_SIZE is not None else {}),
         },
         "sir_particles": SIR_PARTICLES,

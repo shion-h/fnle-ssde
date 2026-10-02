@@ -294,7 +294,6 @@ def initialize_mcmc_sampler(
             else {
                 "method": "nuts",
                 "max_tree_depth": y_tree_depth,
-                "target_accept_prob": 0.8,
             }
         ),
         theta_mh_config=(
@@ -303,7 +302,6 @@ def initialize_mcmc_sampler(
             else {
                 "method": "nuts",
                 "max_tree_depth": theta_tree_depth,
-                "target_accept_prob": 0.8,
             }
         ),
         sir_config={
