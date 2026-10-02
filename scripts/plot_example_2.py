@@ -12,19 +12,19 @@ for path in (ROOT / "src", Path(__file__).resolve().parent):
     sys.path.insert(0, str(path))
 
 from example_2 import (  # noqa: E402
-    CLE_HISTORY_PATH,
-    LV_HISTORY_PATH,
-    SIR_HISTORY_PATH,
+    RESULT_PATH,
     experiments,
 )
 from fnle_ssde.visualization import (  # noqa: E402
     ParameterPlotGroup,
     PosteriorFigureCase,
+    combine_chain_histories,
+    match_regime_labels,
     plot_posterior_figure,
 )
 
 
-FIGURE_PATH = ROOT / "results/figures/example_2.png"
+FIGURE_PATH = RESULT_PATH / "example_2.png"
 PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
 FONT_SCALE = 1.1
 TEXT_FONT_COEFFICIENT = 13.0
@@ -32,24 +32,35 @@ PANEL_TITLE_FONT_COEFFICIENT = 13.0
 OVERALL_TITLE_FONT_COEFFICIENT = 14.0
 
 
-def load(path: Path) -> tuple[dict[str, list[object]], dict[str, object]]:
-    if not path.exists():
-        raise FileNotFoundError(f"Run scripts/example_2.py first: {path}")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    return payload["history"], payload["data"]
-
-
 def main() -> None:
-    dynamics_by_model = {
-        experiment.name: experiment.dynamics for experiment in experiments()
-    }
-    results = {
-        "lv": load(LV_HISTORY_PATH),
-        "cle": load(CLE_HISTORY_PATH),
-        "sir": load(SIR_HISTORY_PATH),
-    }
     cases = []
-    for model, (history, data) in results.items():
+    for experiment in experiments():
+        model = experiment.name
+        path = experiment.history_path
+        paths = tuple(
+            path.with_stem(f"{path.stem}{chain_id}")
+            for chain_id in range(len(experiment.seeds))
+        )
+        payloads = tuple(
+            torch.load(chain_path, map_location="cpu", weights_only=False)
+            for chain_path in paths
+        )
+        data = payloads[0]["data"]
+        histories = tuple(payload["history"] for payload in payloads)
+        regime_orders = tuple(
+            tuple(
+                match_regime_labels(
+                    torch.stack(history["theta"][experiment.burn_in:]).mean(0),
+                    data["theta_true"],
+                ).tolist()
+            )
+            for history in histories
+        )
+        history = combine_chain_histories(
+            histories, start=experiment.burn_in, regime_orders=regime_orders,
+        )
+        del payloads, histories
+
         z_truth_times = torch.cat(
             (data["times"][:1], data["T_true"], data["times"][-1:])
         )
@@ -77,7 +88,7 @@ def main() -> None:
                 ParameterPlotGroup(r"$\gamma$", (2,), 1.4),
                 ParameterPlotGroup(r"$c$", (4,), 1.4),
             )
-            names = (r"\alpha", r"\beta", r"\gamma", r"\delta", "c")
+            names = (r"\alpha/\beta", r"\beta", r"\gamma", r"\delta", "c")
             switching = (True, False, False, False, False)
         else:
             title = "Susceptible–Infected–Recovered epidemic model"
@@ -95,13 +106,13 @@ def main() -> None:
                 y_times=data["times"],
                 z_times=data["times"],
                 num_regimes=data["theta_true"].shape[0],
-                start=500,
+                start=0,
                 parameter_names=names,
                 parameter_switching=switching,
                 parameter_groups=groups,
                 trajectory_dimensions=dimensions,
                 trajectory_labels=trajectory_labels,
-                dynamics=dynamics_by_model[model],
+                dynamics=experiment.dynamics,
                 show_truth=True,
                 theta_truth=data["theta_true"],
                 y_truth_times=data["times"],
