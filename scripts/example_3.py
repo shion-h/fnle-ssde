@@ -182,6 +182,7 @@ def main() -> None:
         nle_config=nle_config,
         sampler_config=sampler_config,
         chain_config=chain_config,
+        output_payload={"data": {"T_obs": T_obs, "x_obs": x_obs}},
     )
 
 

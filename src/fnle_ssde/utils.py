@@ -401,14 +401,11 @@ def _run_and_save_chain(
 
     history = sampler.history
     history_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_payload is None:
-        saved_payload: Any = history
-    else:
-        saved_payload = {
-            "history": history,
-            **output_payload,
-            **initialization,
-        }
+    saved_payload = {
+        "history": history,
+        **(output_payload or {}),
+        **initialization,
+    }
     torch.save(saved_payload, history_path)
 
     outside = posterior_outside_support(

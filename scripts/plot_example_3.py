@@ -21,7 +21,6 @@ from example_3 import (  # noqa: E402
     NUM_CHAINS,
     NUM_SWEEPS,
     RESULT_PATH,
-    read_observations,
 )
 from fnle_ssde.dynamics import LotkaVolterraDynamics  # noqa: E402
 from fnle_ssde.visualization import (  # noqa: E402
@@ -186,15 +185,18 @@ def main() -> None:
             f"Numerical results not found:\n{missing_text}\n"
             "Run scripts/example_3.py first."
         )
-    histories = tuple(
+    payloads = tuple(
         torch.load(path, map_location="cpu", weights_only=False)
         for path in HISTORY_PATHS
     )
+    histories = tuple(payload["history"] for payload in payloads)
+    data = payloads[0]["data"]
+    del payloads
     if len(histories) != NUM_CHAINS:
         raise ValueError(f"Expected {NUM_CHAINS} chains, got {len(histories)}.")
     if any(len(history["theta"]) != NUM_SWEEPS for history in histories):
         raise ValueError(f"Every chain must contain {NUM_SWEEPS} stored sweeps.")
-    T_obs, x_obs = read_observations()
+    T_obs, x_obs = data["T_obs"], data["x_obs"]
     dynamics = LotkaVolterraDynamics(
         dt=DYNAMICS_DT,
         device="cpu",
