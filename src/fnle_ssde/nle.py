@@ -5,7 +5,7 @@ from tqdm import tqdm
 from typing import Literal, Tuple, List, Union
 import torch
 import pyro.distributions as dist
-from torch.distributions import Distribution, Independent, Normal
+from torch.distributions import Independent, Normal
 from scipy.interpolate import CubicSpline
 from sbi.inference import SNLE
 from sbi.neural_nets.factory import likelihood_nn
@@ -66,9 +66,6 @@ class NLEEstimator:
             ref_noize: float,
             max_n_steps: int | None = None,
             n_transitions: int | None = None,
-            observed_dims: torch.Tensor | None = None,
-            unobserved_dims: torch.Tensor | None = None,
-            unobserved_init_dist: Distribution | None = None,
             state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
             noisy_init_strategy: Literal["clamp", "resample"] = "clamp",
             max_noisy_init_attempts: int = 1000,
@@ -84,12 +81,6 @@ class NLEEstimator:
                 the sampled value to the context.
             n_transitions: Number of transitions to generate for this theta. If None,
                 use every adjacent reference state, preserving the original behavior.
-            observed_dims: Latent-state indices represented by x_ref columns. If
-                None, x_ref must contain the complete latent state.
-            unobserved_dims: Complement of observed_dims, prepared once by
-                generate_training_data.
-            unobserved_init_dist: Distribution whose sample fills latent dimensions
-                absent from x_ref.
             state_clamp_bounds: Optional bounds applied when constructing the
                 noisy initial state. Simulated states are constrained by the
                 supplied Dynamics instance.
@@ -100,6 +91,11 @@ class NLEEstimator:
         """
         xt_chunk = []
         ctx_chunk = []
+        if x_ref.ndim != 2 or x_ref.shape[1] != self.dynamics.x_dim:
+            raise ValueError(
+                "x_ref must have shape (num_reference_times, state_dim) with "
+                f"state_dim={self.dynamics.x_dim}."
+            )
 
         if n_transitions is None:
             ref_indices = range(1, len(x_ref))
@@ -112,13 +108,7 @@ class NLEEstimator:
                 max_noisy_init_attempts if noisy_init_strategy == "resample" else 1
             )
             for _ in range(attempts):
-                x_init = self._draw_noisy_initial_state(
-                    x_ref_value=x_ref_value,
-                    ref_noize=ref_noize,
-                    observed_dims=observed_dims,
-                    unobserved_dims=unobserved_dims,
-                    unobserved_init_dist=unobserved_init_dist,
-                )
+                x_init = x_ref_value + torch.randn_like(x_ref_value) * ref_noize
                 if (
                     noisy_init_strategy == "clamp"
                     or self._is_within_bounds(x_init, state_clamp_bounds)
@@ -173,8 +163,6 @@ class NLEEstimator:
             ref_noize: float,
             max_n_steps: int | None = None,
             samples_per_theta: int | None = None,
-            observed_dims: torch.Tensor | None = None,
-            unobserved_init_dist: Distribution | None = None,
             state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
             noisy_init_strategy: Literal["clamp", "resample"] = "clamp",
             max_noisy_init_attempts: int = 1000,
@@ -192,20 +180,17 @@ class NLEEstimator:
             samples_per_theta: Number of transitions generated per parameter sample.
                 If None, use all adjacent reference states for each theta. Set to 1
                 to train on one transition per sampled theta.
-            observed_dims: Latent-state indices represented by x_ref columns.
-            unobserved_init_dist: Distribution used to initialize omitted latent
-                dimensions independently for each generated transition.
             state_clamp_bounds: Optional bounds applied to noisy initial states.
                 Subsequent states are constrained by the Dynamics instance.
         """
         all_xt = []
         all_ctx = []
 
-        observed_dims, unobserved_dims = self._prepare_initial_state_dimensions(
-            x_ref=x_ref,
-            observed_dims=observed_dims,
-            unobserved_init_dist=unobserved_init_dist,
-        )
+        if x_ref.ndim != 2 or x_ref.shape[1] != self.dynamics.x_dim:
+            raise ValueError(
+                "x_ref must have shape (num_reference_times, state_dim) with "
+                f"state_dim={self.dynamics.x_dim}."
+            )
         if samples_per_theta is not None and samples_per_theta < 1:
             raise ValueError("samples_per_theta must be positive.")
         if noisy_init_strategy not in {"clamp", "resample"}:
@@ -222,9 +207,6 @@ class NLEEstimator:
                 ref_noize,
                 max_n_steps,
                 n_transitions=samples_per_theta,
-                observed_dims=observed_dims,
-                unobserved_dims=unobserved_dims,
-                unobserved_init_dist=unobserved_init_dist,
                 state_clamp_bounds=state_clamp_bounds,
                 noisy_init_strategy=noisy_init_strategy,
                 max_noisy_init_attempts=max_noisy_init_attempts,
@@ -291,8 +273,6 @@ class NLEEstimator:
               epochs: int = 50,
               stop_after_epochs: int = 20,
               samples_per_theta: int | None = None,
-              observed_dims: torch.Tensor | None = None,
-              unobserved_init_dist: Distribution | None = None,
               state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
               noisy_init_strategy: Literal["clamp", "resample"] = "clamp",
               max_noisy_init_attempts: int = 1000,
@@ -321,9 +301,6 @@ class NLEEstimator:
             samples_per_theta: Number of transitions generated per sampled theta.
                 If None, preserve the original behavior and use len(x_ref)-1
                 transitions per theta. Set to 1 for one transition per theta.
-            observed_dims: Latent-state indices represented by x_ref columns.
-            unobserved_init_dist: Distribution used to initialize latent dimensions
-                that are not represented in x_ref.
             state_clamp_bounds: Optional state-space bounds applied to noisy
                 initial states. Subsequent states are constrained by the
                 Dynamics instance.
@@ -331,7 +308,7 @@ class NLEEstimator:
                 outside state_clamp_bounds.
             max_noisy_init_attempts: Maximum redraws under "resample".
             obs_times: Irregular observation times used for spline construction.
-            x_obs: Observations with shape (N, observed_dim).
+            x_obs: Observations with shape (N, state_dim).
             reference_times: Grid on which the spline reference path is evaluated.
             spline_clamp_bounds: Optional bounds applied to the spline path.
             training_data_cache_path: Optional separate cache for generated
@@ -355,6 +332,11 @@ class NLEEstimator:
                 "Do not provide obs_times, x_obs, or reference_times together with x_ref."
             )
 
+        if x_ref.ndim != 2 or x_ref.shape[1] != self.dynamics.x_dim:
+            raise ValueError(
+                "x_ref must have shape (num_reference_times, state_dim) with "
+                f"state_dim={self.dynamics.x_dim}."
+            )
         self.conditions_on_n_steps = max_n_steps is not None
         if max_n_steps is not None and max_n_steps < 1:
             raise ValueError("max_n_steps must be positive when specified.")
@@ -414,8 +396,6 @@ class NLEEstimator:
                 ref_noize,
                 max_n_steps,
                 samples_per_theta=samples_per_theta,
-                observed_dims=observed_dims,
-                unobserved_init_dist=unobserved_init_dist,
                 state_clamp_bounds=state_clamp_bounds,
                 noisy_init_strategy=noisy_init_strategy,
                 max_noisy_init_attempts=max_noisy_init_attempts,
@@ -480,7 +460,6 @@ class NLEEstimator:
                 stop_after_epochs=stop_after_epochs,
                 samples_per_theta=samples_per_theta,
                 x_ref_shape=x_ref_shape,
-                observed_dims=observed_dims,
                 state_clamp_bounds=state_clamp_bounds,
                 noisy_init_strategy=noisy_init_strategy,
                 max_noisy_init_attempts=max_noisy_init_attempts,
@@ -498,7 +477,6 @@ class NLEEstimator:
             stop_after_epochs: int | None = None,
             samples_per_theta: int | None = None,
             x_ref_shape: Tuple[int, ...] | None = None,
-            observed_dims: torch.Tensor | None = None,
             state_clamp_bounds: tuple[float | None, float | None] | None = (0.0, 1e4),
             noisy_init_strategy: Literal["clamp", "resample"] = "clamp",
             max_noisy_init_attempts: int = 1000) -> None:
@@ -525,11 +503,6 @@ class NLEEstimator:
                     "stop_after_epochs": stop_after_epochs,
                     "samples_per_theta": samples_per_theta,
                     "x_ref_shape": x_ref_shape,
-                    "observed_dims": (
-                        observed_dims.detach().cpu()
-                        if observed_dims is not None
-                        else None
-                    ),
                     "state_clamp_bounds": state_clamp_bounds,
                     "state_clamp_applies_to_x_init": True,
                     "noisy_init_strategy": noisy_init_strategy,
@@ -642,82 +615,6 @@ class NLEEstimator:
         if upper is not None and torch.any(value > upper):
             return False
         return True
-
-    def _prepare_initial_state_dimensions(
-            self,
-            *,
-            x_ref: torch.Tensor,
-            observed_dims: torch.Tensor | None,
-            unobserved_init_dist: Distribution | None,
-            ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Validate the fixed state layout once before generating transitions."""
-        if x_ref.ndim != 2:
-            raise ValueError("x_ref must have shape (num_reference_times, state_dim).")
-        if observed_dims is None:
-            if x_ref.shape[1] != self.dynamics.x_dim:
-                raise ValueError(
-                    f"Full-state x_ref must have {self.dynamics.x_dim} columns."
-                )
-            return None, None
-
-        observed_dims = torch.as_tensor(
-            observed_dims, dtype=torch.long, device=x_ref.device
-        )
-        if observed_dims.ndim != 1:
-            raise ValueError("observed_dims must be one-dimensional.")
-        if x_ref.shape[1] != observed_dims.numel():
-            raise ValueError("x_ref columns must match the number of observed_dims.")
-        if torch.unique(observed_dims).numel() != observed_dims.numel():
-            raise ValueError("observed_dims entries must be unique.")
-        if torch.any((observed_dims < 0) | (observed_dims >= self.dynamics.x_dim)):
-            raise ValueError("observed_dims contains an invalid state index.")
-
-        all_dims = torch.arange(self.dynamics.x_dim, device=x_ref.device)
-        unobserved_dims = all_dims[~torch.isin(all_dims, observed_dims)]
-        if unobserved_dims.numel() == 0:
-            raise ValueError("Use observed_dims=None when x_ref contains the full state.")
-        if unobserved_init_dist is None:
-            raise ValueError(
-                "unobserved_init_dist is required when x_ref omits "
-                "latent-state dimensions."
-            )
-        sample_shape = (
-            unobserved_init_dist.batch_shape + unobserved_init_dist.event_shape
-        )
-        if sample_shape != torch.Size([unobserved_dims.numel()]):
-            raise ValueError(
-                "unobserved_init_dist.sample() must have shape "
-                f"({unobserved_dims.numel()},)."
-            )
-        return observed_dims, unobserved_dims
-
-    def _draw_noisy_initial_state(
-            self,
-            *,
-            x_ref_value: torch.Tensor,
-            ref_noize: float,
-            observed_dims: torch.Tensor | None,
-            unobserved_dims: torch.Tensor | None,
-            unobserved_init_dist: Distribution | None) -> torch.Tensor:
-        """Draw one complete initial state around a reference-state row."""
-        noisy_reference = (
-            x_ref_value + torch.randn_like(x_ref_value) * ref_noize
-        )
-        if observed_dims is None:
-            return noisy_reference
-
-        x_init = torch.empty(
-            self.dynamics.x_dim,
-            dtype=x_ref_value.dtype,
-            device=x_ref_value.device,
-        )
-        x_init[observed_dims] = noisy_reference
-        x_init[unobserved_dims] = torch.as_tensor(
-            unobserved_init_dist.sample(),
-            dtype=x_ref_value.dtype,
-            device=x_ref_value.device,
-        )
-        return x_init
 
     def _sample_n_steps(self, max_n_steps: int | None) -> int:
         if max_n_steps is None:
