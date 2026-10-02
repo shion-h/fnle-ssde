@@ -122,54 +122,50 @@ def single_series_history(
     }
 
 
-def match_chain_regime_labels(
-    histories: tuple[dict[str, list[object]], ...],
+def match_regime_labels(
+    theta_means: torch.Tensor,
     *,
-    switching_parameter_mask: tuple[bool, ...],
-    start: int = 0,
+    theta_truth: torch.Tensor | None = None,
+    switching_parameter_mask: tuple[bool, ...] | None = None,
     reference_chain: int = 0,
-) -> tuple[tuple[int, ...], ...]:
-    """Find one fixed regime permutation per chain relative to a reference chain.
+) -> torch.Tensor:
+    """Return regime orders of shape (chain, regime) from mean NLE coordinates.
 
-    Matching uses the post-``start`` mean of every switching parameter in the
-    real-valued NLE coordinate. Parameters are standardized across chains and
-    regimes before calculating mean squared distances, so no one parameter
-    determines the result merely because of its scale. Regime labels are never
-    changed from draw to draw within a chain.
+    ``theta_means`` has shape (chain, regime, parameter). With ``theta_truth``,
+    match all parameters to the truth without standardization. Otherwise,
+    match to ``reference_chain`` using the switching parameters, standardized
+    across chains and regimes. An omitted mask selects all parameters.
+    The caller computes means after burn-in and applies one order per chain.
     """
-    if not histories:
-        raise ValueError("At least one chain history is required.")
-    if not 0 <= reference_chain < len(histories):
-        raise ValueError("reference_chain is outside the available chain range.")
+    if theta_means.ndim != 3 or any(size == 0 for size in theta_means.shape):
+        raise ValueError("theta_means must have nonempty shape (chain, regime, parameter).")
+    num_chains, num_regimes, theta_dim = theta_means.shape
 
-    theta_chains = []
-    for history in histories:
-        if not 0 <= start < len(history["theta"]):
-            raise ValueError("start must select at least one theta draw per chain.")
-        theta_chains.append(torch.stack(history["theta"][start:]))
-    num_regimes = theta_chains[0].shape[1]
-    theta_dim = theta_chains[0].shape[2]
-    if len(switching_parameter_mask) != theta_dim:
-        raise ValueError(
-            "switching_parameter_mask must have one value per theta dimension."
+    if theta_truth is not None:
+        if theta_truth.shape != (num_regimes, theta_dim):
+            raise ValueError("theta_truth must have shape (regime, parameter).")
+        centers = theta_means
+        reference = theta_truth
+        scale = 1.0
+    else:
+        if not 0 <= reference_chain < num_chains:
+            raise ValueError("reference_chain is outside the available chain range.")
+        if switching_parameter_mask is None:
+            switching_parameter_mask = (True,) * theta_dim
+        if len(switching_parameter_mask) != theta_dim:
+            raise ValueError("switching_parameter_mask must have one value per theta dimension.")
+        switching_indices = [
+            index for index, switching in enumerate(switching_parameter_mask) if switching
+        ]
+        if not switching_indices:
+            return torch.arange(num_regimes, device=theta_means.device).repeat(num_chains, 1)
+        centers = theta_means[:, :, switching_indices]
+        scale = centers.reshape(-1, len(switching_indices)).std(dim=0).clamp_min(
+            torch.finfo(centers.dtype).eps
         )
-    switching_indices = [
-        index for index, switching in enumerate(switching_parameter_mask) if switching
-    ]
-    if not switching_indices:
-        return tuple(tuple(range(num_regimes)) for _ in histories)
-    if any(theta.shape[1:] != (num_regimes, theta_dim) for theta in theta_chains):
-        raise ValueError("All chains must have the same theta shape per draw.")
-
-    centers = torch.stack(
-        [theta[:, :, switching_indices].mean(dim=0) for theta in theta_chains]
-    )
-    scale = centers.reshape(-1, len(switching_indices)).std(dim=0).clamp_min(
-        torch.finfo(centers.dtype).eps
-    )
-    reference = centers[reference_chain]
+        reference = centers[reference_chain]
     permutations = tuple(itertools.permutations(range(num_regimes)))
-    return tuple(
+    orders = [
         min(
             permutations,
             key=lambda permutation: float(
@@ -182,7 +178,8 @@ def match_chain_regime_labels(
             ),
         )
         for center in centers
-    )
+    ]
+    return torch.tensor(orders, dtype=torch.long, device=theta_means.device)
 
 
 def combine_chain_histories(
@@ -449,17 +446,6 @@ def _indices_at_grid_times(
     return safe_indices
 
 
-def match_regime_labels(theta: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
-    """Match regime labels by mean squared error in the NLE theta coordinate."""
-    order = min(
-        itertools.permutations(range(truth.shape[0])),
-        key=lambda permutation: float(
-            ((theta[torch.tensor(permutation)] - truth) ** 2).mean()
-        ),
-    )
-    return torch.tensor(order)
-
-
 def posterior_summary(
     history: dict[str, list[object]],
     *,
@@ -495,7 +481,9 @@ def posterior_summary(
     if theta_truth is None:
         order = torch.arange(num_regimes)
     else:
-        order = match_regime_labels(theta_nle.mean(0), theta_truth)
+        order = match_regime_labels(
+            theta_nle.mean(0).unsqueeze(0), theta_truth=theta_truth,
+        )[0]
     theta_nle = theta_nle[:, order]
     theta = dynamics.to_physical_theta(theta_nle)
     z_prob = torch.nn.functional.one_hot(z, num_classes=num_regimes).float().mean(0)

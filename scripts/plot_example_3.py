@@ -25,7 +25,7 @@ from example_3 import (  # noqa: E402
 from fnle_ssde.dynamics import LotkaVolterraDynamics  # noqa: E402
 from fnle_ssde.visualization import (  # noqa: E402
     combine_chain_histories,
-    match_chain_regime_labels,
+    match_regime_labels,
     ParameterPlotGroup,
     PosteriorFigureCase,
     plot_multichain_traces,
@@ -202,12 +202,15 @@ def main() -> None:
         device="cpu",
         state_upper_bound=1e4,
     )
-    regime_orders = match_chain_regime_labels(
-        histories,
+    theta_means = torch.stack([
+        torch.stack(history["theta"][BURN_IN:]).mean(0)
+        for history in histories
+    ])
+    regime_orders = match_regime_labels(
+        theta_means,
         switching_parameter_mask=PARAMETER_SWITCHING,
-        start=BURN_IN,
         reference_chain=0,
-    )
+    ).tolist()
     chains, display_names = extract_aligned_scalar_chains(
         histories, regime_orders, dynamics
     )

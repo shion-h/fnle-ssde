@@ -47,15 +47,13 @@ def main() -> None:
         )
         data = payloads[0]["data"]
         histories = tuple(payload["history"] for payload in payloads)
-        regime_orders = tuple(
-            tuple(
-                match_regime_labels(
-                    torch.stack(history["theta"][experiment.burn_in:]).mean(0),
-                    data["theta_true"],
-                ).tolist()
-            )
+        theta_means = torch.stack([
+            torch.stack(history["theta"][experiment.burn_in:]).mean(0)
             for history in histories
-        )
+        ])
+        regime_orders = match_regime_labels(
+            theta_means, theta_truth=data["theta_true"],
+        ).tolist()
         history = combine_chain_histories(
             histories, start=experiment.burn_in, regime_orders=regime_orders,
         )
