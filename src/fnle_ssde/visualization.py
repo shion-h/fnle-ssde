@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import itertools
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,11 @@ POSTERIOR_COLOR = "#2364aa"
 OBSERVATION_COLOR = "#d1495b"
 TRUTH_COLOR = "#1b1b1b"
 REGIME_COLOR = "#2a9d8f"
+POSTERIOR_METHOD_STYLES = (
+    (POSTERIOR_COLOR, "-"),
+    ("#c44900", "--"),
+    (REGIME_COLOR, "-."),
+)
 
 
 @dataclass(frozen=True)
@@ -504,52 +510,101 @@ def plot_posterior_y_trajectory(
     ax: plt.Axes,
     *,
     times: torch.Tensor,
-    mean: torch.Tensor,
-    low: torch.Tensor,
-    high: torch.Tensor,
+    summaries: Sequence[Mapping[str, torch.Tensor | np.ndarray]],
     observation_times: torch.Tensor,
     observations: torch.Tensor,
     dimension: int,
+    styles: Sequence[tuple[str, str]] | None = None,
+    labels: Sequence[str] | None = None,
     show_truth: bool = False,
     truth_times: torch.Tensor | None = None,
     truth: torch.Tensor | None = None,
+    linewidth: float = 1.7,
+    truth_on_top: bool = False,
+    observation_zorder: float = 3,
+    observation_linewidths: float | None = None,
 ) -> None:
-    """Plot one latent dimension using the shared paper-figure design."""
+    """Overlay posterior summaries for one state dimension and its observations."""
+    if styles is None:
+        styles = POSTERIOR_METHOD_STYLES[:len(summaries)]
+    if labels is None:
+        labels = ("Posterior mean",) * len(summaries)
     if show_truth:
         if truth_times is None or truth is None:
             raise ValueError("truth_times and truth are required when show_truth=True.")
-        ax.plot(
-            truth_times,
-            truth[:, dimension],
-            color=TRUTH_COLOR,
-            lw=1.5,
-            label="Latent truth",
+        if not truth_on_top:
+            ax.plot(truth_times, truth[:, dimension], color=TRUTH_COLOR,
+                    lw=1.5, label="Latent truth")
+    for index, (summary, (color, linestyle), label) in enumerate(
+        zip(summaries, styles, labels, strict=True)
+    ):
+        ax.fill_between(
+            times, summary["low"][:, dimension], summary["high"][:, dimension],
+            color=color, alpha=0.25, lw=0,
+            label="95% predictive interval" if index == 0 else "_nolegend_",
         )
-    ax.fill_between(
-        times,
-        low[:, dimension],
-        high[:, dimension],
-        color=POSTERIOR_COLOR,
-        alpha=0.25,
-        lw=0,
-        label="95% predictive interval",
-    )
-    ax.plot(
-        times,
-        mean[:, dimension],
-        color=POSTERIOR_COLOR,
-        lw=1.7,
-        label="Posterior mean",
-    )
+        ax.plot(
+            times, summary["mean"][:, dimension], color=color,
+            ls=linestyle, lw=linewidth, label=label,
+        )
+    if show_truth and truth_on_top:
+        ax.plot(truth_times, truth[:, dimension], color=TRUTH_COLOR,
+                lw=1.5, label="Latent truth")
     ax.scatter(
-        observation_times,
-        observations[:, dimension],
-        s=12,
-        color=OBSERVATION_COLOR,
-        alpha=0.6,
-        label="Observed",
-        zorder=3,
+        observation_times, observations[:, dimension], s=12,
+        color=OBSERVATION_COLOR, alpha=0.6, label="Observed",
+        zorder=observation_zorder, linewidths=observation_linewidths,
     )
+
+
+def plot_posterior_regime(
+    ax: plt.Axes,
+    *,
+    times: torch.Tensor,
+    probabilities: Sequence[torch.Tensor | np.ndarray],
+    styles: Sequence[tuple[str, str]],
+    labels: Sequence[str],
+    regime: int,
+    num_regimes: int,
+    truth_times: torch.Tensor | None = None,
+    truth_regimes: torch.Tensor | None = None,
+    linewidth: float = 1.4,
+    legend: bool = False,
+    ylim: tuple[float, float] = (-0.05, 1.05),
+    yticks: tuple[float, ...] | None = None,
+) -> None:
+    """Overlay regime probabilities and an optional zero-based true path."""
+    truth_ax = None
+    if truth_times is not None and truth_regimes is not None:
+        truth_ax = ax.twinx()
+        truth_ax.step(truth_times, truth_regimes + 1, where="post",
+                      color=TRUTH_COLOR, lw=1.4, label="True regime")
+        truth_ax.set(
+            ylim=(0.95, num_regimes + 0.05),
+            yticks=range(1, num_regimes + 1), ylabel="Regime",
+        )
+        truth_ax.tick_params(axis="y", length=0, pad=5)
+        truth_ax.grid(False)
+    for probability, (color, linestyle), label in zip(
+        probabilities, styles, labels, strict=True
+    ):
+        ax.plot(times, probability, color=color, ls=linestyle,
+                lw=linewidth, label=label)
+    ax.set(
+        ylim=ylim,
+        title=f"Posterior probability of regime {regime + 1}",
+        xlabel="Time", ylabel="Probability",
+    )
+    if yticks is not None:
+        ax.set_yticks(yticks)
+    ax.yaxis.grid(False)
+    if legend:
+        handles, legend_labels = ax.get_legend_handles_labels()
+        if truth_ax is not None:
+            truth_handles, truth_labels = truth_ax.get_legend_handles_labels()
+            handles = truth_handles + handles
+            legend_labels = truth_labels + legend_labels
+        ax.legend(handles, legend_labels)
 
 
 def relative_density_hpd(
@@ -796,9 +851,7 @@ def plot_posterior_figure(
             plot_posterior_y_trajectory(
                 ax,
                 times=case.y_times,
-                mean=interpolated_y["mean"],
-                low=interpolated_y["low"],
-                high=interpolated_y["high"],
+                summaries=(interpolated_y,),
                 observation_times=case.observation_times,
                 observations=case.observations,
                 dimension=dimension,
@@ -818,51 +871,19 @@ def plot_posterior_figure(
         regime_ax = fig.add_subplot(
             time_grid[max_trajectories, 0], sharex=trajectory_axes[0]
         )
-        truth_regime_ax = None
-        if case.show_truth:
-            truth_regime_ax = regime_ax.twinx()
-            truth_regime_ax.step(
-                case.z_truth_times,
-                case.z_truth + 1,
-                where="post",
-                color=TRUTH_COLOR,
-                lw=1.4,
-                label="True regime",
-            )
-            truth_regime_ax.set(
-                ylim=(0.95, case.num_regimes + 0.05),
-                yticks=range(1, case.num_regimes + 1),
-                ylabel="Regime",
-            )
-            truth_regime_ax.tick_params(axis="y", length=0, pad=5)
-            truth_regime_ax.grid(False)
-        regime_ax.plot(
-            case.z_times,
-            summary["z_prob"][:, case.regime],
-            color=REGIME_COLOR,
-            lw=1.4,
-            label=(
-                r"$\Pr(Z_t = "
-                + str(case.regime + 1)
-                + r" \mid x)$"
-            ),
+        regime_label = rf"$\Pr(Z_t = {case.regime + 1} \mid x)$"
+        plot_posterior_regime(
+            regime_ax,
+            times=case.z_times,
+            probabilities=(summary["z_prob"][:, case.regime],),
+            styles=((REGIME_COLOR, "-"),),
+            labels=(regime_label,),
+            regime=case.regime,
+            num_regimes=case.num_regimes,
+            truth_times=case.z_truth_times if case.show_truth else None,
+            truth_regimes=case.z_truth if case.show_truth else None,
+            legend=case.show_truth,
         )
-        regime_ax.set(
-            ylim=(-0.05, 1.05),
-            title="Posterior probability of regime " + str(case.regime + 1),
-            xlabel="Time",
-            ylabel="Probability",
-        )
-        regime_ax.yaxis.grid(False)
-        if truth_regime_ax is not None:
-            posterior_handles, posterior_labels = (
-                regime_ax.get_legend_handles_labels()
-            )
-            truth_handles, truth_labels = truth_regime_ax.get_legend_handles_labels()
-            regime_ax.legend(
-                truth_handles + posterior_handles,
-                truth_labels + posterior_labels,
-            )
     parameter_handles, parameter_labels = parameter_legend_content
     parameter_legend.legend(
         parameter_handles,
