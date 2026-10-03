@@ -16,65 +16,49 @@ The runtime estimates below refer to this development PC:
 | Software | Python 3.12.11, PyTorch 2.5.1, Pyro 1.9.1, sbi 0.24.0 |
 | Compute device | CPU only; no GPU acceleration |
 
-Example 2 runs the three synthetic experiments sequentially, using one PyTorch
-thread. Example 3 runs four GS chains in parallel processes, with one PyTorch
-intra-op and inter-op thread per chain. Its NLE is trained once and shared by
-the four chains, not trained separately for each chain.
-
 ## Expected runtime
 
-**Allow approximately 9-11 hours to reproduce all three experiments from
-scratch on this PC**, including training-data generation, NLE training, GS,
-density comparison, and plotting. These are wall-clock estimates based on
-saved August-September 2026 runs, not a newly timed end-to-end benchmark of
-the current scripts. Dependency installation and downloads are excluded.
+These are wall-clock measurements or estimates from saved 2026 runs, not a
+newly timed end-to-end benchmark. Dependency installation is excluded, and
+actual times vary with system load and NLE early stopping.
 
-| Experiment | Workload | Approximate elapsed time |
-| --- | --- | --- |
-| Example 1 | Simulator/NLE density comparison at six contexts; reuses the LV NLE from Example 2 | A few minutes (less than 0.1 h), excluding the shared NLE training |
-| Example 2 | Synthetic LV, CLE, and SIR; 100,000 NLE training transitions per model; one 1,000-sweep GS chain per model | 1.5-2 h total |
-| Example 3 | Real-data LV; 800,000 NLE training transitions; four parallel 10,000-sweep GS chains | 7.5-8.5 h total |
+| Experiment | Approximate elapsed time |
+| --- | --- |
+| Example 1 | About 14 min for exact OU MCMC and 2.3 h for each FNLE MCMC; data generation and FNLE training are additional |
+| Example 2 | About 12.5-13 h with trained NLE caches; around 13.5-14 h including NLE preparation |
+| Example 3 | 7.5-8.5 h total |
 
-The sweep counts include burn-in: 500 sweeps for each synthetic chain and
-5,000 for each real-data chain. Example 3 uses NUTS tree depths of 5 for `y`
-and 3 for `theta`. Its GS runtime is the elapsed time for all four parallel
-chains to finish, not the sum of their individual runtimes.
+With trained NLE caches available, the Example 1 MCMC stages take about
+**4.8 hours** in total. Parallel-chain timings are wall time to finish all
+chains, not the sum of their individual times.
 
 For context, the recorded NLE preparation times (simulation plus training)
 were about 25 minutes for synthetic LV, 13 minutes for CLE, 13 minutes for
-SIR, and 3.1 hours for real-data LV. These training measurements used one
-PyTorch thread. The real-data NLE stopped after 80 epochs with early-stopping
-patience 20, rather than running to the 5,000-epoch limit. Real-data GS took
-about 4.3 hours for the seed-0-through-3 run; related runs took about 5.3 hours.
-Stopping epochs, NUTS trajectories, thread settings, background CPU load, and
-file synchronization can change these times substantially.
+SIR, and 3.1 hours for real-data LV. Real-data MCMC took about 4.3 hours in
+one run; related runs took about 5.3 hours.
 
 ### Reusing saved results
 
-- With all four trained NLE caches available, allow roughly **5-7 hours** to
-  rerun GS and regenerate the figures; NLE simulation and training are skipped.
-- To regenerate figures from saved numerical results and MCMC histories, run
-  only `plot_example_{1,2,3}.py`. No NLE training or GS is needed.
-- `example_2.py` and `example_3.py` still rerun GS and overwrite their history
-  files even when those histories already exist. `example_1.py` instead skips
-  density evaluation when `results/example1.pt` exists.
-
-For a fresh reproduction, run `generate_data_2.py` and `example_2.py` before
-`generate_data_1.py` and `example_1.py`: Example 1 needs the synthetic LV data
-and its trained NLE. The shared LV training cost is counted only once above.
+- To regenerate figures from saved MCMC histories, run only
+  `plot_example_{1,2,3}.py`. No NLE training or MCMC is needed.
+- `example_1.py` reuses existing OU training data, models, and complete chain
+  histories. `example_2.py` and `example_3.py` still rerun MCMC and overwrite
+  their history files.
 
 ## Reproduce the figures
 
-Run these commands from the repository root, in the order shown:
+Run these commands from the repository root, in order. Each example's data
+generation, inference, and plotting scripts are grouped together.
 
 ```bash
-uv run python scripts/generate_data_2.py
-uv run python scripts/example_2.py
-uv run python scripts/plot_example_2.py
 uv run python scripts/generate_data_1.py
 uv run python scripts/example_1.py
 uv run python scripts/plot_example_1.py
+uv run python scripts/generate_data_2.py
+uv run python scripts/example_2.py
+uv run python scripts/plot_example_2.py
 uv run python scripts/generate_data_3.py
 uv run python scripts/example_3.py
 uv run python scripts/plot_example_3.py
+uv run python scripts/diagnostics.py
 ```
