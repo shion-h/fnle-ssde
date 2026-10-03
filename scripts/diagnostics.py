@@ -195,7 +195,11 @@ def main() -> None:
         print(f"Diagnosing example {experiment.example}: {experiment.model}/{experiment.method}", flush=True)
         rows.extend(diagnostic_rows(experiment))
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(OUTPUT_PATH, index=False)
+    diagnostics = pd.DataFrame(rows)
+    diagnostics["rhat"] = diagnostics["rhat"].map("{:.3f}".format)
+    for column in ("ess_bulk", "ess_tail"):
+        diagnostics[column] = diagnostics[column].map("{:.1f}".format)
+    diagnostics.to_csv(OUTPUT_PATH, index=False)
     print(f"saved: {OUTPUT_PATH}")
 
 
