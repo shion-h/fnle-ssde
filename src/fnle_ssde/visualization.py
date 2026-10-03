@@ -654,6 +654,7 @@ def plot_posterior_figure(
     text_font_coefficient: float = 9.0,
     panel_title_font_coefficient: float = 12.0,
     overall_title_font_coefficient: float = 14.0,
+    parameter_section_title: str | None = None,
 ) -> None:
     """Create a complete posterior figure from numerical case settings."""
     if not cases:
@@ -721,6 +722,13 @@ def plot_posterior_figure(
             va="center",
             fontsize=overall_title_font_coefficient * font_scale,
         )
+        if parameter_section_title is not None:
+            fig.text(
+                (column + 0.5) / len(cases), 0.945,
+                parameter_section_title,
+                ha="center", va="center",
+                fontsize=panel_title_font_coefficient * font_scale,
+            )
         parameter_grid = grid[1, column].subgridspec(
             1,
             len(case.parameter_groups),
@@ -757,7 +765,7 @@ def plot_posterior_figure(
         for ax, group in zip(parameter_axes, case.parameter_groups, strict=True):
             plot_parameter_bars(
                 ax,
-                title=group.title,
+                title=" " if parameter_section_title is not None else group.title,
                 indices=group.indices,
                 names=case.parameter_names,
                 switching=case.parameter_switching,
