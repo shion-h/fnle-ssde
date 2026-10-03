@@ -56,7 +56,7 @@ def method_output_dir(method: str) -> Path:
 
 def max_observation_steps(data: dict) -> int:
     """Convert the widest observed time interval to simulation steps."""
-    return round(float(data["times"].diff().max()) / DT)
+    return round(float(data["T_obs"].diff().max()) / DT)
 
 
 def prepare_paired_training_data(data: dict) -> None:
@@ -80,7 +80,7 @@ def prepare_paired_training_data(data: dict) -> None:
     )
     reference_times = torch.arange(round(float(data["times"][-1]) / DT) + 1) * DT
     reference = NLEEstimator.build_spline_reference_path(
-        data["times"], data["x"], reference_times, spline_clamp_bounds=None,
+        data["T_obs"], data["x_obs"], reference_times, spline_clamp_bounds=None,
     )
     context_generator = torch.Generator().manual_seed(0)
     exact_generator = torch.Generator().manual_seed(1)
@@ -147,7 +147,7 @@ def train_fnle(method: str, data: dict) -> None:
         )
     reference_times = torch.arange(round(float(data["times"][-1]) / DT) + 1) * DT
     estimator.train(
-        obs_times=data["times"], x_obs=data["x"],
+        obs_times=data["T_obs"], x_obs=data["x_obs"],
         reference_times=reference_times,
         n_params=TRAINING_SIZE, ref_noize=REF_NOISE,
         max_n_steps=max_observation_steps(data),
@@ -200,7 +200,7 @@ def sample_chain(method: str, chain_id: int) -> tuple[int, Path]:
     initial_q = sample_generator_matrix(2, q_alpha=2.0, q_beta=20.0)
     q_for_initial_path = make_symmetric_generator(2, INITIAL_PATH_JUMP_RATE)
     sampler_kwargs = dict(
-        Q=initial_q, x_obs=data["x"], obs_times=data["times"],
+        Q=initial_q, x_obs=data["x_obs"], obs_times=data["T_obs"],
         T=float(data["times"][-1]), omega_scale=3.0,
         switching_parameter_mask=switching_mask,
         prior_config=prior,
