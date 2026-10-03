@@ -1,9 +1,8 @@
 """Compare exact OU inference with exact-trained and Euler-trained FNLEs.
 
 Run generate_data_1.py first. The two FNLEs share 100,000 training contexts;
-then each of the three methods runs 10,000 sweeps in four chains. Existing
-training caches are reused. Histories with the earlier initialization remain
-in fnle_comparison; the new chains use example2_style_initialization.
+then each of the three methods runs 10,000 sweeps in four chains. Each method's
+model, training data, and chain histories are saved together under RESULT_PATH.
 """
 
 from __future__ import annotations
@@ -31,9 +30,7 @@ from fnle_ssde.utils import (
 from generate_data_1 import DATA_PATH, DT, ROOT
 
 
-DATA_DIR = ROOT / "results/example_1_ou_seed0"
-NLE_CACHE_DIR = DATA_DIR / "fnle_comparison"
-OUTPUT_DIR = DATA_DIR / "example2_style_initialization"
+RESULT_PATH = ROOT / "results/example_1"
 METHODS = ("exact", "fnle_exact", "fnle_euler")
 SEEDS = (0, 1, 2, 3)
 NUM_SWEEPS = 10_000
@@ -50,7 +47,7 @@ THETA_PHYSICAL_HIGH = torch.tensor([0.2, 2.0, 0.1])
 
 def method_output_dir(method: str) -> Path:
     if method in METHODS:
-        return OUTPUT_DIR / method
+        return RESULT_PATH / method
     raise ValueError(f"Unknown method: {method}")
 
 
@@ -61,8 +58,8 @@ def max_observation_steps(data: dict) -> int:
 
 def prepare_paired_training_data(data: dict) -> None:
     """Generate matched contexts and method-specific transition targets."""
-    exact_path = NLE_CACHE_DIR / "fnle_exact/training.pt"
-    euler_path = NLE_CACHE_DIR / "fnle_euler/training.pt"
+    exact_path = method_output_dir("fnle_exact") / "training.pt"
+    euler_path = method_output_dir("fnle_euler") / "training.pt"
     if exact_path.exists() and euler_path.exists():
         exact = torch.load(exact_path, map_location="cpu", weights_only=False)
         euler = torch.load(euler_path, map_location="cpu", weights_only=False)
@@ -124,7 +121,7 @@ def prepare_paired_training_data(data: dict) -> None:
 
 
 def train_fnle(method: str, data: dict) -> None:
-    method_dir = NLE_CACHE_DIR / method
+    method_dir = method_output_dir(method)
     model_path = method_dir / "nle.pt"
     dynamics = OUDynamics(dt=DT, device="cpu")
     lower, upper = dynamics.physical_bounds_to_nle_bounds(
@@ -177,7 +174,7 @@ def sample_chain(method: str, chain_id: int) -> tuple[int, Path]:
     else:
         sampler_class = ContinuousTimeAR1HMMSampler
         estimator = NLEEstimator(
-            dynamics=dynamics, model_cache_path=NLE_CACHE_DIR / method / "nle.pt",
+            dynamics=dynamics, model_cache_path=method_dir / "nle.pt",
         )
         estimator.xt_data = estimator.ctx_data = None
 
