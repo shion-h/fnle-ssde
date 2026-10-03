@@ -33,9 +33,9 @@ from fnle_ssde.visualization import (  # noqa: E402
 )
 
 
-FIGURE_PATH = RESULT_PATH / "posterior.png"
+FIGURE_PATH = RESULT_PATH / "example_3.png"
 FIGURE_PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
-TRACE_PATH = RESULT_PATH / "multichain_trace.png"
+TRACE_PATH = RESULT_PATH / "example_3_trace.png"
 TRACE_PDF_PATH = TRACE_PATH.with_suffix(".pdf")
 REGIME_ALIGNMENT_PATH = RESULT_PATH / "regime_alignment.csv"
 FONT_SCALE = 2.0
