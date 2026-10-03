@@ -86,7 +86,7 @@ def main() -> None:
                 ParameterPlotGroup(r"$\gamma$", (2,), 1.4),
                 ParameterPlotGroup(r"$c$", (4,), 1.4),
             )
-            names = (r"\alpha/\beta", r"\beta", r"\gamma", r"\delta", "c")
+            names = (r"\rho", r"\beta", r"\gamma", r"\delta", "c")
             switching = (True, False, False, False, False)
         else:
             title = "Susceptible–Infected–Recovered epidemic model"
@@ -130,6 +130,7 @@ def main() -> None:
         text_font_coefficient=TEXT_FONT_COEFFICIENT,
         panel_title_font_coefficient=PANEL_TITLE_FONT_COEFFICIENT,
         overall_title_font_coefficient=OVERALL_TITLE_FONT_COEFFICIENT,
+        parameter_section_title="Parameters",
     )
 
 
