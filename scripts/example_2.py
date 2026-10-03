@@ -25,9 +25,9 @@ RESULT_PATH = ROOT / "results/example_2"
 NLE_CACHE_PATHS = {
     name: RESULT_PATH / name / "nle.pt" for name in ("lv", "cle", "sir")
 }
-LV_HISTORY_PATH = RESULT_PATH / "lv/example2_lv_mcmc_chain.pt"
+LV_HISTORY_PATH = RESULT_PATH / "lv/chain.pt"
 CLE_HISTORY_PATH = RESULT_PATH / "cle/chain.pt"
-SIR_HISTORY_PATH = RESULT_PATH / "sir/example2_sir_mcmc_chain.pt"
+SIR_HISTORY_PATH = RESULT_PATH / "sir/chain.pt"
 
 Q_PRIOR_ALPHA, Q_PRIOR_BETA = 2.0, 20.0
 # Settings shared by LV, CLE and SIR. Existing histories are not overwritten.
@@ -37,6 +37,9 @@ BURN_IN = 5_000
 PROGRESS_EVERY = 100
 NLE_TRAINING_SAMPLES = 100_000
 NLE_SEED = 0
+# Upper training limit; early stopping can finish before this.
+NLE_MAX_EPOCHS = 100
+NLE_REF_NOISE = 0.32
 
 
 @dataclass(frozen=True)
@@ -46,11 +49,9 @@ class Experiment:
     data_path: Path
     history_path: Path
     nle_cache_path: Path
-    nle_epochs: int
     theta_low: torch.Tensor
     theta_high: torch.Tensor
     switching_mask: torch.Tensor
-    ref_noise: float
     theta_prior_loc: torch.Tensor
     theta_prior_scale: torch.Tensor
     initial_path_jump_rate: float
@@ -79,11 +80,9 @@ def experiments() -> tuple[Experiment, ...]:
             data_path=DATA_PATHS["lv"],
             history_path=LV_HISTORY_PATH,
             nle_cache_path=NLE_CACHE_PATHS["lv"],
-            nle_epochs=100,
             theta_low=torch.tensor([0.01, 0.1, 0.01, 0.1, 0.01, 0.01]),
             theta_high=torch.tensor([2.0, 3.0, 2.0, 3.0, 0.30, 0.20]),
             switching_mask=torch.tensor([True, True, True, True, False, False]),
-            ref_noise=0.32,
             theta_prior_loc=torch.tensor([0.0, 0.0, 0.0, 0.0, -1.0, -1.0]),
             theta_prior_scale=torch.ones(6),
             initial_path_jump_rate=0.2,
@@ -99,11 +98,9 @@ def experiments() -> tuple[Experiment, ...]:
             data_path=DATA_PATHS["cle"],
             history_path=CLE_HISTORY_PATH,
             nle_cache_path=NLE_CACHE_PATHS["cle"],
-            nle_epochs=100,
             theta_low=torch.tensor([50.0, 0.5, 0.001, 0.5, 0.01]),
             theta_high=torch.tensor([400.0, 1.5, 0.010, 1.5, 0.10]),
             switching_mask=torch.tensor([True, False, False, False, False]),
-            ref_noise=0.32,
             theta_prior_loc=torch.tensor([4.0, 0.0, 0.0, 0.0, 0.0]),
             theta_prior_scale=torch.ones(5),
             initial_path_jump_rate=0.4,
@@ -115,11 +112,9 @@ def experiments() -> tuple[Experiment, ...]:
             data_path=DATA_PATHS["sir"],
             history_path=SIR_HISTORY_PATH,
             nle_cache_path=NLE_CACHE_PATHS["sir"],
-            nle_epochs=100,
             theta_low=torch.tensor([0.05, 0.02]),
             theta_high=torch.tensor([2.0, 2.0]),
             switching_mask=torch.tensor([True, True]),
-            ref_noise=0.32,
             theta_prior_loc=torch.zeros(2),
             theta_prior_scale=torch.ones(2),
             initial_path_jump_rate=0.5,
@@ -179,9 +174,9 @@ def run(experiment: Experiment) -> None:
             "theta_upper": experiment.theta_high,
             "n_params": NLE_TRAINING_SAMPLES,
             "seed": NLE_SEED,
-            "ref_noise": experiment.ref_noise,
+            "ref_noise": NLE_REF_NOISE,
             "max_n_steps": max_n_steps,
-            "epochs": experiment.nle_epochs,
+            "epochs": NLE_MAX_EPOCHS,
             "stop_after_epochs": 20,
             "noisy_init_strategy": "resample",
         },
