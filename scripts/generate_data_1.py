@@ -41,23 +41,24 @@ def simulate_path(
 
 def generate_data() -> dict:
     dynamics = ExactTransitionOUDynamics(dt=DT, device="cpu")
-    times = torch.arange(round(END_TIME / OBS_DELTA) + 1, dtype=torch.float64) * OBS_DELTA
+    T_obs = torch.arange(round(END_TIME / OBS_DELTA) + 1, dtype=torch.float64) * OBS_DELTA
     simulation_times = (
         torch.arange(round(END_TIME / SIMULATION_DELTA) + 1, dtype=torch.float64)
         * SIMULATION_DELTA
     )
-    grid = torch.unique(torch.cat((times, simulation_times, JUMP_TIMES)), sorted=True)
-    obs_idx = torch.searchsorted(grid, times)
+    grid = torch.unique(torch.cat((T_obs, simulation_times, JUMP_TIMES)), sorted=True)
+    obs_idx = torch.searchsorted(grid, T_obs)
 
     generator = torch.Generator().manual_seed(DATA_SEED)
-    latent_path = simulate_path(dynamics, PHYSICAL_TRUTH, grid, generator)
-    y = latent_path[obs_idx]
-    x = y + TAU_TRUTH * torch.randn(
-        y.shape, generator=generator, dtype=y.dtype,
+    y_true = simulate_path(dynamics, PHYSICAL_TRUTH, grid, generator)
+    y_at_observations = y_true[obs_idx]
+    x_obs = y_at_observations + TAU_TRUTH * torch.randn(
+        y_at_observations.shape, generator=generator, dtype=y_at_observations.dtype,
     )
 
     return dict(
-        times=times, y=y, x=x, jump_times=JUMP_TIMES.clone(), regimes=REGIMES.clone(),
+        times=grid, y_true=y_true, obs_idx=obs_idx, T_obs=T_obs, x_obs=x_obs,
+        jump_times=JUMP_TIMES.clone(), regimes=REGIMES.clone(),
         theta_true=dynamics.to_nle_theta(PHYSICAL_TRUTH),
         metadata=dict(
             data_seed=DATA_SEED,
@@ -72,19 +73,8 @@ def main() -> None:
     torch.set_num_threads(1)
     data = generate_data()
     DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if DATA_PATH.exists():
-        saved = torch.load(DATA_PATH, map_location="cpu", weights_only=False)
-        fields = ("times", "y", "x", "jump_times", "regimes")
-        if any(not torch.equal(saved[field], data[field]) for field in fields):
-            raise ValueError(f"Existing data differ from the reproducible generation: {DATA_PATH}")
-        if set(saved) == set(data) and set(saved["metadata"]) == set(data["metadata"]):
-            print(f"Reusing bitwise-identical data: {DATA_PATH}", flush=True)
-            return
-        torch.save(data, DATA_PATH)
-        print(f"Saved updated data: {DATA_PATH}", flush=True)
-    else:
-        torch.save(data, DATA_PATH)
-        print(f"Saved {DATA_PATH}", flush=True)
+    torch.save(data, DATA_PATH)
+    print(f"Saved {DATA_PATH}", flush=True)
 
 
 if __name__ == "__main__":
