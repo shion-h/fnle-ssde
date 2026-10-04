@@ -541,7 +541,7 @@ def plot_posterior_y_trajectory(
         ax.fill_between(
             times, summary["low"][:, dimension], summary["high"][:, dimension],
             color=color, alpha=0.25, lw=0,
-            label="95% predictive interval" if index == 0 else "_nolegend_",
+            label="Pointwise 95% credible interval" if index == 0 else "_nolegend_",
         )
         ax.plot(
             times, summary["mean"][:, dimension], color=color,

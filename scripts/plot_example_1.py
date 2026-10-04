@@ -31,8 +31,10 @@ from generate_data_1 import DATA_PATH, DT
 FIGURE_PATH = RESULT_PATH / "example_1.png"
 FONT_SCALE = 1.1
 TEXT_FONT_COEFFICIENT = 13.0
-PANEL_TITLE_FONT_COEFFICIENT = 13.0
 FIGURE_SIZE = (9.6, 12.8)
+# Match Example 3's 24 pt panel titles after both one-column figures are
+# scaled to the same printed width (Example 3 is 13 inches wide).
+PANEL_TITLE_FONT_COEFFICIENT = 24.0 * FIGURE_SIZE[0] / (13.0 * FONT_SCALE)
 HISTOGRAM_RANGE_QUANTILES: tuple[float, float] | None = None
 
 METHOD_LABELS = {
@@ -120,7 +122,12 @@ def plot_figure(
     )
 
     fig = plt.figure(figsize=FIGURE_SIZE, layout="constrained")
-    fig.get_layout_engine().set(rect=(0, 0, 1, 0.82))
+    fig.get_layout_engine().set(rect=(0, 0, 1, 0.78))
+    fig.text(
+        0.5, 0.81, "Posterior distributions of parameters",
+        ha="center", va="center",
+        fontsize=PANEL_TITLE_FONT_COEFFICIENT * FONT_SCALE,
+    )
     grid = fig.add_gridspec(
         4, 2,
         height_ratios=(1, 1, 0.7, 0.7),
@@ -207,7 +214,7 @@ def plot_figure(
             facecolor=METHOD_STYLES[method][0],
             alpha=0.25,
             edgecolor="none",
-            label=f"95% predictive interval ({METHOD_SHORT_LABELS[method]})",
+            label=f"Pointwise 95% credible interval ({METHOD_SHORT_LABELS[method]})",
         )
         for method in METHODS
     )

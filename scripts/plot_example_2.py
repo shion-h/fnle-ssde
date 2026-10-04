@@ -28,8 +28,11 @@ FIGURE_PATH = RESULT_PATH / "example_2.png"
 PDF_PATH = FIGURE_PATH.with_suffix(".pdf")
 FONT_SCALE = 1.1
 TEXT_FONT_COEFFICIENT = 13.0
-PANEL_TITLE_FONT_COEFFICIENT = 13.0
-OVERALL_TITLE_FONT_COEFFICIENT = 14.0
+FIGURE_SIZE = (18.5, 10.5)
+# Match Example 3's 24 pt panel titles when this figure is printed at twice
+# the width of a one-column figure (Example 3 is 13 inches wide).
+PANEL_TITLE_FONT_COEFFICIENT = 24.0 * FIGURE_SIZE[0] / (2.0 * 13.0 * FONT_SCALE)
+OVERALL_TITLE_FONT_COEFFICIENT = PANEL_TITLE_FONT_COEFFICIENT
 
 
 def main() -> None:
@@ -123,7 +126,7 @@ def main() -> None:
     plot_posterior_figure(
         tuple(cases),
         FIGURE_PATH,
-        figsize=(18.5, 10.5),
+        figsize=FIGURE_SIZE,
         additional_outputs=(PDF_PATH,),
         height_ratios=(0.12, 0.70, 0.15, 0.22, 0.70, 0.70, 0.70),
         font_scale=FONT_SCALE,
