@@ -77,7 +77,7 @@ def plot_result(
     """Create the real-data posterior figure from combined post-burn-in draws."""
     dense_times = torch.linspace(float(T_obs[0]), float(T_obs[-1]), 1_000)
     case = PosteriorFigureCase(
-        title=r"$\mathit{Didinium}$–$\mathit{Paramecium}$",
+        title="",
         history=history,
         observation_times=T_obs,
         observations=x_obs,
@@ -100,11 +100,12 @@ def plot_result(
         output,
         figsize=(13, 13),
         additional_outputs=additional_outputs,
-        height_ratios=(0.12, 0.90, 0.15, 0.22, 1, 1, 1),
+        height_ratios=(0.90, 0.15, 0.22, 1, 1, 1),
         font_scale=FONT_SCALE,
         text_font_coefficient=TEXT_FONT_COEFFICIENT,
         panel_title_font_coefficient=PANEL_TITLE_FONT_COEFFICIENT,
         overall_title_font_coefficient=OVERALL_TITLE_FONT_COEFFICIENT,
+        parameter_section_title="Parameters",
     )
 
 

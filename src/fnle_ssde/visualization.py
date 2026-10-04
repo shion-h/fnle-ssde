@@ -552,7 +552,7 @@ def plot_posterior_y_trajectory(
                 lw=1.5, label="Latent truth")
     ax.scatter(
         observation_times, observations[:, dimension], s=12,
-        color=OBSERVATION_COLOR, alpha=0.6, label="Observed",
+        color=OBSERVATION_COLOR, alpha=0.6, label="Observations",
         zorder=observation_zorder, linewidths=observation_linewidths,
     )
 
@@ -715,10 +715,16 @@ def plot_posterior_figure(
     if not cases:
         raise ValueError("At least one posterior figure case is required.")
     max_trajectories = max(len(case.trajectory_dimensions) for case in cases)
-    expected_rows = 5 + max_trajectories
+    show_case_titles = any(case.title for case in cases)
+    title_offset = int(show_case_titles)
+    parameter_row = title_offset
+    parameter_legend_row = title_offset + 1
+    trajectory_legend_row = title_offset + 2
+    time_grid_start = title_offset + 3
+    expected_rows = time_grid_start + max_trajectories + 1
     if height_ratios is None:
         height_ratios = (
-            0.12,
+            *((0.12,) if show_case_titles else ()),
             1.10,
             0.15,
             0.22,
@@ -737,15 +743,26 @@ def plot_posterior_figure(
         panel_title_font_coefficient=panel_title_font_coefficient,
     )
     fig = plt.figure(figsize=figsize, constrained_layout=True)
+    if parameter_section_title is not None and not show_case_titles:
+        fig.get_layout_engine().set(
+            rect=(0.0, 0.0, 1.0, 0.94),
+            h_pad=0.01,
+            hspace=0.0,
+        )
     grid = fig.add_gridspec(
         expected_rows,
         len(cases),
         height_ratios=height_ratios,
         wspace=0.08,
+        hspace=(
+            0.0
+            if parameter_section_title is not None and not show_case_titles
+            else None
+        ),
     )
-    parameter_legend = fig.add_subplot(grid[2, :])
+    parameter_legend = fig.add_subplot(grid[parameter_legend_row, :])
     parameter_legend.axis("off")
-    trajectory_legend = fig.add_subplot(grid[3, :])
+    trajectory_legend = fig.add_subplot(grid[trajectory_legend_row, :])
     trajectory_legend.axis("off")
     parameter_legend_content = None
     trajectory_legend_content = None
@@ -767,24 +784,35 @@ def plot_posterior_figure(
                 "z_truth are required when show_truth=True."
             )
 
-        title_ax = fig.add_subplot(grid[0, column])
-        title_ax.axis("off")
-        title_ax.text(
-            0.5,
-            0.5,
-            case.title,
-            ha="center",
-            va="center",
-            fontsize=overall_title_font_coefficient * font_scale,
-        )
-        if parameter_section_title is not None:
-            fig.text(
-                (column + 0.5) / len(cases), 0.945,
-                parameter_section_title,
-                ha="center", va="center",
-                fontsize=panel_title_font_coefficient * font_scale,
+        if show_case_titles:
+            title_ax = fig.add_subplot(grid[0, column])
+            title_ax.axis("off")
+            title_ax.text(
+                0.5,
+                0.5,
+                case.title,
+                ha="center",
+                va="center",
+                fontsize=overall_title_font_coefficient * font_scale,
             )
-        parameter_grid = grid[1, column].subgridspec(
+        if parameter_section_title is not None:
+            if show_case_titles:
+                fig.text(
+                    (column + 0.5) / len(cases), 0.945,
+                    parameter_section_title,
+                    ha="center", va="center",
+                    fontsize=panel_title_font_coefficient * font_scale,
+                )
+            else:
+                fig.text(
+                    (column + 0.5) / len(cases),
+                    0.938,
+                    parameter_section_title,
+                    ha="center",
+                    va="center",
+                    fontsize=panel_title_font_coefficient * font_scale,
+                )
+        parameter_grid = grid[parameter_row, column].subgridspec(
             1,
             len(case.parameter_groups),
             width_ratios=tuple(group.width for group in case.parameter_groups),
@@ -834,10 +862,10 @@ def plot_posterior_figure(
         if parameter_legend_content is None:
             parameter_legend_content = parameter_axes[0].get_legend_handles_labels()
 
-        time_grid = grid[4:, column].subgridspec(
+        time_grid = grid[time_grid_start:, column].subgridspec(
             max_trajectories + 1,
             1,
-            height_ratios=height_ratios[4:],
+            height_ratios=height_ratios[time_grid_start:],
             hspace=0.05,
         )
         trajectory_axes = []
@@ -859,7 +887,7 @@ def plot_posterior_figure(
                 truth_times=case.y_truth_times,
                 truth=case.y_truth,
             )
-            ax.set_title(f"Trajectory: {label}")
+            ax.set_title(f"Latent state: {label}")
             ax.set_ylabel(label)
             ax.tick_params(axis="x", labelbottom=False)
             trajectory_axes.append(ax)

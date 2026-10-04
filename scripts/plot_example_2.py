@@ -123,9 +123,9 @@ def main() -> None:
     plot_posterior_figure(
         tuple(cases),
         FIGURE_PATH,
-        figsize=(18.5, 11.5),
+        figsize=(18.5, 10.5),
         additional_outputs=(PDF_PATH,),
-        height_ratios=(0.12, 1.10, 0.15, 0.22, 1, 1, 0.70),
+        height_ratios=(0.12, 0.70, 0.15, 0.22, 0.70, 0.70, 0.70),
         font_scale=FONT_SCALE,
         text_font_coefficient=TEXT_FONT_COEFFICIENT,
         panel_title_font_coefficient=PANEL_TITLE_FONT_COEFFICIENT,

@@ -20,7 +20,7 @@ from example_1 import (
 )
 from fnle_ssde.dynamics import OUDynamics
 from fnle_ssde.visualization import (
-    OBSERVATION_COLOR, POSTERIOR_COLOR, POSTERIOR_METHOD_STYLES, TRUTH_COLOR,
+    OBSERVATION_COLOR, POSTERIOR_METHOD_STYLES, TRUTH_COLOR,
     interpolated_posterior_y_summary, match_regime_labels, regime_at_times,
     plot_posterior_regime, plot_posterior_y_trajectory,
     save_figure, set_paper_figure_style,
@@ -32,14 +32,18 @@ FIGURE_PATH = RESULT_PATH / "example_1.png"
 FONT_SCALE = 1.1
 TEXT_FONT_COEFFICIENT = 13.0
 PANEL_TITLE_FONT_COEFFICIENT = 13.0
-OVERALL_TITLE_FONT_COEFFICIENT = 14.0
-FIGURE_SIZE = (14.8, 12.5)
+FIGURE_SIZE = (9.6, 12.8)
 HISTOGRAM_RANGE_QUANTILES: tuple[float, float] | None = None
 
 METHOD_LABELS = {
     "exact": "Exact MCMC",
-    "fnle_exact": "Approx. MCMC with FNLE(exact-transition training)",
-    "fnle_euler": "Approx. MCMC with FNLE(Euler--Maruyama training)",
+    "fnle_exact": "Approx. MCMC (exact FNLE)",
+    "fnle_euler": "Approx. MCMC (Euler--Maruyama FNLE)",
+}
+METHOD_SHORT_LABELS = {
+    "exact": "exact MCMC",
+    "fnle_exact": "approx. MCMC (exact FNLE)",
+    "fnle_euler": "approx. MCMC (Euler--Maruyama FNLE)",
 }
 METHOD_STYLES = dict(zip(METHODS, POSTERIOR_METHOD_STYLES, strict=True))
 PARAMETER_LABELS = (
@@ -103,7 +107,7 @@ def plot_figure(
     regime_times: torch.Tensor,
     dynamics: OUDynamics,
 ) -> None:
-    """One paper figure with four parameter densities and two time-series panels."""
+    """Plot 2-by-2 parameter densities above the state and regime panels."""
     set_paper_figure_style(
         font_scale=FONT_SCALE,
         text_font_coefficient=TEXT_FONT_COEFFICIENT,
@@ -116,18 +120,17 @@ def plot_figure(
     )
 
     fig = plt.figure(figsize=FIGURE_SIZE, layout="constrained")
-    fig.get_layout_engine().set(rect=(0, 0, 1, 0.92))
-    parameter_fig, latent_fig = fig.subfigures(
-        2, 1, height_ratios=(1.0, 2.0),
+    fig.get_layout_engine().set(rect=(0, 0, 1, 0.82))
+    grid = fig.add_gridspec(
+        4, 2,
+        height_ratios=(1, 1, 0.7, 0.7),
+        hspace=0.08,
+        wspace=0.0,
     )
-    parameter_fig.suptitle(
-        "Parameters", x=0.02, ha="left", fontweight="bold",
-        fontsize=OVERALL_TITLE_FONT_COEFFICIENT * FONT_SCALE,
-    )
-    parameter_grid = parameter_fig.add_gridspec(1, len(PARAMETER_LABELS))
     parameter_axes = [
-        parameter_fig.add_subplot(parameter_grid[0, column])
-        for column in range(len(PARAMETER_LABELS))
+        fig.add_subplot(grid[row, column])
+        for row in range(2)
+        for column in range(2)
     ]
     for index, symbol in enumerate(PARAMETER_LABELS):
         ax = parameter_axes[index]
@@ -145,20 +148,15 @@ def plot_figure(
                 label=METHOD_LABELS[method],
             )
         if np.isfinite(parameter_truth[index]):
-            ax.axvline(parameter_truth[index], color=TRUTH_COLOR, ls="--", lw=1.4)
+            ax.axvline(parameter_truth[index], color=TRUTH_COLOR, ls="-", lw=1.4)
         ax.set_title(symbol)
-        ax.set_ylabel("Density" if index == 0 else "")
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        ax.set_ylabel("Density" if index % 2 == 0 else "")
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
         ax.grid(axis="y")
         ax.grid(axis="x", visible=False)
 
-    latent_fig.suptitle(
-        "Latent variables", x=0.02, ha="left", fontweight="bold",
-        fontsize=OVERALL_TITLE_FONT_COEFFICIENT * FONT_SCALE,
-    )
-    state_ax, regime_ax = latent_fig.subplots(
-        2, 1, sharex=True, gridspec_kw={"height_ratios": (1.4, 1)},
-    )
+    state_ax = fig.add_subplot(grid[2, :])
+    regime_ax = fig.add_subplot(grid[3, :], sharex=state_ax)
     styles = tuple(METHOD_STYLES.values())
     labels = tuple(METHOD_LABELS[method] for method in METHODS)
     plot_posterior_y_trajectory(
@@ -178,7 +176,7 @@ def plot_figure(
         observation_zorder=10,
         observation_linewidths=0,
     )
-    state_ax.set_title(r"Trajectory: $Y_t$")
+    state_ax.set_title(r"Latent state: $Y_t$")
     state_ax.set_ylabel(r"$Y_t$")
 
     edges = torch.cat((data["times"][:1], data["jump_times"], data["times"][-1:]))
@@ -204,14 +202,28 @@ def plot_figure(
         )
         for method, (color, linestyle) in METHOD_STYLES.items()
     ]
+    handles.extend(
+        Patch(
+            facecolor=METHOD_STYLES[method][0],
+            alpha=0.25,
+            edgecolor="none",
+            label=f"95% predictive interval ({METHOD_SHORT_LABELS[method]})",
+        )
+        for method in METHODS
+    )
     handles.extend((
-        Line2D([0], [0], color=TRUTH_COLOR, lw=1.5, label="True value / path"),
+        Line2D([0], [0], color=TRUTH_COLOR, lw=1.5, label="True values"),
         Line2D([0], [0], color=OBSERVATION_COLOR, marker="o", lw=0, markersize=5,
                label="Observations"),
-        Patch(facecolor=POSTERIOR_COLOR, alpha=0.25, edgecolor="none",
-              label="95% predictive interval"),
     ))
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.99), ncol=3)
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.99),
+        ncol=1,
+        labelspacing=0.25,
+        handletextpad=0.6,
+    )
     save_figure(fig, FIGURE_PATH, additional_paths=(FIGURE_PATH.with_suffix(".pdf"),))
 
 
