@@ -1,7 +1,7 @@
 # FNLE-SSDE
 
-The paper experiments are implemented in `scripts/example_1.py` through
-`scripts/example_3.py`. Data generation and plotting are separate:
+The paper experiments are implemented in `scripts/example_{1,2,3}.py`.
+Data generation and plotting are separate:
 `scripts/generate_data_{1,2,3}.py` and `scripts/plot_example_{1,2,3}.py`.
 
 ## Reference machine
