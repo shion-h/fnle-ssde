@@ -1,15 +1,33 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fnle_ssde"
 version = "0.1.0"
+requires-python = ">=3.12,<3.13"
 dependencies = [
+    "arviz==0.22.0",
+    "matplotlib==3.10.5",
+    "nflows==0.14",
+    "numpy==2.3.2",
+    "pandas==2.3.2",
+    "pyro-ppl==1.9.1",
+    "sbi==0.24.0",
+    "scipy==1.16.1",
+    "torch==2.5.1",
+    "tqdm==4.67.1",
+]
+
+# Keep every transitive dependency selected by the project at the version in
+# the pre-uv .venv. Entries that are not required by the direct dependencies
+# remain constraints only and are not installed.
+[tool.uv]
+constraint-dependencies = [
     "absl-py==2.3.1",
+    "arviz==0.22.0",
     "argon2-cffi==25.1.0",
     "argon2-cffi-bindings==25.1.0",
-    "arviz==0.22.0",
     "asttokens==3.0.0",
     "attrs==25.3.0",
     "beautifulsoup4==4.13.5",
@@ -50,7 +68,6 @@ dependencies = [
     "Markdown==3.8.2",
     "markdown-it-py==4.0.0",
     "MarkupSafe==3.0.2",
-    "matplotlib==3.10.5",
     "matplotlib-inline==0.1.7",
     "mdurl==0.1.2",
     "miniKanren==1.0.5",
@@ -62,9 +79,7 @@ dependencies = [
     "nbformat==5.10.4",
     "nest-asyncio==1.6.0",
     "networkx==3.5",
-    "nflows==0.14",
     "notebook==6.4.12",
-    "numpy==2.3.2",
     "nvidia-cublas-cu12==12.4.5.8",
     "nvidia-cuda-cupti-cu12==12.4.127",
     "nvidia-cuda-nvrtc-cu12==12.4.127",
@@ -79,7 +94,6 @@ dependencies = [
     "nvidia-nvtx-cu12==12.4.127",
     "opt_einsum==3.4.0",
     "packaging==25.0",
-    "pandas==2.3.2",
     "pandocfilters==1.5.1",
     "parso==0.8.5",
     "pexpect==4.9.0",
@@ -97,7 +111,6 @@ dependencies = [
     "pymc==5.25.1",
     "pyparsing==3.2.3",
     "pyro-api==0.1.2",
-    "pyro-ppl==1.9.1",
     "pytensor==2.31.7",
     "python-dateutil==2.9.0.post0",
     "pytz==2025.2",
@@ -105,9 +118,7 @@ dependencies = [
     "referencing==0.36.2",
     "rich==14.1.0",
     "rpds-py==0.27.1",
-    "sbi==0.24.0",
     "scikit-learn==1.7.1",
-    "scipy==1.16.1",
     "Send2Trash==1.8.3",
     "setuptools==80.9.0",
     "six==1.17.0",
@@ -120,9 +131,7 @@ dependencies = [
     "threadpoolctl==3.6.0",
     "tinycss2==1.4.0",
     "toolz==1.0.0",
-    "torch==2.5.1",
     "tornado==6.5.2",
-    "tqdm==4.67.1",
     "traitlets==5.14.3",
     "triton==3.1.0",
     "typing_extensions==4.15.0",

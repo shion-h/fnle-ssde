@@ -1,0 +1,2095 @@
+"""
+Continuous-time AR(1)-HMM MCMC sampler in a single research-oriented file.
+
+This implementation combines:
+1. Uniformization / candidate jumps for the continuous-time discrete regime path z(t)
+2. Conditional NUTS or MALA updates for the continuous latent trajectory y
+   on an augmented grid
+3. FFBS updates for the discrete regime skeleton on the same augmented grid
+4. Conditional NUTS or MALA updates for the NLE transition parameters
+5. Conjugate updates for the diagonal observation noise
+6. Conjugate updates for the CTMC generator Q
+
+Model summary
+-------------
+z(t) in {0, ..., K-1} follows a continuous-time Markov jump process with generator Q.
+
+The observation model is diagonal Gaussian:
+
+    x_i | y(t_i) ~ Normal(y(t_i), diag(tau_obs^2))
+
+The latent transition density is evaluated by an NLEEstimator:
+
+    p(y_{t+1} | y_t, z=k) = flow.log_prob(y_{t+1}, context=[theta_k, y_t, interval_length / dt])
+
+The code keeps the implementation intentionally explicit and modular inside one class so
+that each MCMC transition remains easy to inspect and modify.
+"""
+
+from __future__ import annotations
+
+import heapq
+import os
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pyro
+import pyro.distributions as dist
+from pyro.infer import HMC, MCMC, NUTS
+import torch
+from torch.distributions import Distribution, constraints
+
+class SSDESampler:
+    """
+    MCMC sampler for a switching SDE with a supplied transition density.
+
+    Shapes
+    ------
+    x_obs: (N, obs_dim)
+    T_obs: (N,)
+    y_aug: (L+1, D)
+    z_aug: (L+1,)
+    theta: (K, theta_dim)       real-valued NLE parameter coordinates
+    log_tau: (obs_dim,)         observation-noise log scale, not part of theta
+    Q: (K, K)                   CTMC generator, sampled by Gamma conjugacy
+
+    Conventions
+    -----------
+    - Regimes are indexed from 0 to K-1.
+    - `z_aug[j+1]` denotes the regime on the interval [T_all[j], T_all[j+1]].
+    - Therefore the NLE transition from y_aug[j] to y_aug[j+1] uses regime z_aug[j+1].
+    - `z_aug[0]` duplicates the first interval regime so that `z_aug` has the same
+      length as `T_all`.
+    """
+
+    def __init__(
+        self,
+        Q: torch.Tensor,
+        x_obs: torch.Tensor | Sequence[torch.Tensor],
+        obs_times: torch.Tensor | Sequence[torch.Tensor],
+        T: float | Sequence[float],
+        *,
+        omega_scale: float = 1.5,
+        nle_estimator: Any = None,
+        dynamics: Any = None,
+        transition_log_prob_fn: Any = None,
+        transition_sample_fn: Any = None,
+        y_mh_config: Optional[Dict[str, Any]] = None,
+        theta_mh_config: Optional[Dict[str, Any]] = None,
+        sir_config: Optional[Dict[str, Any]] = None,
+        prior_config: Optional[Dict[str, Any]] = None,
+        theta_prior: Optional[Distribution] = None,
+        switching_parameter_mask: Optional[torch.Tensor] = None,
+        fixed_parameter_mask: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float64,
+        time_dtype: torch.dtype = torch.float64,
+        seed: int = 0,
+        latest_sample_path: Optional[str | os.PathLike[str]] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        Q:
+            Generator matrix of shape (K, K). Rows must sum to zero.
+        x_obs:
+            Observation matrix of shape (N, D).
+        obs_times:
+            Observation times T_obs of shape (N,), with
+            0 = T_obs[0] < ... < T_obs[N-1] = T.
+        T:
+            End time of the latent process.
+        omega_scale:
+            Uniformization rate factor. Omega = omega_scale * max_k(-Q_kk).
+        nle_estimator:
+            Trained/loaded NLEEstimator. Transition log densities are evaluated by
+            `nle_estimator.transition_log_prob`.
+        dynamics / transition_log_prob_fn / transition_sample_fn:
+            Alternative to nle_estimator. Supply all three. The density callable
+            takes (y_prev, y_next, theta, delta) and returns one log density per
+            batch row; the sampling callable takes (theta, y_prev, delta) and
+            returns one state per row. Delta is elapsed time, not a step count.
+            Callables must preserve device/dtype and density gradients in y/theta.
+        y_mh_config / theta_mh_config:
+            MH settings for the corresponding conditional update. Set ``method``
+            to ``"nuts"`` and provide ``max_tree_depth``, or set it to
+            ``"mala"`` and provide
+            ``step_size``. MALA uses one-step Pyro HMC; its step size is the
+            leapfrog epsilon, so the equivalent Langevin proposal has noise
+            variance epsilon squared. Exactly one MH transition is performed per
+            MCMC sweep. An explicit NUTS ``step_size`` skips initial tuning and
+            stays fixed. Otherwise NUTS step sizes are selected during initialize()
+            (one per y series and one for theta) and then held fixed; no mass
+            matrix adaptation or dual-averaging warmup is performed.
+            Setting NUTS ``adapt_step_size=True`` instead searches for a step
+            size at every update, using ``step_size`` (default 1) as the search
+            starting value. This state-dependent heuristic is intended for
+            calibration experiments, not fixed-kernel posterior sampling.
+        sir_config:
+            Settings for SIR initialization of y at newly inserted candidate
+            times. ``num_particles`` controls the number of particles.
+            ``use_t_pseudo_in_sir`` determines whether y values at the previous
+            sweep's pseudo-event times are retained as bridge boundaries.
+        prior_config:
+            Prior hyperparameters for theta and observation-noise variance.
+            `theta_loc` and `theta_scale` define the legacy Normal prior in the
+            NLE theta coordinate when `theta_prior` is omitted.
+        theta_prior:
+            Optional component-wise prior in the real-valued NLE theta coordinate.
+            It must have batch shape `(theta_dim,)`, scalar event shape, and real
+            support, and its log density must evaluate on the sampler's device
+            and dtype. A physical-scale prior can be converted with
+            `nle_estimator.dynamics.pullback_theta_prior()`.
+        switching_parameter_mask:
+            Boolean tensor of shape (theta_dim,). True dimensions have one
+            parameter per regime; False dimensions are shared across regimes.
+            If omitted, every parameter is regime-specific as before.
+        fixed_parameter_mask:
+            Boolean tensor of shape (theta_dim,). True dimensions are held at
+            their `initial_theta` values and excluded from both NUTS and the
+            theta prior. Fixed dimensions take precedence over switching/shared
+            classification.
+        time_dtype:
+            Floating-point dtype used for observation, jump, candidate, and
+            augmented-grid times. Time differences are computed in this dtype and
+            converted to the NLE dtype only after subtraction. Must be float32 or
+            float64; float64 is the default to make exact time collisions negligible.
+        latest_sample_path:
+            Optional monitoring file overwritten atomically after every completed
+            MCMC sweep. The complete in-memory history is unchanged.
+
+        The initial latent state has an improper flat prior on all of real space.
+        Every latent-state dimension must be observed with Gaussian noise.
+        """
+        first_x_obs = x_obs[0] if isinstance(x_obs, (list, tuple)) else x_obs
+        self.device = device or first_x_obs.device
+        self.dtype = dtype
+        if time_dtype not in (torch.float32, torch.float64):
+            raise ValueError("time_dtype must be torch.float32 or torch.float64.")
+        self.time_dtype = time_dtype
+        self.rng = torch.Generator(device="cpu")
+        self.rng.manual_seed(seed)
+        pyro.set_rng_seed(seed)
+        self.latest_sample_path = (
+            Path(latest_sample_path) if latest_sample_path is not None else None
+        )
+
+        self.Q = Q.to(device=self.device, dtype=self.dtype)
+        self.omega_scale = float(omega_scale)
+        if isinstance(x_obs, (list, tuple)):
+            if not isinstance(obs_times, (list, tuple)):
+                raise ValueError("obs_times must be a list/tuple when x_obs is a list/tuple.")
+            if not isinstance(T, (list, tuple)):
+                T = [float(times[-1].item()) for times in obs_times]
+            if len(x_obs) != len(obs_times) or len(x_obs) != len(T):
+                raise ValueError("x_obs, obs_times, and T must have the same number of series.")
+            self.x_obs_list = [
+                x.to(device=self.device, dtype=self.dtype) for x in x_obs
+            ]
+            self.T_obs_list = [
+                times.to(device=self.device, dtype=self.time_dtype)
+                for times in obs_times
+            ]
+            self.T_list = [
+                torch.tensor(float(t), device=self.device, dtype=self.time_dtype)
+                for t in T
+            ]
+        else:
+            if isinstance(obs_times, (list, tuple)):
+                raise ValueError("obs_times must be a tensor when x_obs is a tensor.")
+            if isinstance(T, (list, tuple)):
+                raise ValueError("T must be a scalar when x_obs is a tensor.")
+            self.x_obs_list = [x_obs.to(device=self.device, dtype=self.dtype)]
+            self.T_obs_list = [
+                obs_times.to(device=self.device, dtype=self.time_dtype)
+            ]
+            self.T_list = [
+                torch.tensor(float(T), device=self.device, dtype=self.time_dtype)
+            ]
+
+        self.S = len(self.x_obs_list)
+        self.K = int(self.Q.shape[0])
+        self.obs_dim = int(self.x_obs_list[0].shape[1])
+        self.N_list = [int(x.shape[0]) for x in self.x_obs_list]
+        self.nle_estimator = nle_estimator
+        self.transition_log_prob_fn = transition_log_prob_fn
+        self.transition_sample_fn = transition_sample_fn
+        if nle_estimator is not None:
+            if any(value is not None for value in (
+                dynamics, transition_log_prob_fn, transition_sample_fn
+            )):
+                raise ValueError("Supply either nle_estimator or dynamics and transition callables.")
+            dynamics = nle_estimator.dynamics
+            self.flow_model = nle_estimator.estimator
+            if self.flow_model is None:
+                raise ValueError("nle_estimator.estimator must be trained/loaded before sampling.")
+        else:
+            if dynamics is None or not callable(transition_log_prob_fn) or not callable(transition_sample_fn):
+                raise ValueError("Without nle_estimator, dynamics and both transition callables are required.")
+            self.flow_model = None
+        self.dynamics = dynamics
+        self.theta_dim = int(dynamics.theta_dim)
+        self.D = int(dynamics.x_dim)
+        if self.obs_dim != self.D:
+            raise ValueError(
+                "x_obs must contain every latent dimension: "
+                f"obs_dim={self.obs_dim}, latent_dim={self.D}."
+            )
+        for series_idx, x_s in enumerate(self.x_obs_list):
+            if x_s.ndim != 2:
+                raise ValueError(f"x_obs for series {series_idx} must be two-dimensional.")
+            if x_s.shape[1] != self.obs_dim:
+                raise ValueError("All series must have the same observed dimension.")
+        if switching_parameter_mask is None:
+            switching_parameter_mask = torch.ones(
+                self.theta_dim, dtype=torch.bool, device=self.device
+            )
+        else:
+            switching_parameter_mask = torch.as_tensor(
+                switching_parameter_mask, dtype=torch.bool, device=self.device
+            )
+        if switching_parameter_mask.shape != (self.theta_dim,):
+            raise ValueError(
+                "switching_parameter_mask must have shape "
+                f"({self.theta_dim},), got {tuple(switching_parameter_mask.shape)}."
+            )
+        if fixed_parameter_mask is None:
+            fixed_parameter_mask = torch.zeros(
+                self.theta_dim, dtype=torch.bool, device=self.device
+            )
+        else:
+            fixed_parameter_mask = torch.as_tensor(
+                fixed_parameter_mask, dtype=torch.bool, device=self.device
+            )
+        if fixed_parameter_mask.shape != (self.theta_dim,):
+            raise ValueError(
+                "fixed_parameter_mask must have shape "
+                f"({self.theta_dim},), got {tuple(fixed_parameter_mask.shape)}."
+            )
+        self.fixed_parameter_mask = fixed_parameter_mask
+        self.switching_parameter_mask = (
+            switching_parameter_mask & ~fixed_parameter_mask
+        )
+        self.shared_parameter_mask = (
+            ~switching_parameter_mask & ~fixed_parameter_mask
+        )
+        self.dynamics_dt = float(dynamics.dt)
+        if self.dynamics_dt <= 0.0:
+            raise ValueError("nle_estimator.dynamics.dt must be positive.")
+        if hasattr(self.flow_model, "to"):
+            self.flow_model.to(self.device)
+        if hasattr(self.flow_model, "eval"):
+            self.flow_model.eval()
+        if hasattr(self.flow_model, "requires_grad_"):
+            # The trained NLE is a fixed density inside MCMC inference. Keeping
+            # its weights differentiable makes PyTorch retain unnecessary
+            # autograd tensors across repeated one-step MCMC runs. Freezing the
+            # weights still permits gradients with respect to y and theta, which
+            # are the variables sampled by NUTS or MALA.
+            self.flow_model.requires_grad_(False)
+
+        if self.Q.shape != (self.K, self.K):
+            raise ValueError("Q must be square with shape (K, K).")
+        if not torch.allclose(self.Q.sum(dim=1), torch.zeros(self.K, dtype=self.dtype, device=self.device), atol=1e-8):
+            raise ValueError("Each row of Q must sum to zero.")
+        for series_idx, (T_obs_s, T_s, N_s) in enumerate(
+            zip(self.T_obs_list, self.T_list, self.N_list)
+        ):
+            if T_obs_s.ndim != 1 or T_obs_s.shape[0] != N_s:
+                raise ValueError(f"obs_times for series {series_idx} must have shape (N_s,).")
+            if N_s < 2:
+                raise ValueError("Each series must contain at least the endpoints 0 and T_s.")
+            if not torch.all(T_obs_s[1:] > T_obs_s[:-1]):
+                raise ValueError(f"obs_times for series {series_idx} must be strictly increasing.")
+            if abs(float(T_obs_s[0].item())) > 1e-10:
+                raise ValueError(f"obs_times for series {series_idx} must start at 0.")
+            if abs(float(T_obs_s[-1].item()) - float(T_s.item())) > 1e-10:
+                raise ValueError(f"obs_times for series {series_idx} must end at T_s.")
+
+        self.omega = 0.0
+        self.B = torch.empty_like(self.Q)
+        self._refresh_uniformization()
+
+        self.y_mh_config = self._prepare_mh_config(y_mh_config, "y_mh_config")
+        self.theta_mh_config = self._prepare_mh_config(
+            theta_mh_config, "theta_mh_config"
+        )
+        self._last_y_mh_diagnostics: List[Optional[Dict[str, Any]]] = [
+            None for _ in range(self.S)
+        ]
+        self._last_theta_mh_diagnostics: Optional[Dict[str, Any]] = None
+
+        self.sir_config = {
+            "num_particles": 64,
+            "use_t_pseudo_in_sir": True,
+        }
+        if sir_config is not None:
+            self.sir_config.update(sir_config)
+        if not isinstance(self.sir_config["use_t_pseudo_in_sir"], bool):
+            raise TypeError("sir_config['use_t_pseudo_in_sir'] must be a bool.")
+
+        self.prior_config = {
+            "theta_loc": 0.0,
+            "theta_scale": 1.0,
+            # tau_obs[d]^2 ~ InvGamma(tau2_alpha, tau2_beta), independently by d.
+            "tau2_alpha": 2.0,
+            "tau2_beta": 0.1,
+            # q_ij ~ Gamma(q_alpha, q_beta) for i != j, using rate parameterization.
+            "q_alpha": 1.0,
+            "q_beta": 1.0,
+        }
+        if prior_config is not None:
+            self.prior_config.update(prior_config)
+        self.theta_prior = theta_prior
+        if self.theta_prior is not None:
+            self._validate_explicit_theta_prior()
+
+        self.history: Dict[str, List[Any]] = {
+            "y_aug": [],
+            "z_aug": [],
+            "T_all": [],
+            "theta": [],
+            "log_tau": [],
+            "Q": [],
+            "omega": [],
+            "T_true": [],
+            "z_true": [],
+            "diagnostics": [],
+        }
+
+        self.theta: Optional[torch.Tensor] = None
+        self.fixed_theta: Optional[torch.Tensor] = None
+        self.log_tau: Optional[torch.Tensor] = None
+        self.T_true_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.z_true_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.T_all_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.z_aug_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.is_event_time_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.obs_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.true_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.pseudo_idx_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.y_aug_list: List[Optional[torch.Tensor]] = [None for _ in range(self.S)]
+        self.initial_regime_probs = torch.full(
+            (self.K,), 1.0 / self.K, dtype=self.dtype, device=self.device
+        )
+
+    @staticmethod
+    def _prepare_mh_config(
+        config: Optional[Dict[str, Any]],
+        argument_name: str,
+    ) -> Dict[str, Any]:
+        supplied = dict(config) if config is not None else {}
+        method = supplied.pop("method", "nuts")
+        if method not in {"nuts", "mala"}:
+            raise ValueError(
+                f'{argument_name}["method"] must be either "nuts" or "mala".'
+            )
+        if method == "nuts":
+            prepared = {
+                "method": "nuts",
+                "max_tree_depth": 4,
+            }
+            allowed_keys = {"max_tree_depth", "step_size", "adapt_step_size"}
+        else:
+            prepared = {"method": "mala", "step_size": 0.01}
+            allowed_keys = {"step_size"}
+        unknown_keys = set(supplied) - allowed_keys
+        if unknown_keys:
+            unknown = ", ".join(sorted(unknown_keys))
+            raise ValueError(f"Unknown {argument_name} setting(s): {unknown}.")
+        prepared.update(supplied)
+        if "adapt_step_size" in prepared and not isinstance(prepared["adapt_step_size"], bool):
+            raise ValueError(f"{argument_name}['adapt_step_size'] must be a bool.")
+        if "step_size" in prepared:
+            step_size = float(prepared["step_size"])
+            if not torch.isfinite(torch.tensor(step_size)) or step_size <= 0.0:
+                raise ValueError(
+                    f"{argument_name}['step_size'] must be finite and positive."
+                )
+        return prepared
+
+    @staticmethod
+    def _kernel_diagnostics(mcmc: MCMC, method: str) -> Dict[str, Any]:
+        # MCMC stores the kernel diagnostics before terminating and cleaning up
+        # the kernel. Calling kernel.diagnostics() after run() is therefore not
+        # reliable in Pyro 1.9.1.
+        diagnostics = mcmc._diagnostics[0]
+        return {
+            "method": method,
+            "acceptance_rate": float(diagnostics["acceptance rate"]),
+            "divergences": list(diagnostics["divergences"]),
+        }
+
+    def initialize(
+        self,
+        *,
+        initial_theta: Optional[torch.Tensor] = None,
+        initial_log_tau: Optional[torch.Tensor] = None,
+        initial_regime_probs: Optional[torch.Tensor] = None,
+    ) -> None:
+        """
+        Initialize theta, observation noise, and the true discrete path.
+
+        `initial_theta` is expressed in the real-valued NLE parameter coordinate.
+        Pass observation noise separately as `initial_log_tau`.
+
+        The initial true path has no jumps. Its single regime is sampled from
+        `initial_regime_probs`, unless that probability vector is overridden here.
+
+        For NUTS without an explicit step_size, perform one initial transition with step-size search
+        enabled, then freeze its step size for all subsequent sweeps. This is
+        initialization only (not stored in history), not dual-averaging warmup.
+        """
+        if initial_regime_probs is not None:
+            probs = initial_regime_probs.to(device=self.device, dtype=self.dtype)
+            self.initial_regime_probs = probs / probs.sum()
+
+        prior_config = self.prior_config
+        if initial_theta is None:
+            if self.theta_prior is None:
+                theta_loc, theta_scale = self._theta_prior_parameters()
+                theta_value = dist.Normal(theta_loc, theta_scale).sample((self.K,))
+            else:
+                theta_value = self.theta_prior.sample((self.K,))
+            # Shared dimensions represent one random variable, not K independent draws.
+            theta_value[:, self.shared_parameter_mask] = theta_value[
+                0, self.shared_parameter_mask
+            ]
+        else:
+            theta_value = initial_theta
+
+        if initial_log_tau is None:
+            tau2_alpha = torch.as_tensor(
+                prior_config["tau2_alpha"], dtype=self.dtype, device=self.device
+            ).broadcast_to((self.obs_dim,))
+            tau2_beta = torch.as_tensor(
+                prior_config["tau2_beta"], dtype=self.dtype, device=self.device
+            ).broadcast_to((self.obs_dim,))
+            precision = dist.Gamma(tau2_alpha, tau2_beta).sample()
+            initial_log_tau = 0.5 * torch.log(precision.reciprocal().clamp_min(1e-16))
+
+        self.theta = theta_value.to(device=self.device, dtype=self.dtype).clone()
+        self.fixed_theta = self.theta[:, self.fixed_parameter_mask].clone()
+        self.log_tau = initial_log_tau.to(device=self.device, dtype=self.dtype).clone()
+        if self.theta.shape != (self.K, self.theta_dim):
+            raise ValueError(f"theta must have shape ({self.K}, {self.theta_dim}).")
+        self._validate_theta_structure(self.theta)
+        if self.log_tau.shape != (self.obs_dim,):
+            raise ValueError(
+                f"log_tau must have shape ({self.obs_dim},)."
+            )
+
+        for s in range(self.S):
+            initial_regime = dist.Categorical(probs=self.initial_regime_probs).sample()
+            self.T_true_list[s] = torch.empty(
+                0, dtype=self.time_dtype, device=self.device
+            )
+            self.z_true_list[s] = initial_regime.reshape(1).to(
+                dtype=torch.long, device=self.device
+            )
+            self.T_all_list[s] = None
+            self.z_aug_list[s] = None
+            self.is_event_time_list[s] = None
+            self.obs_idx_list[s] = None
+            self.true_idx_list[s] = None
+            self.pseudo_idx_list[s] = None
+            self.y_aug_list[s] = None
+
+        self.y_nuts_step_sizes = [
+            float(self.y_mh_config["step_size"])
+            if self.y_mh_config["method"] == "nuts" and "step_size" in self.y_mh_config
+            else None
+        ] * self.S
+        self.theta_nuts_step_size = (
+            float(self.theta_mh_config["step_size"])
+            if self.theta_mh_config["method"] == "nuts" and "step_size" in self.theta_mh_config
+            else None
+        )
+        self._initializing_nuts = False
+        if any(config["method"] == "nuts" and "step_size" not in config
+               and not config.get("adapt_step_size", False)
+               for config in (self.y_mh_config, self.theta_mh_config)):
+            self._initialize_nuts_step_sizes()
+
+    def _initialize_nuts_step_sizes(self) -> None:
+        """Tune once on the initial observation grid, retaining the sampled state."""
+        for s in range(self.S):
+            empty = torch.empty(0, dtype=self.time_dtype, device=self.device)
+            times, regimes, events, obs_idx, _ = self.build_augmented_grid(s, empty)
+            self.T_all_list[s] = times
+            self.z_aug_list[s] = regimes
+            self.is_event_time_list[s] = events
+            self.obs_idx_list[s] = obs_idx
+            self.y_aug_list[s] = self._initialize_y_on_grid(s, times)
+            self.true_idx_list[s] = torch.empty(0, dtype=torch.long, device=self.device)
+            self.pseudo_idx_list[s] = torch.empty(0, dtype=torch.long, device=self.device)
+        self._initializing_nuts = True
+        try:
+            if (self.y_mh_config["method"] == "nuts" and "step_size" not in self.y_mh_config
+                    and not self.y_mh_config.get("adapt_step_size", False)):
+                for s in range(self.S):
+                    self.y_aug_list[s] = self.sample_y_mh(s, self.y_aug_list[s])
+            if (self.theta_mh_config["method"] == "nuts" and "step_size" not in self.theta_mh_config
+                    and not self.theta_mh_config.get("adapt_step_size", False)):
+                self.theta = self.sample_theta_mh()
+        finally:
+            self._initializing_nuts = False
+
+    def _theta_prior_parameters(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return legacy NLE-coordinate Normal parameters of shape (theta_dim,)."""
+        theta_loc = torch.as_tensor(
+            self.prior_config["theta_loc"], dtype=self.dtype, device=self.device
+        ).broadcast_to((self.theta_dim,))
+        theta_scale = torch.as_tensor(
+            self.prior_config["theta_scale"], dtype=self.dtype, device=self.device
+        ).broadcast_to((self.theta_dim,))
+        if torch.any(theta_scale <= 0):
+            raise ValueError("theta prior scales must be positive.")
+        return theta_loc, theta_scale
+
+    def _validate_explicit_theta_prior(self) -> None:
+        """Validate the component-wise prior supplied in the NLE coordinate."""
+        if not isinstance(self.theta_prior, Distribution):
+            raise TypeError("theta_prior must be a torch Distribution.")
+        expected_batch_shape = torch.Size((self.theta_dim,))
+        if self.theta_prior.batch_shape != expected_batch_shape:
+            raise ValueError(
+                "theta_prior must have batch_shape "
+                f"{tuple(expected_batch_shape)}, got "
+                f"{tuple(self.theta_prior.batch_shape)}."
+            )
+        if self.theta_prior.event_shape != torch.Size():
+            raise ValueError(
+                "theta_prior must be component-wise with an empty event_shape; "
+                "do not wrap it in Independent."
+            )
+        if self.theta_prior.support != constraints.real:
+            raise ValueError(
+                "theta_prior must have real support in the NLE theta coordinate. "
+                "Use dynamics.pullback_theta_prior() for a constrained physical prior."
+            )
+        probe = torch.zeros(
+            self.theta_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        try:
+            probe_log_prob = self.theta_prior.log_prob(probe)
+        except (RuntimeError, ValueError) as error:
+            raise ValueError(
+                "theta_prior must be constructed on a device compatible with the sampler."
+            ) from error
+        if probe_log_prob.shape != expected_batch_shape:
+            raise ValueError(
+                "theta_prior.log_prob(theta) must return one value per theta dimension."
+            )
+        if (
+            probe_log_prob.device != self.device
+            or probe_log_prob.dtype != self.dtype
+        ):
+            raise ValueError(
+                "theta_prior.log_prob(theta) must use the sampler's device and dtype "
+                f"({self.device}, {self.dtype}); got "
+                f"({probe_log_prob.device}, {probe_log_prob.dtype})."
+            )
+
+    def _validate_theta_structure(self, theta: torch.Tensor) -> None:
+        """Validate shared columns and the values retained for fixed columns."""
+        if torch.any(self.shared_parameter_mask):
+            shared = theta[:, self.shared_parameter_mask]
+            if not torch.allclose(shared, shared[0].expand_as(shared)):
+                raise ValueError(
+                    "initial_theta must be identical across regimes for shared "
+                    "parameter dimensions."
+                )
+        if (
+            torch.any(self.fixed_parameter_mask)
+            and self.fixed_theta is not None
+            and not torch.allclose(
+                theta[:, self.fixed_parameter_mask], self.fixed_theta
+            )
+        ):
+            raise ValueError(
+                "Fixed theta dimensions differ from their initialized values."
+            )
+
+    def _pack_theta(self, theta: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Pack expanded theta (K, P) into non-redundant MCMC variables."""
+        packed: Dict[str, torch.Tensor] = {}
+        if torch.any(self.shared_parameter_mask):
+            packed["theta_shared"] = theta[0, self.shared_parameter_mask].clone()
+        if torch.any(self.switching_parameter_mask):
+            packed["theta_switching"] = theta[
+                :, self.switching_parameter_mask
+            ].clone()
+        return packed
+
+    def _expand_theta(self, packed: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Expand non-redundant MCMC variables to theta with shape (K, P)."""
+        columns: List[torch.Tensor] = []
+        shared_index = 0
+        switching_index = 0
+        fixed_index = 0
+        for parameter_index in range(self.theta_dim):
+            if self.fixed_parameter_mask[parameter_index]:
+                if self.fixed_theta is None:
+                    raise RuntimeError("Call initialize() before expanding theta.")
+                column = self.fixed_theta[:, fixed_index]
+                fixed_index += 1
+            elif self.switching_parameter_mask[parameter_index]:
+                column = packed["theta_switching"][:, switching_index]
+                switching_index += 1
+            else:
+                column = packed["theta_shared"][shared_index].expand(self.K)
+                shared_index += 1
+            columns.append(column)
+        return torch.stack(columns, dim=1)
+
+    def _theta_log_prior(self, packed: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Evaluate each unique theta prior exactly once."""
+        if self.theta_prior is not None:
+            theta = self._expand_theta(packed)
+            elementwise_logp = self.theta_prior.log_prob(theta)
+            expected_shape = torch.Size((self.K, self.theta_dim))
+            if elementwise_logp.shape != expected_shape:
+                raise RuntimeError(
+                    "theta_prior.log_prob(theta) returned shape "
+                    f"{tuple(elementwise_logp.shape)}, expected {tuple(expected_shape)}."
+                )
+            logp = torch.zeros((), dtype=self.dtype, device=self.device)
+            if torch.any(self.shared_parameter_mask):
+                logp = logp + elementwise_logp[
+                    0, self.shared_parameter_mask
+                ].sum()
+            if torch.any(self.switching_parameter_mask):
+                logp = logp + elementwise_logp[
+                    :, self.switching_parameter_mask
+                ].sum()
+            return logp
+
+        theta_loc, theta_scale = self._theta_prior_parameters()
+        logp = torch.tensor(0.0, dtype=self.dtype, device=self.device)
+        if torch.any(self.shared_parameter_mask):
+            logp = logp + dist.Normal(
+                theta_loc[self.shared_parameter_mask],
+                theta_scale[self.shared_parameter_mask],
+            ).log_prob(packed["theta_shared"]).sum()
+        if torch.any(self.switching_parameter_mask):
+            logp = logp + dist.Normal(
+                theta_loc[self.switching_parameter_mask],
+                theta_scale[self.switching_parameter_mask],
+            ).log_prob(packed["theta_switching"]).sum()
+        return logp
+
+    def _iter_merged_time_sources(
+        self,
+        s: int,
+        *,
+        context: str,
+        sources: Sequence[Tuple[str, torch.Tensor]],
+    ) -> Iterator[Tuple[str, int, float]]:
+        """Yield tagged, strictly increasing times from sorted source tensors."""
+
+        def tagged_records(
+            source_name: str,
+            times: torch.Tensor,
+        ) -> Iterator[Tuple[float, str, int]]:
+            for position, time in enumerate(times):
+                yield (
+                    time.item(),
+                    source_name,
+                    position,
+                )
+
+        streams = []
+        for source_name, source_times in sources:
+            times = source_times.to(
+                device=self.device,
+                dtype=self.time_dtype,
+            )
+            if times.ndim != 1:
+                raise ValueError(
+                    f"{source_name} times for series {s + 1} must be one-dimensional."
+                )
+            if not torch.all(torch.isfinite(times)):
+                raise ValueError(
+                    f"{source_name} times for series {s + 1} must be finite."
+                )
+            if times.numel() > 1 and torch.any(times[1:] <= times[:-1]):
+                bad_position = int(
+                    torch.nonzero(
+                        times[1:] <= times[:-1], as_tuple=False
+                    )[0].item()
+                )
+                raise RuntimeError(
+                    f"{source_name} times for series {s + 1} must be strictly "
+                    f"increasing; positions {bad_position} and {bad_position + 1} "
+                    f"contain {float(times[bad_position].item())} and "
+                    f"{float(times[bad_position + 1].item())}."
+                )
+            streams.append(tagged_records(source_name, times))
+
+        previous_time: Optional[float] = None
+        previous_source: Optional[str] = None
+        merged = heapq.merge(*streams, key=lambda record: record[0])
+        for time_value, source_name, position in merged:
+            if previous_time is not None and time_value == previous_time:
+                raise RuntimeError(
+                    f"Duplicate time {time_value} in {context} merge for series "
+                    f"{s + 1}: sources {previous_source} and {source_name}."
+                )
+            previous_time = time_value
+            previous_source = source_name
+            yield source_name, position, time_value
+
+    def build_augmented_grid(
+        self,
+        s: int,
+        T_cand: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return augmented-grid arrays for T_all = T_true U T_cand U T_obs."""
+        T_true = self.T_true_list[s]
+        z_true = self.z_true_list[s]
+        T_obs = self.T_obs_list[s]
+        N = self.N_list[s]
+        if T_true is None or z_true is None:
+            raise RuntimeError("Call initialize() before build_augmented_grid().")
+
+        T_true = T_true.to(device=self.device, dtype=self.time_dtype)
+        T_cand = T_cand.to(device=self.device, dtype=self.time_dtype)
+        self.T_true_list[s] = T_true
+
+        T_all_values: List[float] = []
+        is_event_values: List[bool] = []
+        obs_idx_values: List[int] = []
+        cand_idx_values: List[int] = []
+
+        sources = (
+            ("T_true", T_true),
+            ("T_cand", T_cand),
+            ("T_obs", T_obs),
+        )
+        for idx_all, (source_name, _, time_value) in enumerate(
+            self._iter_merged_time_sources(
+                s,
+                context="augmented-grid",
+                sources=sources,
+            )
+        ):
+            T_all_values.append(time_value)
+            is_event_values.append(source_name in ("T_true", "T_cand"))
+            if source_name == "T_cand":
+                cand_idx_values.append(idx_all)
+            elif source_name == "T_obs":
+                obs_idx_values.append(idx_all)
+
+        T_all = torch.tensor(
+            T_all_values,
+            dtype=self.time_dtype,
+            device=self.device,
+        )
+        is_event_time = torch.tensor(is_event_values, dtype=torch.bool, device=self.device)
+        obs_idx = torch.tensor(obs_idx_values, dtype=torch.long, device=self.device)
+        cand_idx = torch.tensor(cand_idx_values, dtype=torch.long, device=self.device)
+        if obs_idx.shape[0] != N:
+            raise RuntimeError("Observation time was not found on the merged grid.")
+        if cand_idx.shape[0] != T_cand.shape[0]:
+            raise RuntimeError("Candidate jump time was not found on the merged grid.")
+
+        z_aug = self._expand_true_path_onto_grid(s, T_all)
+        return T_all, z_aug, is_event_time, obs_idx, cand_idx
+
+    def _expand_true_path_onto_grid(
+        self,
+        s: int,
+        times: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return point regimes with z[j] assigned to interval [times[j-1], times[j]]."""
+        T_true = self.T_true_list[s]
+        z_true = self.z_true_list[s]
+        if T_true is None or z_true is None:
+            raise RuntimeError("Call initialize() before assigning regimes to a grid.")
+        if times.ndim != 1 or times.shape[0] < 2:
+            raise ValueError("times must be one-dimensional and include 0 and T.")
+
+        # Point-regime representation on T_all.
+        # z_aug[j+1] is the regime on [T_all[j], T_all[j+1]], and z_aug[0]
+        # duplicates the first interval regime. z_true is not padded: z_true[r] is
+        # the regime on true-path segment r.
+        interval_regimes = torch.empty(
+            times.shape[0] - 1, dtype=torch.long, device=self.device
+        )
+        T_true_idx = 0
+        for j in range(times.shape[0] - 1):
+            # time at the left of the interval
+            left = times[j]
+            # T_true_idx is the number of true jumps at or before `left`.
+            # The matching true-path regime is z_true[T_true_idx].
+            while T_true_idx < T_true.shape[0] and T_true[T_true_idx] <= left:
+                T_true_idx += 1
+            interval_regimes[j] = z_true[T_true_idx]
+
+        z_aug = torch.empty(times.shape[0], dtype=torch.long, device=self.device)
+        # To fit z_aug indices with y_aug indices, duplicate the first interval regime
+        z_aug[0] = interval_regimes[0]
+        z_aug[1:] = interval_regimes
+        return z_aug
+
+    def _build_sir_work_grid(
+        self,
+        s: int,
+        T_cand: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Merge retained old boundaries and new candidate times for SIR.
+
+        By default this is the four-way union of T_obs, T_true, old T_pseudo,
+        and new T_cand. If ``use_t_pseudo_in_sir`` is false, old T_pseudo is
+        omitted. The returned masks identify old pseudo points and new candidate
+        points, respectively.
+        """
+        old_T_all = self.T_all_list[s]
+        old_pseudo_idx = self.pseudo_idx_list[s]
+        T_true = self.T_true_list[s]
+        if any(
+            value is None
+            for value in (
+                old_T_all,
+                old_pseudo_idx,
+                T_true,
+            )
+        ):
+            raise RuntimeError("The previous augmented grid is incomplete.")
+
+        T_obs = self.T_obs_list[s]
+        old_T_all = old_T_all.to(device=self.device, dtype=self.time_dtype)
+        T_true = T_true.to(device=self.device, dtype=self.time_dtype)
+        T_cand = T_cand.to(device=self.device, dtype=self.time_dtype)
+        self.T_all_list[s] = old_T_all
+        self.T_true_list[s] = T_true
+        T_pseudo = old_T_all[old_pseudo_idx]
+        source_times = [
+            ("T_obs", T_obs),
+            ("T_true", T_true),
+        ]
+        if self.sir_config["use_t_pseudo_in_sir"]:
+            source_times.append(("T_pseudo", T_pseudo))
+        source_times.append(("T_cand", T_cand))
+
+        times_for_sir: List[float] = []
+        is_old_pseudo: List[bool] = []
+        is_new_candidate: List[bool] = []
+
+        for source_name, _, time_value in self._iter_merged_time_sources(
+            s,
+            context="SIR work-grid",
+            sources=source_times,
+        ):
+            times_for_sir.append(time_value)
+            is_old_pseudo.append(source_name == "T_pseudo")
+            is_new_candidate.append(source_name == "T_cand")
+
+        return (
+            torch.tensor(
+                times_for_sir,
+                dtype=self.time_dtype,
+                device=self.device,
+            ),
+            torch.tensor(is_old_pseudo, dtype=torch.bool, device=self.device),
+            torch.tensor(is_new_candidate, dtype=torch.bool, device=self.device),
+        )
+
+    def add_candidate_jumps(self, s: int) -> torch.Tensor:
+        """
+        Add candidate jumps to the current true path using uniformization.
+
+        On an interval with regime k and duration dt, candidate jumps are sampled from:
+            Poisson((Omega - q_k) dt) = Poisson((Omega + Q_kk) dt)
+        because q_k = -Q_kk.
+        """
+        T_true = self.T_true_list[s]
+        z_true = self.z_true_list[s]
+        T = self.T_list[s]
+        if T_true is None or z_true is None:
+            raise RuntimeError("Call initialize() before add_candidate_jumps().")
+
+        cand_times: List[torch.Tensor] = []
+        for j, regime in enumerate(z_true.tolist()):
+            # regime is active on the interval between t0 and t1
+            t0 = 0.0 if j == 0 else T_true[j - 1].item()
+            t1 = T.item() if j == z_true.shape[0] - 1 else T_true[j].item()
+            dt = t1 - t0
+            if dt <= 0.0:
+                raise RuntimeError("dt <= 0 encountered when adding candidate jumps.")
+
+            rate = self.omega + float(self.Q[regime, regime].item())
+            if rate <= 0.0:
+                raise RuntimeError("omega must be greater than max_k(-Q_kk) to ensure a positive candidate jump rate.")
+
+            num_candidate = int(
+                torch.poisson(
+                    torch.tensor(rate * dt, dtype=self.time_dtype),
+                    generator=self.rng,
+                ).item()
+            )
+            if num_candidate == 0:
+                continue
+
+            u = torch.rand(
+                num_candidate,
+                generator=self.rng,
+                dtype=self.time_dtype,
+            )
+            times = t0 + dt * u
+            cand_times.append(times.to(device=self.device))
+        if not cand_times:
+            return torch.empty(
+                0, dtype=self.time_dtype, device=self.device
+            )
+
+        # Do not silently remove exact duplicates. The source-aware merge checks
+        # them as invariant violations and reports both colliding sources.
+        return torch.sort(torch.cat(cand_times)).values
+
+    def _delta_to_n_steps(self, delta: torch.Tensor) -> torch.Tensor:
+        """
+        Convert continuous elapsed time to the discrete NLE conditioning step count.
+
+        The NLE was trained on simulator steps of size `dynamics.dt`, so an
+        interval Delta is mapped to the continuous step count Delta / dt.
+        """
+        if not torch.all(torch.isfinite(delta)):
+            raise ValueError("Transition time differences must be finite.")
+        if torch.any(delta <= 0):
+            smallest = float(delta.min().detach().cpu().item())
+            raise RuntimeError(
+                "Transition time differences must be strictly positive; "
+                f"smallest delta is {smallest}."
+            )
+        return delta / self.dynamics_dt
+
+    def observation_logprob(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        log_tau: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Diagonal Gaussian log density on all latent-state dimensions."""
+        if log_tau is None:
+            log_tau = self.log_tau
+        tau = torch.exp(log_tau)
+        return dist.Normal(y, tau).log_prob(x).sum()
+
+    def logprob_y_given_z_theta(
+        self,
+        y_aug: torch.Tensor,
+        z_aug: torch.Tensor,
+        T_all: torch.Tensor,
+        obs_idx: torch.Tensor,
+        x_obs: Optional[torch.Tensor] = None,
+        theta: Optional[torch.Tensor] = None,
+        log_tau: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Conditional log density:
+
+            log p(y_aug | z_aug, theta, log_tau, x)
+              = sum_l log p(y_l | y_{l-1}, z_l, Delta_l, theta)
+              + sum_i log p(x_i | y_{m(i)}, log_tau)
+
+        The improper flat prior on y_0 contributes a constant zero.
+        """
+        theta = self.theta if theta is None else theta
+        if theta is None:
+            raise RuntimeError("Sampler theta has not been initialized.")
+        if log_tau is None:
+            log_tau = self.log_tau
+        if x_obs is None:
+            x_obs = self.x_obs_list[0]
+        logp = self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
+
+        y_at_obs = y_aug[obs_idx]  # (N, D)
+        tau = torch.exp(log_tau)
+        logp = logp + dist.Normal(y_at_obs, tau).log_prob(x_obs).sum()
+        return logp
+
+    def logprob_theta_given_y_z(
+        self,
+        theta: torch.Tensor,
+        y_aug: torch.Tensor,
+        z_aug: torch.Tensor,
+        T_all: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Conditional log density:
+
+            log p(theta | y, z)
+              = log p(theta)
+              + sum_l log p(y_l | y_{l-1}, z_l, Delta_l, theta)
+
+        The observation model x | y, log_tau is constant with respect to
+        theta, so it is intentionally omitted here. Observation noise is updated
+        separately by sample_log_tau().
+        """
+        self._validate_theta_structure(theta)
+        logp = self._theta_log_prior(self._pack_theta(theta))
+        logp = logp + self._compute_log_emission_given_z(y_aug, z_aug, T_all, theta)
+        return logp
+
+    def _logprob_theta_all_series(self, theta: torch.Tensor) -> torch.Tensor:
+        """Shared-theta conditional log density summed over series s=1,...,S."""
+        self._validate_theta_structure(theta)
+        logp = self._theta_log_prior(self._pack_theta(theta))
+        for s in range(self.S):
+            y_aug_s = self.y_aug_list[s]
+            z_aug_s = self.z_aug_list[s]
+            T_all_s = self.T_all_list[s]
+            if y_aug_s is None or z_aug_s is None or T_all_s is None:
+                raise RuntimeError("All series must have y/z/T_all before theta update.")
+            logp = logp + self._compute_log_emission_given_z(
+                y_aug_s,
+                z_aug_s,
+                T_all_s,
+                theta,
+            )
+        return logp
+
+    @torch.no_grad()
+    def complete_data_log_joint(self) -> Dict[str, Any]:
+        """Evaluate a component-wise complete-data log joint for diagnostics.
+
+        The latent path is scored on the canonical grid formed by observation
+        times and retained CTMC jump times.  Virtual uniformization candidates
+        are deliberately excluded, so this diagnostic does not change merely
+        because a sweep happened to introduce more auxiliary grid points.
+
+        The density is with respect to ``tau**2`` (the model parameter having an
+        inverse-gamma prior), rather than with respect to ``log_tau``.  Hence no
+        change-of-variables Jacobian for ``log_tau`` is included.
+
+        The theta-prior component is with respect to the real-valued NLE
+        coordinate. If ``theta_prior`` was pulled back from physical scale, its
+        ``log_prob`` already contains the corresponding Jacobian.
+        """
+        if self.theta is None or self.log_tau is None:
+            raise RuntimeError(
+                "Call initialize() and complete a sweep before evaluating the joint."
+            )
+
+        theta_prior = self._theta_log_prior(self._pack_theta(self.theta))
+
+        tau2 = torch.exp(2.0 * self.log_tau)
+        tau2_alpha = torch.as_tensor(
+            self.prior_config["tau2_alpha"],
+            dtype=self.dtype,
+            device=self.device,
+        ).broadcast_to(tau2.shape)
+        tau2_beta = torch.as_tensor(
+            self.prior_config["tau2_beta"],
+            dtype=self.dtype,
+            device=self.device,
+        ).broadcast_to(tau2.shape)
+        tau2_prior = dist.InverseGamma(tau2_alpha, tau2_beta).log_prob(tau2).sum()
+
+        q_alpha = torch.as_tensor(
+            self.prior_config["q_alpha"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        q_beta = torch.as_tensor(
+            self.prior_config["q_beta"],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if q_alpha.ndim != 0 or q_beta.ndim != 0:
+            raise ValueError("q_alpha and q_beta must be scalars.")
+        off_diagonal = ~torch.eye(
+            self.K, dtype=torch.bool, device=self.device
+        )
+        Q_prior = dist.Gamma(q_alpha, q_beta).log_prob(
+            self.Q[off_diagonal]
+        ).sum()
+
+        initial_regime = torch.zeros((), dtype=self.dtype, device=self.device)
+        ctmc_path = torch.zeros((), dtype=self.dtype, device=self.device)
+        latent_initial = torch.zeros((), dtype=self.dtype, device=self.device)
+        nle_transition = torch.zeros((), dtype=self.dtype, device=self.device)
+        observation = torch.zeros((), dtype=self.dtype, device=self.device)
+        num_latent_transitions = 0
+        num_observation_rows = 0
+        num_observation_values = 0
+        num_true_jumps = 0
+
+        for s in range(self.S):
+            T_all_s = self.T_all_list[s]
+            z_aug_s = self.z_aug_list[s]
+            y_aug_s = self.y_aug_list[s]
+            obs_idx_s = self.obs_idx_list[s]
+            true_idx_s = self.true_idx_list[s]
+            T_true_s = self.T_true_list[s]
+            z_true_s = self.z_true_list[s]
+            if any(
+                value is None
+                for value in (
+                    T_all_s,
+                    z_aug_s,
+                    y_aug_s,
+                    obs_idx_s,
+                    true_idx_s,
+                    T_true_s,
+                    z_true_s,
+                )
+            ):
+                raise RuntimeError(
+                    "Complete an MCMC sweep before evaluating the complete-data joint."
+                )
+
+            canonical_idx = torch.unique(
+                torch.cat([obs_idx_s, true_idx_s]), sorted=True
+            )
+            if canonical_idx.numel() < 2:
+                raise RuntimeError(
+                    "The canonical grid must contain at least the interval endpoints."
+                )
+            canonical_times = T_all_s[canonical_idx]
+            canonical_y = y_aug_s[canonical_idx]
+            right_idx = canonical_idx[1:]
+            interval_regimes = z_aug_s[right_idx]
+            delta = canonical_times[1:] - canonical_times[:-1]
+
+            nle_transition = nle_transition + self._evaluate_batched_transition_logprobs(
+                y_prev_batch=canonical_y[:-1],
+                y_curr_batch=canonical_y[1:],
+                theta_batch=self.theta[interval_regimes],
+                delta_batch=delta,
+            ).sum()
+            observation = observation + self.observation_logprob(
+                self.x_obs_list[s],
+                y_aug_s[obs_idx_s],
+                self.log_tau,
+            )
+
+            initial_regime = initial_regime + torch.log(
+                self.initial_regime_probs[z_true_s[0]]
+            )
+            path_boundaries = torch.cat(
+                [
+                    torch.zeros(
+                        1, dtype=self.time_dtype, device=self.device
+                    ),
+                    T_true_s,
+                    self.T_list[s].reshape(1),
+                ]
+            )
+            dwell_times = path_boundaries[1:] - path_boundaries[:-1]
+            ctmc_path = ctmc_path + (
+                self.Q[z_true_s, z_true_s] * dwell_times
+            ).sum()
+            if T_true_s.numel() > 0:
+                ctmc_path = ctmc_path + torch.log(
+                    self.Q[z_true_s[:-1], z_true_s[1:]]
+                ).sum()
+
+            num_latent_transitions += int(canonical_idx.numel() - 1)
+            num_observation_rows += int(self.x_obs_list[s].shape[0])
+            num_observation_values += int(self.x_obs_list[s].numel())
+            num_true_jumps += int(T_true_s.numel())
+
+        components = {
+            "theta_prior": float(theta_prior.item()),
+            "tau2_prior": float(tau2_prior.item()),
+            "Q_prior": float(Q_prior.item()),
+            "initial_regime": float(initial_regime.item()),
+            "ctmc_path": float(ctmc_path.item()),
+            "latent_initial": float(latent_initial.item()),
+            "nle_transition": float(nle_transition.item()),
+            "observation": float(observation.item()),
+        }
+        total = sum(components.values())
+        return {
+            "definition": "complete_data_on_observation_and_true_jump_grid",
+            "theta_measure": "nle_coordinate",
+            "tau_measure": "tau_squared",
+            "components": components,
+            "total": total,
+            "counts": {
+                "num_series": self.S,
+                "num_latent_transitions": num_latent_transitions,
+                "num_observation_rows": num_observation_rows,
+                "num_observation_values": num_observation_values,
+                "num_true_jumps": num_true_jumps,
+            },
+            "nle_transition_mean": (
+                components["nle_transition"] / num_latent_transitions
+                if num_latent_transitions
+                else float("nan")
+            ),
+            "observation_mean": (
+                components["observation"] / num_observation_values
+                if num_observation_values
+                else float("nan")
+            ),
+        }
+
+    def _latest_sample_payload(self) -> Dict[str, Any]:
+        """Build the monitoring payload from the most recently stored sweep."""
+        if not self.history["diagnostics"]:
+            raise RuntimeError("No completed sweep is available to save.")
+        sample_keys = (
+            "y_aug",
+            "z_aug",
+            "T_all",
+            "T_true",
+            "z_true",
+            "theta",
+            "log_tau",
+            "Q",
+            "omega",
+        )
+        return {
+            "schema_version": 1,
+            "completed_sweeps": len(self.history["diagnostics"]),
+            "sample": {key: self.history[key][-1] for key in sample_keys},
+            "diagnostics": self.history["diagnostics"][-1],
+        }
+
+    def _save_latest_sample(self) -> None:
+        """Atomically overwrite the externally readable latest-sample file."""
+        target = self.latest_sample_path
+        if target is None:
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        os.close(file_descriptor)
+        temporary_path = Path(temporary_name)
+        try:
+            with temporary_path.open("wb") as handle:
+                torch.save(self._latest_sample_payload(), handle)
+            os.replace(temporary_path, target)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    def _run_mh_transition(
+        self,
+        *,
+        potential_fn: Any,
+        initial_params: Dict[str, torch.Tensor],
+        config: Dict[str, Any],
+        adapt_step_size: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+        """Run one configured Pyro MH transition and return its final position."""
+        pyro.clear_param_store()
+        method = config["method"]
+        if method == "nuts":
+            kernel = NUTS(
+                potential_fn=potential_fn,
+                max_tree_depth=config["max_tree_depth"],
+                step_size=float(config.get("step_size", 1.0)),
+                adapt_step_size=adapt_step_size,
+                adapt_mass_matrix=False,
+            )
+        else:
+            kernel = HMC(
+                potential_fn=potential_fn,
+                step_size=float(config["step_size"]),
+                num_steps=1,
+                adapt_step_size=False,
+                adapt_mass_matrix=False,
+            )
+
+        transition_stats = {}
+
+        def record_kernel_stats(kernel, samples, stage, iteration):
+            # Capture before Pyro cleans up counters at the end of run().
+            transition_stats["mean_accept_prob"] = float(kernel._mean_accept_prob)
+
+        mcmc = MCMC(
+            kernel,
+            warmup_steps=0,
+            num_samples=1,
+            initial_params=initial_params,
+            disable_progbar=True,
+            hook_fn=record_kernel_stats,
+        )
+        mcmc.run()
+        final_params = {
+            name: values[-1].detach()
+            for name, values in mcmc.get_samples().items()
+        }
+        diagnostics = self._kernel_diagnostics(mcmc, method)
+        diagnostics["step_size"] = float(kernel.step_size)
+        diagnostics["adapt_step_size"] = bool(adapt_step_size) if method == "nuts" else False
+        diagnostics.update(transition_stats)
+        return final_params, diagnostics
+
+    def sample_y_mh(
+        self,
+        s: int,
+        y_init: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the selected MH transition to the full augmented latent path."""
+        T_all = self.T_all_list[s]
+        z_aug = self.z_aug_list[s]
+        obs_idx = self.obs_idx_list[s]
+        x_obs = self.x_obs_list[s]
+        if T_all is None or z_aug is None or obs_idx is None:
+            raise RuntimeError("Sampler must be initialized before sample_y_mh().")
+        if self.theta is None or self.log_tau is None:
+            raise RuntimeError("Sampler parameters have not been initialized.")
+
+        def y_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
+            return -self.logprob_y_given_z_theta(
+                y_aug=params["y_aug"],
+                z_aug=z_aug,
+                T_all=T_all,
+                obs_idx=obs_idx,
+                x_obs=x_obs,
+                theta=self.theta,
+                log_tau=self.log_tau,
+            )
+
+        samples, diagnostics = self._run_mh_transition(
+            potential_fn=y_potential_fn,
+            initial_params={"y_aug": y_init},
+            config=(dict(self.y_mh_config, step_size=self.y_nuts_step_sizes[s])
+                    if self.y_nuts_step_sizes[s] is not None and not self.y_mh_config.get("adapt_step_size", False)
+                    else self.y_mh_config),
+            adapt_step_size=self._initializing_nuts or self.y_mh_config.get("adapt_step_size", False),
+        )
+        if self._initializing_nuts:
+            self.y_nuts_step_sizes[s] = diagnostics["step_size"]
+        self._last_y_mh_diagnostics[s] = diagnostics
+        return samples["y_aug"]
+
+    def sample_theta_mh(self) -> torch.Tensor:
+        """Apply the selected MH transition to the non-fixed theta coordinates."""
+        for s in range(self.S):
+            if self.T_all_list[s] is None or self.z_aug_list[s] is None or self.y_aug_list[s] is None:
+                raise RuntimeError("Sampler must be initialized before sample_theta_mh().")
+        if self.theta is None:
+            raise RuntimeError("Sampler theta has not been initialized.")
+        method = self.theta_mh_config["method"]
+        if not (
+            torch.any(self.shared_parameter_mask)
+            or torch.any(self.switching_parameter_mask)
+        ):
+            self._last_theta_mh_diagnostics = {
+                "method": method,
+                "skipped": True,
+            }
+            return self.theta.clone()
+
+        def theta_potential_fn(params: Dict[str, torch.Tensor]) -> torch.Tensor:
+            theta = self._expand_theta(params)
+            return -self._logprob_theta_all_series(theta)
+
+        packed_sample, diagnostics = self._run_mh_transition(
+            potential_fn=theta_potential_fn,
+            initial_params=self._pack_theta(self.theta),
+            config=(dict(self.theta_mh_config, step_size=self.theta_nuts_step_size)
+                    if self.theta_nuts_step_size is not None and not self.theta_mh_config.get("adapt_step_size", False)
+                    else self.theta_mh_config),
+            adapt_step_size=self._initializing_nuts or self.theta_mh_config.get("adapt_step_size", False),
+        )
+        if self._initializing_nuts:
+            self.theta_nuts_step_size = diagnostics["step_size"]
+        self._last_theta_mh_diagnostics = diagnostics
+        return self._expand_theta(packed_sample).detach()
+
+    def sample_log_tau(self) -> torch.Tensor:
+        """
+        Conjugate update for diagonal observation noise.
+
+        With x_i[d] | y_i[d], tau_d^2 ~ Normal(y_i[d], tau_d^2) and
+        tau_d^2 ~ InvGamma(alpha0, beta0), the conditional posterior is:
+
+            tau_d^2 | x, y ~ InvGamma(alpha0 + N/2,
+                                      beta0 + 0.5 * sum_i (x_i[d] - y_i[d])^2)
+
+        The stored parameter is log_tau[d] = 0.5 * log(tau_d^2).
+        """
+        prior_config = self.prior_config
+        ssr = torch.zeros(self.obs_dim, dtype=self.dtype, device=self.device)
+        total_N = 0
+        for s in range(self.S):
+            y_aug_s = self.y_aug_list[s]
+            obs_idx_s = self.obs_idx_list[s]
+            x_obs_s = self.x_obs_list[s]
+            if y_aug_s is None or obs_idx_s is None:
+                raise RuntimeError("Sampler must be initialized before sample_log_tau().")
+            y_at_obs = y_aug_s[obs_idx_s]
+            residual = x_obs_s - y_at_obs
+            ssr = ssr + (residual**2).sum(dim=0)
+            total_N += int(x_obs_s.shape[0])
+
+        alpha = torch.as_tensor(prior_config["tau2_alpha"], dtype=self.dtype, device=self.device) + 0.5 * total_N
+        beta = torch.as_tensor(prior_config["tau2_beta"], dtype=self.dtype, device=self.device) + 0.5 * ssr
+
+        # If tau^2 ~ InvGamma(alpha, beta), then precision 1/tau^2 ~ Gamma(alpha, beta).
+        precision = dist.Gamma(alpha.expand_as(beta), beta).sample()
+        tau2 = precision.reciprocal().clamp_min(1e-16)
+        return 0.5 * torch.log(tau2)
+
+    def sample_Q(self) -> torch.Tensor:
+        """
+        Sample a new CTMC generator Q from the current true jump path.
+
+        For i != j, use independent Gamma priors:
+
+            q_ij ~ Gamma(a_ij, b_ij)      # rate parameterization
+
+        Given the true path, let n_ij be the number of jumps i -> j and let
+        S_i be total dwell time in regime i. The conditional posterior is:
+
+            q_ij | z(t) ~ Gamma(a_ij + n_ij, b_ij + S_i)
+
+        After sampling off-diagonal rates, diagonals are set to
+        q_ii = -sum_{j != i} q_ij.
+
+        This method has no side effects: assignment to self.Q and the required
+        Omega/B refresh are handled by one_sweep().
+        """
+        prior_config = self.prior_config
+        q_alpha = torch.as_tensor(prior_config["q_alpha"], dtype=self.dtype, device=self.device)
+        q_beta = torch.as_tensor(prior_config["q_beta"], dtype=self.dtype, device=self.device)
+        if q_alpha.ndim != 0 or q_beta.ndim != 0:
+            raise ValueError("q_alpha and q_beta must be scalars.")
+
+        dwell_time_k = torch.zeros(self.K, dtype=self.dtype, device=self.device)
+        n_jumps_kk = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
+
+        for s in range(self.S):
+            T_true_s = self.T_true_list[s]
+            z_true_s = self.z_true_list[s]
+            T_s = self.T_list[s]
+            if T_true_s is None or z_true_s is None:
+                raise RuntimeError("Call initialize() before sample_Q().")
+            if z_true_s.shape[0] != T_true_s.shape[0] + 1:
+                raise RuntimeError("z_true must have len(T_true)+1 entries.")
+
+            for i, regime in enumerate(z_true_s.tolist()):
+                t_left = 0.0 if i == 0 else T_true_s[i - 1]
+                t_right = T_s if i == z_true_s.shape[0] - 1 else T_true_s[i]
+                dwell_time_k[regime] = dwell_time_k[regime] + (t_right - t_left)
+
+            for i in range(T_true_s.shape[0]):
+                src = z_true_s[i].item()
+                dst = z_true_s[i + 1].item()
+                if src != dst:
+                    n_jumps_kk[src, dst] = n_jumps_kk[src, dst] + 1.0
+
+        Q = torch.zeros(self.K, self.K, dtype=self.dtype, device=self.device)
+        for i in range(self.K):
+            for j in range(self.K):
+                if i == j:
+                    continue
+                posterior_alpha = q_alpha + n_jumps_kk[i, j]
+                posterior_beta = q_beta + dwell_time_k[i]
+                Q[i, j] = dist.Gamma(posterior_alpha, posterior_beta).sample()
+            Q[i, i] = -Q[i].sum()
+
+        return Q.detach()
+
+    def _evaluate_batched_transition_logprobs(
+        self,
+        y_prev_batch: torch.Tensor,
+        y_curr_batch: torch.Tensor,
+        theta_batch: torch.Tensor,
+        delta_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate batched NLE transition log probabilities."""
+        delta = torch.as_tensor(
+            delta_batch,
+            device=self.device,
+            dtype=y_prev_batch.dtype,
+        ).reshape(-1)
+        if y_prev_batch.shape != y_curr_batch.shape:
+            raise ValueError("y_prev_batch and y_curr_batch must have the same shape.")
+        if y_prev_batch.shape[0] != theta_batch.shape[0] or y_prev_batch.shape[0] != delta.shape[0]:
+            raise ValueError("Batch dimensions of y, theta, and delta_batch must match.")
+
+        if self.transition_log_prob_fn is not None:
+            return self.transition_log_prob_fn(
+                y_prev_batch, y_curr_batch, theta_batch, delta
+            )
+        n_steps = self._delta_to_n_steps(delta)
+        return self.nle_estimator.transition_log_prob(
+            x_next=y_curr_batch,
+            theta=theta_batch,
+            x_prev=y_prev_batch,
+            n_steps=n_steps.to(device=y_prev_batch.device, dtype=y_prev_batch.dtype),
+            include_jacobian=True,
+        )
+
+    def _sample_transition_one_per_context(
+        self,
+        theta: torch.Tensor,
+        y_prev: torch.Tensor,
+        delta: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draw one transition sample per context row in y-space."""
+        if self.transition_sample_fn is not None:
+            return self.transition_sample_fn(theta, y_prev, delta).to(
+                device=self.device, dtype=self.dtype
+            )
+        n_steps = self._delta_to_n_steps(delta)
+        samples = self.nle_estimator.sample_transition(
+            theta=theta,
+            x_prev=y_prev,
+            n_steps=n_steps.to(device=y_prev.device, dtype=y_prev.dtype),
+        )
+        return samples.to(device=self.device, dtype=self.dtype)
+
+    def _sample_forward_block_particles(
+        self,
+        left_y: torch.Tensor,
+        left_time: torch.Tensor,
+        block_times: torch.Tensor,
+        block_regimes: torch.Tensor,
+        num_particles: int,
+    ) -> torch.Tensor:
+        """
+        Sample particles from q(block) = p(block | y_left) by simulating forward
+        with the NLE transition sampler.
+
+        Returns a tensor with shape (num_particles, block_len, D).
+        """
+        particles: List[torch.Tensor] = []
+        y_prev = left_y.unsqueeze(0).expand(num_particles, self.D)
+        previous_time = left_time
+
+        with torch.no_grad():
+            for block_time, regime in zip(block_times, block_regimes):
+                delta = block_time - previous_time
+                theta_batch = self.theta[regime].unsqueeze(0).expand(
+                    num_particles, self.theta_dim
+                )
+                # batch size is num_particle
+                y_curr = self._sample_transition_one_per_context(
+                    theta=theta_batch,
+                    y_prev=y_prev,
+                    delta=delta.expand(num_particles),
+                )
+                particles.append(y_curr)
+                y_prev = y_curr
+                previous_time = block_time
+
+        return torch.stack(particles, dim=1)
+
+    def _compute_log_emission_matrix(
+        self,
+        y_aug: torch.Tensor,
+        theta: torch.Tensor,
+        delta: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute FFBS emission logits for all intervals and regimes in one NLE call.
+
+        `delta[j] = T_all[j+1] - T_all[j]` is converted to the NLE conditioning
+        step count by delta[j] / dynamics.dt.
+
+        Returns
+        -------
+        log_emission:
+            Tensor with shape (L-1, K), where
+            log_emission[j, k] = log p(y_aug[j+1] | y_aug[j], z_aug[j+1]=k, theta).
+        """
+        L = y_aug.shape[0]
+        n_intervals = L - 1
+        if n_intervals <= 0:
+            return torch.empty(0, self.K, dtype=self.dtype, device=self.device)
+
+        delta = torch.as_tensor(delta, device=self.device, dtype=y_aug.dtype).reshape(-1)
+        if delta.shape[0] != n_intervals:
+            raise ValueError("delta must have length len(y_aug) - 1.")
+
+        # ((L-1)*K, y_dim)
+        y_prev_batch = y_aug[:-1].repeat_interleave(self.K, dim=0).contiguous()
+        y_curr_batch = y_aug[1:].repeat_interleave(self.K, dim=0).contiguous()
+
+        # (K, theta_dim) -> (1, K, theta_dim) -> ((L-1), K, theta_dim)
+        theta_batch = theta.unsqueeze(0).expand(n_intervals, self.K, self.theta_dim)
+        # ((L-1), K, theta_dim) -> ((L-1)*K, theta_dim)
+        theta_batch = theta_batch.reshape(n_intervals * self.K, self.theta_dim).contiguous()
+        delta_batch = delta.repeat_interleave(self.K)
+
+        log_probs = self._evaluate_batched_transition_logprobs(
+            y_prev_batch=y_prev_batch,
+            y_curr_batch=y_curr_batch,
+            theta_batch=theta_batch,
+            delta_batch=delta_batch,
+        )
+        return log_probs.reshape(n_intervals, self.K)
+
+    def _compute_log_emission_given_z(
+        self,
+        y_aug: torch.Tensor,
+        z_aug: torch.Tensor,
+        T_all: torch.Tensor,
+        theta: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the total transition log density along a fixed z path using a
+        single batched NLE evaluation over the selected regimes only.
+        """
+        delta = T_all[1:] - T_all[:-1]
+        n_intervals = y_aug.shape[0] - 1
+        if n_intervals <= 0:
+            return torch.tensor(0.0, dtype=self.dtype, device=self.device)
+
+        delta = torch.as_tensor(delta, device=self.device, dtype=y_aug.dtype).reshape(-1)
+        if delta.shape[0] != n_intervals:
+            raise ValueError("T_all must have length len(y_aug).")
+
+        y_prev_batch = y_aug[:-1].contiguous()
+        y_curr_batch = y_aug[1:].contiguous()
+        theta_batch = theta[z_aug[1:].to(dtype=torch.long, device=self.device)].contiguous()
+        log_probs = self._evaluate_batched_transition_logprobs(
+            y_prev_batch=y_prev_batch,
+            y_curr_batch=y_curr_batch,
+            theta_batch=theta_batch,
+            delta_batch=delta,
+        )
+        return log_probs.sum()
+
+    @torch.no_grad()
+    def sample_z_ffbs(self, s: int) -> torch.Tensor:
+        """
+        Sample z on the augmented grid with FFBS in log-space.
+
+        Forward recursion:
+            log_alpha_j(h)
+                = log g_j(h) + logsumexp_i(log_alpha_{j-1}(i) + log A_j(i, h))
+
+        Then we normalize at each step:
+            log_alpha_j(h)
+                <- log_alpha_j(h) - logsumexp_h(log_alpha_j(h))
+
+        Hence `log_alpha[j]` in the code is a scaled forward message for the regime
+        on interval [T_all[j-1], T_all[j]], defined only up to an additive constant
+        shared across regimes at time index j. This scaling does not change the FFBS
+        conditional distributions because only within-time differences across regimes
+        matter.
+
+        where:
+            g_j(h) = p(y_j | y_{j-1}, z_j = h, Delta_j; theta)
+            A_j(i, h) is the transition kernel at the right endpoint T_all[j]
+            A_j = B if T_all[j] is in T_true ∪ T_cand, else I
+
+        This matches the rest of the codebase: the latent regime attached to an NLE
+        transition from y_aug[j-1] to y_aug[j] is z_aug[j].
+        """
+        T_all = self.T_all_list[s]
+        z_aug = self.z_aug_list[s]
+        is_event_time = self.is_event_time_list[s]
+        y_aug = self.y_aug_list[s]
+        if T_all is None or z_aug is None or is_event_time is None or y_aug is None:
+            raise RuntimeError("Sampler must be initialized before sample_z_ffbs().")
+        if self.theta is None:
+            raise RuntimeError("Sampler theta has not been initialized.")
+
+        L = T_all.shape[0]
+        log_alpha = torch.empty(L, self.K, dtype=self.dtype, device=self.device)
+        log_alpha[0] = torch.log(self.initial_regime_probs.clamp_min(1e-32))
+
+        log_B = torch.log(self.B.clamp_min(1e-32))
+        delta = T_all[1:] - T_all[:-1]
+        emission_logits = self._compute_log_emission_matrix(y_aug, self.theta, delta)
+
+        for j in range(L - 1):
+            if is_event_time[j]:
+                scores = log_alpha[j].unsqueeze(1) + log_B
+                log_alpha[j + 1] = emission_logits[j] + torch.logsumexp(scores, dim=0)
+            else:
+                # At observation-only times the transition kernel is I, so the regime
+                # does not change. Only the NLE transition likelihood contributes.
+                log_alpha[j + 1] = log_alpha[j] + emission_logits[j]
+            log_alpha[j + 1] = log_alpha[j + 1] - torch.logsumexp(log_alpha[j + 1], dim=0)
+
+        z = torch.empty(L, dtype=torch.long, device=self.device)
+        z[L - 1] = dist.Categorical(logits=log_alpha[L - 1]).sample()
+
+        for j in range(L - 2, -1, -1):
+            if is_event_time[j]:
+                logits_prev = log_alpha[j] + log_B[:, z[j + 1]]
+                z[j] = dist.Categorical(logits=logits_prev).sample()
+            else:
+                z[j] = z[j + 1]
+
+        z[0] = z[1]
+        return z
+
+    def prune_self_transitions(
+        self,
+        T_all: torch.Tensor,
+        z_aug: torch.Tensor,
+        is_event_time: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Partition sampled event points into true and pseudo jumps.
+
+        Event points with a regime change form T_true; self-transition event points
+        form T_pseudo and are represented by `pseudo_idx` into T_all. Returned
+        z_true is not padded: z_true[r] is the regime on true segment r.
+        """
+        interior_event_idx = torch.nonzero(
+            is_event_time[1:-1], as_tuple=False
+        ).squeeze(-1) + 1
+        regime_changed = (
+            z_aug[interior_event_idx + 1] != z_aug[interior_event_idx]
+        )
+        true_idx = interior_event_idx[regime_changed]
+        pseudo_idx = interior_event_idx[~regime_changed]
+
+        # Index T_all directly so true and pseudo times retain their exact stored
+        # floating-point representations for the next source-aware merge.
+        T_true = T_all[true_idx].clone()
+        z_true = torch.cat(
+            [z_aug[1].reshape(1), z_aug[true_idx + 1]]
+        ).to(dtype=torch.long, device=self.device)
+        return T_true, z_true, true_idx, pseudo_idx
+
+    def one_sweep(self) -> Dict[str, Any]:
+        """Run one MCMC sweep: augment grid, sample y, z, theta, tau, and Q."""
+        if self.theta is None or self.log_tau is None:
+            raise RuntimeError("Call initialize() before one_sweep().")
+        for s in range(self.S):
+            if self.T_true_list[s] is None or self.z_true_list[s] is None:
+                raise RuntimeError("Call initialize() before one_sweep().")
+
+        per_series_info: List[Dict[str, Any]] = []
+        for s in range(self.S):
+            T_cand = self.add_candidate_jumps(s)
+            T_all, z_aug, is_event_time, obs_idx, cand_idx = self.build_augmented_grid(s, T_cand)
+            y_mh_init, sir_info = self._sample_inserted_y_by_forward_sir(
+                new_grid_times=T_all,
+                new_z_aug=z_aug,
+                new_cand_idx=cand_idx,
+                s=s,
+            )
+            self.T_all_list[s] = T_all
+            self.z_aug_list[s] = z_aug
+            self.is_event_time_list[s] = is_event_time
+            self.obs_idx_list[s] = obs_idx
+            self.y_aug_list[s] = self.sample_y_mh(s, y_mh_init)
+            self.z_aug_list[s] = self.sample_z_ffbs(s)
+            (
+                self.T_true_list[s],
+                self.z_true_list[s],
+                self.true_idx_list[s],
+                self.pseudo_idx_list[s],
+            ) = self.prune_self_transitions(
+                T_all=T_all,
+                z_aug=self.z_aug_list[s],
+                is_event_time=is_event_time,
+            )
+            per_series_info.append(
+                {
+                    "series": s + 1,
+                    "grid_size": int(T_all.shape[0]),
+                    "num_candidate_events": int(is_event_time.sum().item()),
+                    "num_true_segments": int(self.z_true_list[s].shape[0]),
+                    "sir_num_particles": sir_info["num_particles"],
+                    "sir_min_ess": sir_info["min_ess"],
+                    "sir_mean_ess": sir_info["mean_ess"],
+                }
+            )
+
+        self.theta = self.sample_theta_mh()
+        self.log_tau = self.sample_log_tau()
+        self.Q = self.sample_Q()
+        self._refresh_uniformization()
+        log_joint = self.complete_data_log_joint()
+
+        finite_min_ess = [
+            info["sir_min_ess"]
+            for info in per_series_info
+            if info["sir_min_ess"] == info["sir_min_ess"]
+        ]
+        finite_mean_ess = [
+            info["sir_mean_ess"]
+            for info in per_series_info
+            if info["sir_mean_ess"] == info["sir_mean_ess"]
+        ]
+        sweep_info = {
+            "num_series": self.S,
+            "grid_size": sum(info["grid_size"] for info in per_series_info),
+            "num_candidate_events": sum(info["num_candidate_events"] for info in per_series_info),
+            "num_true_segments": sum(info["num_true_segments"] for info in per_series_info),
+            "per_series": per_series_info,
+            "sir_num_particles": self.sir_config["num_particles"],
+            "use_t_pseudo_in_sir": self.sir_config["use_t_pseudo_in_sir"],
+            "sir_min_ess": min(finite_min_ess) if finite_min_ess else float("nan"),
+            "sir_mean_ess": (
+                sum(finite_mean_ess) / len(finite_mean_ess)
+                if finite_mean_ess
+                else float("nan")
+            ),
+            "y_mh": [
+                dict(diagnostics) if diagnostics is not None else None
+                for diagnostics in self._last_y_mh_diagnostics
+            ],
+            "theta_mh": (
+                dict(self._last_theta_mh_diagnostics)
+                if self._last_theta_mh_diagnostics is not None
+                else None
+            ),
+            "log_tau_update": "conjugate_inverse_gamma",
+            "Q_update": "conjugate_gamma",
+            "omega": float(self.omega),
+            "log_joint": log_joint,
+        }
+
+        self.history["y_aug"].append([
+            y.detach().cpu() if y is not None else None for y in self.y_aug_list
+        ])
+        self.history["z_aug"].append([
+            z.detach().cpu() if z is not None else None for z in self.z_aug_list
+        ])
+        self.history["T_all"].append([
+            t.detach().cpu() if t is not None else None for t in self.T_all_list
+        ])
+        self.history["T_true"].append([
+            t.detach().cpu() if t is not None else None for t in self.T_true_list
+        ])
+        self.history["z_true"].append([
+            z.detach().cpu() if z is not None else None for z in self.z_true_list
+        ])
+        self.history["theta"].append(self.theta.detach().cpu())
+        self.history["log_tau"].append(self.log_tau.detach().cpu())
+        self.history["Q"].append(self.Q.detach().cpu())
+        self.history["omega"].append(float(self.omega))
+        self.history["diagnostics"].append(sweep_info)
+        self._save_latest_sample()
+        return sweep_info
+
+    def run(self, num_sweeps: int, verbose: bool = True) -> Dict[str, List[Any]]:
+        """Run multiple MCMC sweeps and return the stored history."""
+        if self.theta is None or self.log_tau is None or any(
+            T_true is None or z_true is None
+            for T_true, z_true in zip(self.T_true_list, self.z_true_list)
+        ):
+            self.initialize()
+
+        for sweep in range(num_sweeps):
+            info = self.one_sweep()
+            if verbose:
+                print(
+                    f"[sweep {sweep + 1:03d}] "
+                    f"grid={info['grid_size']}, "
+                    f"candidate_events={info['num_candidate_events']}, "
+                    f"true_segments={info['num_true_segments']}"
+                )
+        return self.history
+
+    def _build_uniformized_transition_matrix(self) -> torch.Tensor:
+        """Return B = I + Q / Omega, then clamp/renormalize rows for numeric stability."""
+        B = torch.eye(self.K, dtype=self.dtype, device=self.device) + self.Q / self.omega
+        B = B.clamp_min(0.0)
+        B = B / B.sum(dim=1, keepdim=True)
+        return B
+
+    def _refresh_uniformization(self) -> None:
+        """
+        Recompute Omega and B after Q changes.
+
+        Uniformization requires Omega >= max_i -Q_ii.  We keep a strict margin so
+        candidate-jump rates Omega + Q_ii remain positive even for the largest exit
+        rate regime.
+        """
+        max_exit = torch.max(-torch.diag(self.Q)).item()
+        self.omega = float(max(self.omega_scale * max_exit, max_exit + 1e-6, 1e-6))
+        self.B = self._build_uniformized_transition_matrix()
+
+    def _initialize_y_on_grid(self, s: int, T_all: torch.Tensor) -> torch.Tensor:
+        """
+        Initialize every latent dimension by interpolating its observations.
+
+        This is only used for the first sweep or when the user does not provide y.
+        """
+        T_obs = self.T_obs_list[s]
+        x_obs = self.x_obs_list[s]
+        obs_t = T_obs.detach().cpu()
+        grid_t = T_all.detach().cpu()
+        y_np = torch.empty((T_all.shape[0], self.D), dtype=self.dtype)
+        for d in range(self.D):
+            x_j = x_obs[:, d].detach().cpu()
+            interp = torch.from_numpy(
+                np.interp(
+                    grid_t.numpy(),
+                    obs_t.numpy(),
+                    x_j.numpy(),
+                    left=x_j[0].item(),
+                    right=x_j[-1].item()
+                )
+            ).to(dtype=self.dtype)
+            y_np[:, d] = interp
+        return y_np.to(device=self.device)
+
+    def _sample_inserted_y_by_forward_sir(
+        self,
+        new_grid_times: torch.Tensor,
+        new_z_aug: torch.Tensor,
+        new_cand_idx: torch.Tensor,
+        s: int = 0,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Sample newly inserted y values by forward SIR.
+
+        T_obs, T_true, and new T_cand are merged while retaining source indices.
+        If ``use_t_pseudo_in_sir`` is enabled, old T_pseudo is included as a
+        fourth source and its previous y values become additional boundaries.
+        New candidate times between adjacent retained points form inserted blocks.
+        For each such block, use
+
+            q(block) = p(block | y_left)
+
+        as the proposal. The bridge target is proportional to
+
+            p(block, y_right | y_left)
+              = p(block | y_left) p(y_right | block_last),
+
+        so SIR weights only require the right-boundary likelihood. After all new
+        values are sampled, only values on `new_grid_times` are returned. When
+        enabled, old-only pseudo points serve as bridge endpoints and are then
+        marginalized.
+        """
+        num_particles = int(self.sir_config["num_particles"])
+        if num_particles < 1:
+            raise ValueError("sir_config['num_particles'] must be positive.")
+
+        if self.theta is None or self.log_tau is None:
+            raise RuntimeError("Current parameters must be available before resampling y on a new grid.")
+
+        self.last_sir_cand_particles = []
+
+        old_y_aug = self.y_aug_list[s]
+
+        if self.T_all_list[s] is None or old_y_aug is None:
+            return self._initialize_y_on_grid(s, new_grid_times), {
+                "num_particles": float(num_particles),
+                "min_ess": float("nan"),
+                "mean_ess": float("nan"),
+            }
+
+        if new_z_aug.shape[0] != new_grid_times.shape[0]:
+            raise ValueError("new_z_aug and new_grid_times must have equal length.")
+
+        T_cand = new_grid_times[new_cand_idx]
+        times_for_sir, is_old_pseudo, is_new_candidate = (
+            self._build_sir_work_grid(s, T_cand)
+        )
+        work_z_aug = self._expand_true_path_onto_grid(s, times_for_sir)
+        y_work = torch.empty(
+            times_for_sir.shape[0], self.D, dtype=self.dtype, device=self.device
+        )
+        has_old_y = ~is_new_candidate
+        old_y_for_sir = old_y_aug.to(device=self.device, dtype=self.dtype)
+        if not self.sir_config["use_t_pseudo_in_sir"]:
+            old_pseudo_idx = self.pseudo_idx_list[s]
+            if old_pseudo_idx is None:
+                raise RuntimeError("The previous pseudo-point indices are unavailable.")
+            retain_old_y = torch.ones(
+                old_y_for_sir.shape[0], dtype=torch.bool, device=self.device
+            )
+            retain_old_y[old_pseudo_idx.to(device=self.device)] = False
+            old_y_for_sir = old_y_for_sir[retain_old_y]
+        if old_y_for_sir.shape[0] != int(has_old_y.sum().item()):
+            raise RuntimeError("Old y values do not align with the SIR work grid.")
+        y_work[has_old_y] = old_y_for_sir
+
+        inserted_idx = torch.nonzero(is_new_candidate, as_tuple=False).squeeze(-1)
+        if inserted_idx.numel() == 0:
+            y_sample = y_work[~is_old_pseudo]
+            if y_sample.shape[0] != new_grid_times.shape[0]:
+                raise RuntimeError("SIR work-grid produced the wrong new-grid size.")
+            return y_sample, {
+                "num_particles": float(num_particles),
+                "min_ess": float("nan"),
+                "mean_ess": float("nan"),
+            }
+
+        ess_values: List[float] = []
+        sir_cand_particles: List[Dict[str, torch.Tensor]] = []
+
+        block_start = 0
+        while block_start < inserted_idx.shape[0]:
+            block_end = block_start + 1
+            while (
+                block_end < inserted_idx.shape[0]
+                and int(inserted_idx[block_end].item())
+                == int(inserted_idx[block_end - 1].item()) + 1
+            ):
+                block_end += 1
+
+            block_work_idx = inserted_idx[block_start:block_end]
+            left_idx = int(block_work_idx[0].item()) - 1
+            right_idx = int(block_work_idx[-1].item()) + 1
+            if left_idx < 0 or right_idx >= times_for_sir.shape[0]:
+                raise RuntimeError("Inserted block must be bracketed by old-grid points.")
+            if not bool(has_old_y[left_idx]) or not bool(has_old_y[right_idx]):
+                raise RuntimeError("Inserted block endpoints must carry old y values.")
+
+            block_times = times_for_sir[block_work_idx]
+            block_regimes = work_z_aug[block_work_idx]
+
+            # particles: (num_particles, block_size, D)
+            particles = self._sample_forward_block_particles(
+                left_y=y_work[left_idx],
+                left_time=times_for_sir[left_idx],
+                block_times=block_times,
+                block_regimes=block_regimes,
+                num_particles=num_particles,
+            )
+            sir_cand_particles.append(
+                {
+                    "times": block_times.detach().cpu(),
+                    "particles": particles.detach().cpu(),
+                }
+            )
+
+            right_y = y_work[right_idx].unsqueeze(0).expand(
+                num_particles, self.D
+            )
+            last_particle = particles[:, -1, :]
+            right_delta = times_for_sir[right_idx] - block_times[-1]
+            right_theta = self.theta[work_z_aug[right_idx]].unsqueeze(0).expand(
+                num_particles, self.theta_dim
+            )
+            with torch.no_grad():
+                log_weights = self._evaluate_batched_transition_logprobs(
+                    y_prev_batch=last_particle,
+                    y_curr_batch=right_y,
+                    theta_batch=right_theta,
+                    delta_batch=right_delta.expand(num_particles),
+                ).reshape(-1)
+            normalized_log_weights = log_weights - torch.logsumexp(log_weights, dim=0)
+            weights = normalized_log_weights.exp()
+            ess = weights.square().sum().reciprocal()
+            ess_values.append(float(ess.detach().cpu().item()))
+
+            chosen = dist.Categorical(probs=weights).sample()
+            y_work[block_work_idx] = particles[chosen]
+            sir_cand_particles[-1]["weights"] = weights.detach().cpu()
+            sir_cand_particles[-1]["chosen"] = chosen.detach().cpu().reshape(())
+            block_start = block_end
+
+        ess_tensor = torch.tensor(ess_values, dtype=self.dtype)
+        min_ess = float(ess_tensor.min().item())
+        mean_ess = float(ess_tensor.mean().item())
+        self.last_sir_cand_particles = sir_cand_particles
+
+        y_sample = y_work[~is_old_pseudo]
+        if y_sample.shape[0] != new_grid_times.shape[0]:
+            raise RuntimeError("SIR work-grid produced the wrong new-grid size.")
+
+        return y_sample, {
+            "num_particles": float(num_particles),
+            "min_ess": min_ess,
+            "mean_ess": mean_ess,
+        }
