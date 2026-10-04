@@ -7,6 +7,7 @@ name = "fnle_ssde"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "arviz==0.22.0",
     "matplotlib==3.10.5",
     "nflows==0.14",
     "numpy==2.3.2",

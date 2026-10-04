@@ -5,10 +5,10 @@ from typing import Any
 import torch
 
 from .dynamics import ExactTransitionOUDynamics
-from .sampler import ContinuousTimeAR1HMMSampler
+from .sampler import SSDESampler
 
 
-class ContinuousTimeOUHMMSampler(ContinuousTimeAR1HMMSampler):
+class ExactOUSSDESampler(SSDESampler):
     """Switching scalar OU with Gaussian observation noise.
 
     Y/theta use the parent's NUTS or MALA, regimes use FFBS, and Q/tau use
@@ -23,7 +23,7 @@ class ContinuousTimeOUHMMSampler(ContinuousTimeAR1HMMSampler):
     def __init__(self, Q, x_obs, obs_times, T, *, dynamics: ExactTransitionOUDynamics | None = None, **kwargs: Any):
         dynamics = ExactTransitionOUDynamics() if dynamics is None else dynamics
         if not isinstance(dynamics, ExactTransitionOUDynamics):
-            raise TypeError("ContinuousTimeOUHMMSampler requires ExactTransitionOUDynamics.")
+            raise TypeError("ExactOUSSDESampler requires ExactTransitionOUDynamics.")
         super().__init__(
             Q, x_obs, obs_times, T,
             dynamics=dynamics,

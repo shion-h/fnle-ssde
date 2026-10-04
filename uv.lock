@@ -422,6 +422,7 @@ name = "fnle-ssde"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "arviz" },
     { name = "matplotlib" },
     { name = "nflows" },
     { name = "numpy" },
@@ -435,6 +436,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "arviz", specifier = "==0.22.0" },
     { name = "matplotlib", specifier = "==3.10.5" },
     { name = "nflows", specifier = "==0.14" },
     { name = "numpy", specifier = "==2.3.2" },

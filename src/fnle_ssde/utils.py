@@ -22,7 +22,7 @@ from .prior import (
 )
 
 if TYPE_CHECKING:
-    from .sampler import ContinuousTimeAR1HMMSampler
+    from .sampler import SSDESampler
 
 
 def seed_all(seed: int) -> None:
@@ -134,7 +134,7 @@ def make_symmetric_generator(
 
 
 def initialize_ctmc_path_from_generator(
-    sampler: ContinuousTimeAR1HMMSampler,
+    sampler: SSDESampler,
     Q: torch.Tensor,
     *,
     seed: int | None = None,
@@ -227,7 +227,7 @@ def initialize_mcmc_sampler(
     latest_sample_path: Path | str | None = None,
     theta_prior: Distribution | None = None,
     time_dtype: torch.dtype = torch.float64,
-) -> tuple[ContinuousTimeAR1HMMSampler, dict[str, torch.Tensor]]:
+) -> tuple[SSDESampler, dict[str, torch.Tensor]]:
     """Construct the common paper sampler and initialize it reproducibly.
 
     ``theta_prior`` is a component-wise distribution in the real NLE
@@ -243,7 +243,7 @@ def initialize_mcmc_sampler(
     Set ``use_t_pseudo_in_sir=False`` to marginalize the previous sweep's pseudo
     points rather than retaining their y values as SIR bridge boundaries.
     """
-    from .sampler import ContinuousTimeAR1HMMSampler
+    from .sampler import SSDESampler
 
     seed_all(seed)
     num_regimes = num_regimes if Q is None else Q.shape[0]
@@ -280,7 +280,7 @@ def initialize_mcmc_sampler(
             q_beta=prior_config["q_beta"],
         )
 
-    sampler = ContinuousTimeAR1HMMSampler(
+    sampler = SSDESampler(
         Q=Q,
         x_obs=x_obs,
         obs_times=obs_times,

@@ -16,13 +16,13 @@ from torch.distributions import LogNormal, Normal
 
 from fnle_ssde.dynamics import ExactTransitionOUDynamics, OUDynamics
 from fnle_ssde.nle import NLEEstimator
-from fnle_ssde.ou_sampler import ContinuousTimeOUHMMSampler
+from fnle_ssde.ou_sampler import ExactOUSSDESampler
 from fnle_ssde.prior import (
     make_prior_config,
     sample_generator_matrix,
     sample_initial_theta_from_truncated_physical_prior,
 )
-from fnle_ssde.sampler import ContinuousTimeAR1HMMSampler
+from fnle_ssde.sampler import SSDESampler
 from fnle_ssde.utils import (
     initialize_ctmc_path_from_generator, make_symmetric_generator,
     run_parallel_chains, seed_all,
@@ -169,10 +169,10 @@ def sample_chain(method: str, chain_id: int) -> tuple[int, Path]:
     dynamics_class = ExactTransitionOUDynamics if method == "exact" else OUDynamics
     dynamics = dynamics_class(dt=DT, device="cpu")
     if method == "exact":
-        sampler_class = ContinuousTimeOUHMMSampler
+        sampler_class = ExactOUSSDESampler
         estimator = None
     else:
-        sampler_class = ContinuousTimeAR1HMMSampler
+        sampler_class = SSDESampler
         estimator = NLEEstimator(
             dynamics=dynamics, model_cache_path=method_dir / "nle.pt",
         )

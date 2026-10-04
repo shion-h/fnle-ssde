@@ -41,9 +41,9 @@ from pyro.infer import HMC, MCMC, NUTS
 import torch
 from torch.distributions import Distribution, constraints
 
-class ContinuousTimeAR1HMMSampler:
+class SSDESampler:
     """
-    MCMC sampler for a continuous-time AR(1)-HMM with NLE transition density.
+    MCMC sampler for a switching SDE with a supplied transition density.
 
     Shapes
     ------
