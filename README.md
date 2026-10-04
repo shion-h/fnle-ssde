@@ -1,8 +1,41 @@
 # FNLE-SSDE
 
+## Reproduce the figures
+
 The paper experiments are implemented in `scripts/example_{1,2,3}.py`.
 Data generation and plotting are separate:
 `scripts/generate_data_{1,2,3}.py` and `scripts/plot_example_{1,2,3}.py`.
+Python 3.12 and `uv` are required. Example 3 also requires R and the
+[`rEDM` package](https://CRAN.R-project.org/package=rEDM), which supplies the
+`paramecium_didinium` dataset.
+
+Run these commands from the repository root, in order:
+
+```bash
+uv run python scripts/generate_data_1.py
+uv run python scripts/example_1.py
+uv run python scripts/plot_example_1.py
+uv run python scripts/generate_data_2.py
+uv run python scripts/example_2.py
+uv run python scripts/plot_example_2.py
+Rscript scripts/export_rEDM_paramecium_didinium.R
+uv run python scripts/generate_data_3.py
+uv run python scripts/example_3.py
+uv run python scripts/plot_example_3.py
+uv run python scripts/diagnostics.py
+```
+
+The R export creates `data/didinium_paramecium.csv`; `generate_data_3.py`
+normalizes it for Example 3.
+
+### Reusing saved results
+
+- To regenerate figures from saved MCMC histories, run only
+  `plot_example_{1,2,3}.py`. No NLE training or MCMC is needed.
+- `example_1.py` reuses existing OU training data, models, and complete chain
+  histories. `example_2.py` skips an experiment when all its histories exist
+  and refuses partial histories. `example_3.py` refuses to overwrite existing
+  histories.
 
 ## Reference machine
 
@@ -36,29 +69,3 @@ For context, the recorded NLE preparation times (simulation plus training)
 were about 25 minutes for synthetic LV, 13 minutes for CLE, 13 minutes for
 SIR, and 3.1 hours for real-data LV. Real-data MCMC took about 4.3 hours in
 one run; related runs took about 5.3 hours.
-
-### Reusing saved results
-
-- To regenerate figures from saved MCMC histories, run only
-  `plot_example_{1,2,3}.py`. No NLE training or MCMC is needed.
-- `example_1.py` reuses existing OU training data, models, and complete chain
-  histories. `example_2.py` and `example_3.py` still rerun MCMC and overwrite
-  their history files.
-
-## Reproduce the figures
-
-Run these commands from the repository root, in order. Each example's data
-generation, inference, and plotting scripts are grouped together.
-
-```bash
-uv run python scripts/generate_data_1.py
-uv run python scripts/example_1.py
-uv run python scripts/plot_example_1.py
-uv run python scripts/generate_data_2.py
-uv run python scripts/example_2.py
-uv run python scripts/plot_example_2.py
-uv run python scripts/generate_data_3.py
-uv run python scripts/example_3.py
-uv run python scripts/plot_example_3.py
-uv run python scripts/diagnostics.py
-```
